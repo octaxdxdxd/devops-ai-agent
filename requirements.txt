@@ -1,0 +1,5 @@
+openai>=2.15.0
+python-dotenv>=1.2.1
+elasticsearch>=9.2.1
+boto3>=1.42.27
+requests>=2.32.5
