@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -29,11 +30,11 @@ def count_errors(log_content: str) -> str:
 # Create tools list
 tools = [read_log_file, count_errors]
 
-# Initialize the model
-llm = ChatGoogleGenerativeAI(
-    model='gemini-2.5-flash-lite',
-    google_api_key=os.environ['GEMINI_API_KEY'],
-    temperature=0.1
+llm = ChatOpenAI(
+    model=os.getenv("OPENAI_MODEL", "arcee-ai/trinity-large-preview:free"),
+    temperature=0.1,
+    openai_api_key=os.getenv("OPENAI_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
 )
 
 # Bind tools to the model
