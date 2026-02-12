@@ -26,21 +26,6 @@ def print_banner():
     print()
 
 
-def print_help():
-    """Print help information"""
-    print("\nAvailable commands:")
-    print("  quit/exit  - Exit the program")
-    print("  clear      - Clear conversation history")
-    print("  help       - Show this help message")
-    print("\nExample questions:")
-    print("  - What log files are available?")
-    print("  - Read the app.log file")
-    print("  - What errors are in app.log?")
-    print("  - Search for 'ERROR' in app.log")
-    print("  - When did the database connection fail?")
-    print()
-
-
 def main():
     """Main interactive loop"""
     try:
@@ -51,28 +36,24 @@ def main():
         print_banner()
         
         # Initialize agent
-        print("Initializing AI agent...")
         agent = LogAnalyzerAgent()
-        print("Ready!\n")
         
-        # Main loop
+        # Interactive loop
         while True:
             try:
-                # Get user input
-                user_input = input("You: ").strip()
+                user_input = input("\nYou: ").strip()
                 
-                # Handle empty input
                 if not user_input:
                     continue
                 
                 # Handle commands
-                if user_input.lower() in ['quit', 'exit', 'q']:
+                if user_input.lower() in ['quit', 'exit']:
                     print("\nGoodbye!")
                     break
                 
                 if user_input.lower() == 'clear':
-                    agent.clear_history()
-                    print("\nConversation history cleared.\n")
+                    agent = LogAnalyzerAgent()
+                    print("\nConversation history cleared.")
                     continue
                 
                 if user_input.lower() == 'help':
@@ -80,24 +61,19 @@ def main():
                     continue
                 
                 # Process query
+                print("\nAgent:", end=" ")
                 response = agent.process_query(user_input)
-                print(f"\nAgent: {response}\n")
+                print(response)
             
             except KeyboardInterrupt:
-                print("\n\nInterrupted. Type 'quit' to exit.\n")
+                print("\n\nInterrupted. Type 'quit' to exit.")
                 continue
             except EOFError:
                 print("\n\nGoodbye!")
                 break
     
-    except ValueError as e:
-        print(f"\nConfiguration Error: {e}")
-        print("Please check your .env file and ensure GEMINI_API_KEY is set.")
-        sys.exit(1)
     except Exception as e:
-        print(f"\nUnexpected Error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\nFatal error: {e}")
         sys.exit(1)
 
 

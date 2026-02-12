@@ -1,12 +1,3 @@
-"""
-Log reading tools for the AI agent
-"""
-import os
-from pathlib import Path
-from langchain_core.tools import tool
-from ..config import Config
-
-
 @tool
 def read_log_file(filename: str) -> str:
     """
@@ -36,8 +27,7 @@ def read_log_file(filename: str) -> str:
         return f"Error: Permission denied reading '{filename}'"
     except Exception as e:
         return f"Error reading '{filename}': {str(e)}"
-
-
+    
 @tool
 def list_log_files() -> str:
     """
@@ -67,8 +57,7 @@ def list_log_files() -> str:
     
     except Exception as e:
         return f"Error listing log files: {str(e)}"
-
-
+    
 @tool
 def search_logs(filename: str, search_term: str) -> str:
     """
@@ -79,7 +68,7 @@ def search_logs(filename: str, search_term: str) -> str:
         search_term: Term to search for (case-insensitive)
     
     Returns:
-        String containing matching log lines with line numbers
+        String containing matching lines with line numbers
     """
     log_path = Path(Config.LOG_DIRECTORY) / filename
     
@@ -87,8 +76,9 @@ def search_logs(filename: str, search_term: str) -> str:
         with open(log_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
+        # Search for term (case-insensitive)
         matches = []
-        for line_num, line in enumerate(lines, 1):
+        for line_num, line in enumerate(lines, start=1):
             if search_term.lower() in line.lower():
                 matches.append(f"Line {line_num}: {line.rstrip()}")
         
@@ -96,7 +86,7 @@ def search_logs(filename: str, search_term: str) -> str:
             return f"No matches found for '{search_term}' in {filename}"
         
         result = f"Found {len(matches)} matches for '{search_term}' in {filename}:\n\n"
-        result += '\n'.join(matches)
+        result += "\n".join(matches)
         
         return result
     
@@ -104,13 +94,3 @@ def search_logs(filename: str, search_term: str) -> str:
         return f"Error: Log file '{filename}' not found"
     except Exception as e:
         return f"Error searching '{filename}': {str(e)}"
-
-
-def get_log_tools() -> list:
-    """
-    Get all log-related tools for the agent.
-    
-    Returns:
-        List of tool functions
-    """
-    return [read_log_file, list_log_files, search_logs]
