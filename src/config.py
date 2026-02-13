@@ -34,7 +34,6 @@ class Config:
         
         if not os.path.exists(cls.LOG_DIRECTORY):
             os.makedirs(cls.LOG_DIRECTORY)
-            print(f"Created log directory: {cls.LOG_DIRECTORY}")
     
     @classmethod
     def get_system_prompt(cls) -> str:

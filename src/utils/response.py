@@ -29,8 +29,7 @@ def extract_response_text(response) -> str:
                     text_parts.append(block['text'])
                 elif isinstance(block, str):
                     text_parts.append(block)
-            return ''.join(text_parts)
-        else:
-            return str(response.content)
+            return '\n'.join(text_parts)
     
+    # Fallback: convert to string
     return str(response)

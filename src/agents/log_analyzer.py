@@ -1,10 +1,9 @@
 """
 Log Analyzer Agent
-Simple AI agent for analyzing log files
+AI agent for analyzing log files with Streamlit support
 """
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
 
 from ..models import GeminiModel
 from ..tools import get_log_tools
@@ -14,12 +13,12 @@ from ..config import Config
 
 class LogAnalyzerAgent:
     """
-    AI Logging Agent
+    AI Logging Agent with Streamlit Support
     
     Capabilities:
     - Read and analyze log files
     - Answer questions about logs
-    - Maintain conversation history
+    - Maintain conversation history (via external storage)
     
     Limitations:
     - No routing decisions
@@ -39,58 +38,43 @@ class LogAnalyzerAgent:
         # Bind tools to model
         self.llm_with_tools = self.model.get_llm_with_tools(self.tools)
         
-        # Create chat memory
-        self.chat_history = InMemoryChatMessageHistory()
-        
-        # Create prompt
+        # Create prompt template
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", Config.get_system_prompt()),
             MessagesPlaceholder(variable_name="chat_history"),
             ("user", "{input}"),
         ])
-        
-        # Create chain
-        chain = self.prompt | self.llm_with_tools
-        
-        # Wrap with message history
-        self.chain_with_history = RunnableWithMessageHistory(
-            chain,
-            lambda session_id: self.chat_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-        )
-        
-        self.session_id = "default_session"
     
-    def process_query(self, user_input: str) -> str:
+    def process_query(self, user_input: str, chat_history: list = None) -> str:
         """
         Process a user query and return the response.
         
         Args:
             user_input: User's question or command
+            chat_history: List of previous messages (HumanMessage, AIMessage)
         
         Returns:
             String containing the agent's response
         """
+        if chat_history is None:
+            chat_history = []
+        
         try:
-            # Get response from chain with history
-            response = self.chain_with_history.invoke(
-                {"input": user_input},
-                config={"configurable": {"session_id": self.session_id}}
+            # Format messages for the prompt
+            messages = self.prompt.format_messages(
+                chat_history=chat_history,
+                input=user_input
             )
+            
+            # Get response from LLM with tools
+            response = self.llm_with_tools.invoke(messages)
             
             # Check if model wants to use tools
             if hasattr(response, 'tool_calls') and response.tool_calls:
-                return self._handle_tool_calls(response, user_input)
+                return self._handle_tool_calls(response, user_input, chat_history)
             else:
                 # Direct response without tools
-                response_text = extract_response_text(response)
-                
-                # Add to chat history
-                self.chat_history.add_user_message(user_input)
-                self.chat_history.add_ai_message(response_text)
-                
-                return response_text
+                return extract_response_text(response)
         
         except Exception as e:
             error_msg = f"Error processing query: {str(e)}"
@@ -99,63 +83,52 @@ class LogAnalyzerAgent:
             traceback.print_exc()
             return error_msg
     
-    def _handle_tool_calls(self, response, user_input: str) -> str:
+    def _handle_tool_calls(self, response, user_input: str, chat_history: list) -> str:
         """
         Handle tool calls from the model.
         
         Args:
-            response: Model response containing tool calls
+            response: LLM response containing tool calls
             user_input: Original user input
+            chat_history: Conversation history
         
         Returns:
-            String containing the final response after tool execution
+            Final response after executing tools
         """
         tool_results = []
         
-        # Execute all tool calls
+        # Execute each tool call
         for tool_call in response.tool_calls:
             tool_name = tool_call['name']
             tool_args = tool_call['args']
             
             # Find and execute the tool
+            tool_func = None
             for tool in self.tools:
                 if tool.name == tool_name:
-                    result = tool.invoke(tool_args)
+                    tool_func = tool
+                    break
+            
+            if tool_func:
+                try:
+                    result = tool_func.invoke(tool_args)
                     tool_results.append({
-                        'name': tool_name,
+                        'tool': tool_name,
                         'result': result
                     })
-                    print(f"\n[Tool: {tool_name}]")
-                    print(f"{result}\n")
-                    break
+                except Exception as e:
+                    tool_results.append({
+                        'tool': tool_name,
+                        'result': f"Error: {str(e)}"
+                    })
         
-        # Get final response based on tool results
-        tool_context = "\n\n".join([
-            f"Tool: {tr['name']}\nResult:\n{tr['result']}"
-            for tr in tool_results
-        ])
+        # Build analysis prompt with tool results
+        analysis_prompt = f"User asked: {user_input}\n\n"
+        analysis_prompt += "Tool results:\n"
+        for tr in tool_results:
+            analysis_prompt += f"\n{tr['tool']}:\n{tr['result']}\n"
+        analysis_prompt += "\nPlease analyze these results and answer the user's question."
         
-        final_response = self.llm.invoke([
-            ("system", Config.get_system_prompt() + 
-             "\n\nYou used tools to get information. Now provide a clear, concise answer based on the tool results. "
-             "Do not generate fake data - only analyze what you actually received."),
-            ("user", f"User asked: {user_input}\n\nTool results:\n{tool_context}\n\n"
-                    "Please analyze these results and answer the user's question."),
-        ])
-        
-        # Extract and save response
-        response_text = extract_response_text(final_response)
-        
-        # Add to chat history
-        self.chat_history.add_user_message(user_input)
-        self.chat_history.add_ai_message(response_text)
-        
-        return response_text
-    
-    def clear_history(self):
-        """Clear the conversation history"""
-        self.chat_history = InMemoryChatMessageHistory()
-    
-    def get_history(self) -> list:
-        """Get the conversation history"""
-        return self.chat_history.messages
+        # Get final analysis from LLM
+        final_response = self.llm.invoke(analysis_prompt)
+        return extract_response_text(final_response)
