@@ -1,29 +1,27 @@
 """
-Log Analyzer Agent
-AI agent for analyzing log files with Streamlit support
+Log Analyzer Agent with Kubernetes Actions (Chapter 9)
+AI agent for analyzing logs and managing Kubernetes pods
 """
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
 from ..models import GeminiModel
-from ..tools import get_log_tools
+from ..tools import get_all_tools
 from ..utils.response import extract_response_text
 from ..config import Config
 
 
 class LogAnalyzerAgent:
     """
-    AI Logging Agent with Streamlit Support
+    AI Logging Agent with Kubernetes Management Capabilities
     
     Capabilities:
-    - Read and analyze log files
-    - Answer questions about logs
-    - Maintain conversation history (via external storage)
-    
-    Limitations:
-    - No routing decisions
-    - No automated actions
-    - No multi-source integration
+    - Read and analyze application logs from Kubernetes pods
+    - Detect critical issues (OutOfMemoryError, CrashLoopBackOff, etc.)
+    - Automatically restart failed pods for P1 issues
+    - Check pod status and retrieve pod logs
+    - Scale deployments when needed
+    - Maintain conversation history
     """
     
     def __init__(self):
@@ -32,8 +30,8 @@ class LogAnalyzerAgent:
         self.model = GeminiModel()
         self.llm = self.model.get_llm()
         
-        # Get tools
-        self.tools = get_log_tools()
+        # Get all tools (log readers + K8s actions)
+        self.tools = get_all_tools()
         
         # Bind tools to model
         self.llm_with_tools = self.model.get_llm_with_tools(self.tools)
@@ -85,7 +83,7 @@ class LogAnalyzerAgent:
     
     def _handle_tool_calls(self, response, user_input: str, chat_history: list) -> str:
         """
-        Handle tool calls from the model.
+        Handle tool calls from the model with iterative execution.
         
         Args:
             response: LLM response containing tool calls
@@ -95,40 +93,64 @@ class LogAnalyzerAgent:
         Returns:
             Final response after executing tools
         """
-        tool_results = []
+        from langchain_core.messages import AIMessage, ToolMessage
         
-        # Execute each tool call
-        for tool_call in response.tool_calls:
-            tool_name = tool_call['name']
-            tool_args = tool_call['args']
+        # Keep track of all messages for the agent loop
+        messages = self.prompt.format_messages(
+            chat_history=chat_history,
+            input=user_input
+        )
+        
+        # Agent loop: continue until no more tool calls
+        max_iterations = 5  # Prevent infinite loops
+        iteration = 0
+        current_response = response
+        
+        while iteration < max_iterations:
+            iteration += 1
             
-            # Find and execute the tool
-            tool_func = None
-            for tool in self.tools:
-                if tool.name == tool_name:
-                    tool_func = tool
-                    break
+            # Check if there are tool calls
+            if not (hasattr(current_response, 'tool_calls') and current_response.tool_calls):
+                # No more tool calls, return the final response
+                return extract_response_text(current_response)
             
-            if tool_func:
-                try:
-                    result = tool_func.invoke(tool_args)
-                    tool_results.append({
-                        'tool': tool_name,
-                        'result': result
-                    })
-                except Exception as e:
-                    tool_results.append({
-                        'tool': tool_name,
-                        'result': f"Error: {str(e)}"
-                    })
+            # Execute each tool call
+            tool_messages = []
+            for tool_call in current_response.tool_calls:
+                tool_name = tool_call['name']
+                tool_args = tool_call['args']
+                
+                # Find and execute the tool
+                tool_func = None
+                for tool in self.tools:
+                    if tool.name == tool_name:
+                        tool_func = tool
+                        break
+                
+                if tool_func:
+                    try:
+                        result = tool_func.invoke(tool_args)
+                        tool_messages.append(
+                            ToolMessage(
+                                content=str(result),
+                                tool_call_id=tool_call['id']
+                            )
+                        )
+                    except Exception as e:
+                        error_msg = f"Error: {str(e)}"
+                        tool_messages.append(
+                            ToolMessage(
+                                content=error_msg,
+                                tool_call_id=tool_call['id']
+                            )
+                        )
+            
+            # Add AI response and tool results to messages
+            messages.append(AIMessage(content=current_response.content, tool_calls=current_response.tool_calls))
+            messages.extend(tool_messages)
+            
+            # Get next response from LLM (might call more tools or finish)
+            current_response = self.llm_with_tools.invoke(messages)
         
-        # Build analysis prompt with tool results
-        analysis_prompt = f"User asked: {user_input}\n\n"
-        analysis_prompt += "Tool results:\n"
-        for tr in tool_results:
-            analysis_prompt += f"\n{tr['tool']}:\n{tr['result']}\n"
-        analysis_prompt += "\nPlease analyze these results and answer the user's question."
-        
-        # Get final analysis from LLM
-        final_response = self.llm.invoke(analysis_prompt)
-        return extract_response_text(final_response)
+        # If we hit max iterations, return what we have
+        return extract_response_text(current_response)

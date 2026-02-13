@@ -1,8 +1,5 @@
 """
-AI Log Analyzer - Streamlit Chat Interface
-
-A web-based chat interface for the AI logging agent using Streamlit.
-Run with: streamlit run app.py
+AI Logging Agent
 """
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage
@@ -42,36 +39,63 @@ def initialize_session_state():
 def display_sidebar():
     """Display sidebar with information and controls"""
     with st.sidebar:
-        st.title("🔍 AI Log Analyzer")
+        st.title("AI Logging Agent")
         st.markdown("---")
         
         st.subheader("About")
         st.markdown("""
-        An AI-powered log analysis tool that helps you:
-        - 📁 Read and analyze log files
-        - 🔎 Search for specific patterns
-        - 💡 Get intelligent insights
-        - 🗨️ Ask questions in natural language
+        AI-powered log analysis and incident response:
+        - Read and analyze pod logs
+        - Detect critical issues
+        - Action when needed
+        - Get intelligent recommendations
+        - Natural language interface
         """)
         
         st.markdown("---")
         
         st.subheader("Available Tools")
         st.markdown("""
-        - **read_log_file**: Read a specific log file
-        - **list_log_files**: List all available logs
-        - **search_logs**: Search for patterns in logs
+        **Log Analysis:**
+        - `read_log_file` - Read specific log file
+        - `list_log_files` - List available logs
+        - `search_logs` - Search log patterns
+        
+        **Kubernetes Actions:**
+        - `restart_kubernetes_pod` - Restart failed pod
+          - 🔒 Always asks for approval
+          - ⚡ Recommended for P1 OOM issues
         """)
         
         st.markdown("---")
         
         st.subheader("Example Questions")
         st.markdown("""
-        - "What log files are available?"
-        - "Read the app.log file"
-        - "What errors are in error.log?"
-        - "Search for 'database' in app.log"
-        - "When did the connection fail?"
+        - "Check k8s.log for issues"
+        - "What errors are in the Java pod logs?"
+        - "Analyze the OutOfMemoryError"
+        - "List all log files"
+        - "Search for 'CrashLoopBackOff'"
+        """)
+        
+        st.markdown("---")
+        
+        st.subheader("Severity Levels")
+        st.markdown("""
+        - **P1**: OOM, pod crashes
+        - **P2**: Errors, degradation
+        - **P3**: Warnings
+        - **Info**: Normal operations
+        """)
+        
+        st.markdown("---")
+        
+        st.subheader("How It Works")
+        st.markdown("""
+        1. **Analysis**: AI examines logs and identifies issues
+        2. **Recommendation**: Suggests actions (e.g., pod restart)
+        3. **Confirmation**: Asks for your approval
+        4. **Execution**: Performs action after you confirm
         """)
         
         st.markdown("---")
@@ -86,6 +110,7 @@ def display_sidebar():
         st.caption(f"Model: {Config.GEMINI_MODEL}")
         st.caption(f"Temperature: {Config.TEMPERATURE}")
         st.caption(f"Log Directory: {Config.LOG_DIRECTORY}")
+        st.caption(f"K8s Namespace: {Config.K8S_DEFAULT_NAMESPACE}")
 
 
 def display_chat_messages():
@@ -115,14 +140,19 @@ def main():
     display_sidebar()
     
     # Main content area
-    st.title("Chat with AI Log Analyzer")
-    st.markdown("Ask me anything about your log files!")
+    st.markdown("Analyze pod logs and manage incidents with intelligent automation")
+    
+    # Info banner
+    st.info("""
+    💡 **Tip**: Ask me to check `k8s.log` to see intelligent incident analysis!
+    I will analyze the issue, recommend actions, and wait for your confirmation before executing.
+    """)
     
     # Display chat messages
     display_chat_messages()
     
     # Chat input
-    if prompt := st.chat_input("Ask about your logs..."):
+    if prompt := st.chat_input("Ask about Kubernetes logs or pod status..."):
         # Add user message to chat
         st.session_state.messages.append({"role": "user", "content": prompt})
         
@@ -132,7 +162,7 @@ def main():
         
         # Get agent response
         with st.chat_message("assistant"):
-            with st.spinner("Analyzing..."):
+            with st.spinner("Analyzing logs and checking pod status..."):
                 # Convert chat history to LangChain format
                 chat_history = convert_to_langchain_messages(
                     st.session_state.messages[:-1]  # Exclude the current message

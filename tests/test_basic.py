@@ -28,21 +28,21 @@ def test_log_directory_exists():
 def test_list_log_files():
     """Test listing log files"""
     result = list_log_files.invoke({})
-    assert "app.log" in result or "No .log files" in result
+    assert "k8s.log" in result or "No .log files" in result
     print("✓ List log files works")
 
 
 def test_read_log_file():
     """Test reading a log file"""
-    # This assumes app.log exists
-    result = read_log_file.invoke({"filename": "app.log"})
+    # This assumes k8s.log exists
+    result = read_log_file.invoke({"filename": "k8s.log"})
     assert "Error" not in result or "INFO" in result or "not found" in result
     print("✓ Read log file works")
 
 
 def test_search_logs():
     """Test searching in logs"""
-    result = search_logs.invoke({"filename": "app.log", "search_term": "ERROR"})
+    result = search_logs.invoke({"filename": "k8s.log", "search_term": "ERROR"})
     assert result is not None
     print("✓ Search logs works")
 

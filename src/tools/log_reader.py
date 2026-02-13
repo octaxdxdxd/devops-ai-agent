@@ -13,7 +13,7 @@ def read_log_file(filename: str) -> str:
     Read contents of a log file from the logs directory.
     
     Args:
-        filename: Name of the log file (e.g., 'app.log', 'error.log')
+        filename: Name of the log file (e.g., 'app.log', 'k8s.log', 'error.log')
     
     Returns:
         String containing the log file contents, or error message if file not found

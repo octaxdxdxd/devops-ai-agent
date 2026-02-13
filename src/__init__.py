@@ -1,6 +1,6 @@
 """
-AI Logging Agent
-A simple AI-powered log analyzer using LangChain and Google Gemini
+AI Logging Agent with Streamlit UI
+A simple AI-powered log analyzer with a web-based chat interface
 """
 
-__version__ = "1.0.0"
+__version__ = "0.2.0"

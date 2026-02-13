@@ -19,9 +19,20 @@ class Config:
     # Paths
     LOG_DIRECTORY = os.getenv('LOG_DIRECTORY', 'logs')
     
+    # Kubernetes Configuration
+    K8S_KUBECONFIG = os.getenv('K8S_KUBECONFIG', '')
+    K8S_CONTEXT = os.getenv('K8S_CONTEXT', 'default')
+    K8S_DEFAULT_NAMESPACE = os.getenv('K8S_DEFAULT_NAMESPACE', 'production')
+    
     # Agent Configuration
     MAX_ITERATIONS = 5
     VERBOSE = True
+    
+    @classmethod
+    def is_k8s_configured(cls) -> bool:
+        """Check if Kubernetes is configured"""
+        # For placeholder mode, always return True
+        return True
     
     @classmethod
     def validate(cls):
@@ -38,20 +49,18 @@ class Config:
     @classmethod
     def get_system_prompt(cls) -> str:
         """Get the system prompt for the agent"""
-        return """You are a DevOps expert specializing in log analysis.
-
-Your responsibilities:
-- Analyze application logs to identify errors, warnings, and patterns
-- Explain technical issues in clear, concise language
-- Identify root causes and relationships between events
-- Provide actionable insights
-
-Your limitations:
-- You can only read and analyze logs, not modify them
-- You cannot take actions like restarting services or modifying configurations
-- You work with the log files available in the logs directory
-
-Be direct and helpful. Focus on what's actually in the logs, not speculation."""
+        prompt_file = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            'system_prompt.txt'
+        )
+        try:
+            with open(prompt_file, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            raise ValueError(
+                f"System prompt file not found: {prompt_file}\n"
+                "Please ensure system_prompt.txt exists in the project root."
+            )
 
 
 # Validate configuration on import
