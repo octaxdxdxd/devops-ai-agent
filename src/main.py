@@ -92,7 +92,7 @@ def main():
     
     except ValueError as e:
         print(f"\nConfiguration Error: {e}")
-        print("Please check your .env file and ensure GEMINI_API_KEY is set.")
+        print("Please check your .env file and ensure the API key for your chosen provider is set.")
         sys.exit(1)
     except Exception as e:
         print(f"\nUnexpected Error: {e}")

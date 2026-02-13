@@ -5,8 +5,8 @@ AI agent for analyzing logs and managing Kubernetes pods
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
-from ..models import GeminiModel
-from ..tools import get_all_tools
+from ..models import get_model
+from ..tools import get_all_tools, is_write_tool
 from ..utils.response import extract_response_text
 from ..config import Config
 
@@ -24,10 +24,10 @@ class LogAnalyzerAgent:
     - Maintain conversation history
     """
     
-    def __init__(self):
+    def __init__(self, model_provider: str | None = None, model_name: str | None = None):
         """Initialize the agent"""
         # Initialize model
-        self.model = GeminiModel()
+        self.model = get_model(provider=model_provider, model_name=model_name)
         self.llm = self.model.get_llm()
         
         # Get all tools (log readers + K8s actions)
@@ -35,6 +35,9 @@ class LogAnalyzerAgent:
         
         # Bind tools to model
         self.llm_with_tools = self.model.get_llm_with_tools(self.tools)
+
+        # Pending write action (requires explicit user approval)
+        self._pending_action: dict | None = None
         
         # Create prompt template
         self.prompt = ChatPromptTemplate.from_messages([
@@ -58,6 +61,34 @@ class LogAnalyzerAgent:
             chat_history = []
         
         try:
+            # If there is a pending write action, require an explicit confirmation.
+            if self._pending_action is not None:
+                decision = user_input.strip().lower()
+                if decision in {"yes", "y", "approve", "proceed", "do it", "run it", "ok"} or decision.startswith("approve "):
+                    tool = self._pending_action["tool"]
+                    args = self._pending_action["args"]
+                    self._pending_action = None
+                    try:
+                        result = tool.invoke(args)
+                        return (
+                            f"Approved. Executed `{tool.name}`.\n\n"
+                            f"Result:\n{result}"
+                        )
+                    except Exception as e:
+                        return f"Approved, but execution failed: {e}"
+
+                if decision in {"no", "n", "cancel", "stop"}:
+                    pending_name = self._pending_action["tool"].name
+                    self._pending_action = None
+                    return f"Cancelled. I will not run `{pending_name}`."
+
+                pending_name = self._pending_action["tool"].name
+                pending_args = self._pending_action["args"]
+                return (
+                    f"Approval required before I can run `{pending_name}` with args {pending_args}.\n"
+                    "Reply `yes` to approve or `no` to cancel."
+                )
+
             # Format messages for the prompt
             messages = self.prompt.format_messages(
                 chat_history=chat_history,
@@ -102,7 +133,7 @@ class LogAnalyzerAgent:
         )
         
         # Agent loop: continue until no more tool calls
-        max_iterations = 5  # Prevent infinite loops
+        max_iterations = getattr(Config, "MAX_ITERATIONS", 5)
         iteration = 0
         current_response = response
         
@@ -128,6 +159,16 @@ class LogAnalyzerAgent:
                         break
                 
                 if tool_func:
+                    # Enforce explicit approval for write tools.
+                    if is_write_tool(tool_name):
+                        self._pending_action = {
+                            "tool": tool_func,
+                            "args": tool_args,
+                        }
+                        return (
+                            f"I recommend running `{tool_name}` with args {tool_args}, but it requires approval.\n"
+                            "Would you like me to proceed? (yes/no)"
+                        )
                     try:
                         result = tool_func.invoke(tool_args)
                         tool_messages.append(
@@ -154,3 +195,8 @@ class LogAnalyzerAgent:
         
         # If we hit max iterations, return what we have
         return extract_response_text(current_response)
+
+
+    def clear_history(self):
+        """Clear any pending action. Streamlit history is managed externally."""
+        self._pending_action = None

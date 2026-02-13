@@ -35,12 +35,49 @@ def initialize_session_state():
             st.error(f"Configuration error: {e}")
             st.stop()
 
+    if 'model_provider' not in st.session_state:
+        st.session_state.model_provider = Config.LLM_PROVIDER
+    if 'model_name' not in st.session_state:
+        st.session_state.model_name = Config.get_active_model_name()
+
 
 def display_sidebar():
     """Display sidebar with information and controls"""
     with st.sidebar:
         st.title("AI Logging Agent")
         st.markdown("---")
+
+        st.subheader("Model")
+        provider = st.selectbox(
+            "Provider",
+            options=["gemini", "openrouter"],
+            index=0 if st.session_state.model_provider == "gemini" else 1,
+        )
+
+        openrouter_presets = [
+            "arcee-ai/trinity-large-preview:free",
+            "meta-llama/llama-3.1-8b-instruct:free",
+            "google/gemma-2-9b-it:free",
+            "microsoft/phi-3-mini-128k-instruct:free",
+            "custom...",
+        ]
+
+        model_name = None
+        if provider == "gemini":
+            model_name = st.text_input("Gemini model", value=Config.GEMINI_MODEL)
+        else:
+            preset = st.selectbox("OpenRouter model", options=openrouter_presets, index=0)
+            if preset == "custom...":
+                model_name = st.text_input("Custom OpenRouter model", value=Config.OPENROUTER_MODEL)
+            else:
+                model_name = preset
+
+        if st.button("Apply model", use_container_width=True):
+            st.session_state.model_provider = provider
+            st.session_state.model_name = model_name
+            # Recreate the agent with the selected model.
+            st.session_state.agent = LogAnalyzerAgent(model_provider=provider, model_name=model_name)
+            st.rerun()
         
         st.subheader("About")
         st.markdown("""
@@ -107,7 +144,8 @@ def display_sidebar():
         
         # System info
         st.markdown("---")
-        st.caption(f"Model: {Config.GEMINI_MODEL}")
+        st.caption(f"Provider: {st.session_state.model_provider}")
+        st.caption(f"Model: {st.session_state.model_name}")
         st.caption(f"Temperature: {Config.TEMPERATURE}")
         st.caption(f"Log Directory: {Config.LOG_DIRECTORY}")
         st.caption(f"K8s Namespace: {Config.K8S_DEFAULT_NAMESPACE}")

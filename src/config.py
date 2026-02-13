@@ -10,10 +10,22 @@ load_dotenv()
 
 class Config:
     """Application configuration"""
+
+    # LLM Provider
+    # Supported values: 'gemini', 'openrouter'
+    LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini').lower()
     
     # API Configuration
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
     GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+
+    # OpenRouter (aliases: OPENAI_API_KEY / OPENAI_MODEL for convenience)
+    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY') or os.getenv('OPENAI_API_KEY')
+    OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL') or os.getenv('OPENAI_MODEL') or 'arcee-ai/trinity-large-preview:free'
+    OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
+    # Optional headers OpenRouter recommends
+    OPENROUTER_SITE_URL = os.getenv('OPENROUTER_SITE_URL')
+    OPENROUTER_APP_NAME = os.getenv('OPENROUTER_APP_NAME')
     TEMPERATURE = float(os.getenv('TEMPERATURE', '0.1'))
     
     # Paths
@@ -37,14 +49,31 @@ class Config:
     @classmethod
     def validate(cls):
         """Validate required configuration"""
-        if not cls.GEMINI_API_KEY:
+        if cls.LLM_PROVIDER == 'gemini':
+            if not cls.GEMINI_API_KEY:
+                raise ValueError(
+                    "GEMINI_API_KEY not found. "
+                    "Please set it in .env file or environment variables."
+                )
+        elif cls.LLM_PROVIDER == 'openrouter':
+            if not cls.OPENROUTER_API_KEY:
+                raise ValueError(
+                    "OpenRouter API key not found. "
+                    "Set OPENROUTER_API_KEY (or OPENAI_API_KEY) in .env or environment variables."
+                )
+        else:
             raise ValueError(
-                "GEMINI_API_KEY not found. "
-                "Please set it in .env file or environment variables."
+                f"Unsupported LLM_PROVIDER: {cls.LLM_PROVIDER!r}. Use 'gemini' or 'openrouter'."
             )
         
         if not os.path.exists(cls.LOG_DIRECTORY):
             os.makedirs(cls.LOG_DIRECTORY)
+
+    @classmethod
+    def get_active_model_name(cls) -> str:
+        if cls.LLM_PROVIDER == 'openrouter':
+            return cls.OPENROUTER_MODEL
+        return cls.GEMINI_MODEL
     
     @classmethod
     def get_system_prompt(cls) -> str:
@@ -61,7 +90,3 @@ class Config:
                 f"System prompt file not found: {prompt_file}\n"
                 "Please ensure system_prompt.txt exists in the project root."
             )
-
-
-# Validate configuration on import
-Config.validate()
