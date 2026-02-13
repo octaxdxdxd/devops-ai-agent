@@ -59,18 +59,13 @@ def display_sidebar():
             "meta-llama/llama-3.1-8b-instruct:free",
             "google/gemma-2-9b-it:free",
             "microsoft/phi-3-mini-128k-instruct:free",
-            "custom...",
         ]
 
         model_name = None
         if provider == "gemini":
             model_name = st.text_input("Gemini model", value=Config.GEMINI_MODEL)
         else:
-            preset = st.selectbox("OpenRouter model", options=openrouter_presets, index=0)
-            if preset == "custom...":
-                model_name = st.text_input("Custom OpenRouter model", value=Config.OPENROUTER_MODEL)
-            else:
-                model_name = preset
+            model_name = st.selectbox("OpenRouter model", options=openrouter_presets, index=0)
 
         if st.button("Apply model", use_container_width=True):
             st.session_state.model_provider = provider
