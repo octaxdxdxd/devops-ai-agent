@@ -1,5 +1,22 @@
+# Environment / secrets
 .env
-venv/
-__pycache__/
-*.pyc
+.env.*
+!.env.example
+
+# Virtual environments
 .venv/
+venv/
+ENV/
+env/
+
+# Python cache / test / typecheck
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs / traces
+*.log
+logs/traces/

@@ -29,7 +29,14 @@ def extract_response_text(response) -> str:
                     text_parts.append(block['text'])
                 elif isinstance(block, str):
                     text_parts.append(block)
-            return '\n'.join(text_parts)
+            if text_parts:
+                return '\n'.join(text_parts)
+            # Fallback: some providers return non-text blocks (tool calls, metadata, etc.)
+            # Return a string representation so the UI doesn't show a blank message.
+            try:
+                return str(response.content)
+            except Exception:
+                return ""
     
     # Fallback: convert to string
     return str(response)

@@ -39,6 +39,12 @@ class Config:
     # Agent Configuration
     MAX_ITERATIONS = 5
     VERBOSE = True
+
+    # Tracing (structured JSONL)
+    TRACE_ENABLED = os.getenv('TRACE_ENABLED', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    TRACE_DIR = os.getenv('TRACE_DIR', os.path.join(LOG_DIRECTORY, 'traces'))
+    TRACE_MAX_FIELD_CHARS = int(os.getenv('TRACE_MAX_FIELD_CHARS', '2000'))
+    TRACE_REDACT = os.getenv('TRACE_REDACT', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     
     @classmethod
     def is_k8s_configured(cls) -> bool:

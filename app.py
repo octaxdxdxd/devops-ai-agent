@@ -145,6 +145,18 @@ def display_sidebar():
         st.caption(f"Log Directory: {Config.LOG_DIRECTORY}")
         st.caption(f"K8s Namespace: {Config.K8S_DEFAULT_NAMESPACE}")
 
+        st.markdown("---")
+        st.subheader("Tracing")
+        st.caption(f"Enabled: {Config.TRACE_ENABLED}")
+        st.caption(f"Dir: {Config.TRACE_DIR}")
+        last_trace_id = None
+        try:
+            last_trace_id = getattr(st.session_state.get('agent', None), 'last_trace_id', None)
+        except Exception:
+            last_trace_id = None
+        if last_trace_id:
+            st.code(last_trace_id)
+
 
 def display_chat_messages():
     """Display all chat messages from history"""
@@ -207,8 +219,16 @@ def main():
                     chat_history=chat_history
                 )
                 
-                # Display response
-                st.markdown(response)
+                # Display response (avoid silent blank)
+                if not (response or "").strip():
+                    st.warning("Agent returned an empty response. Check model/provider settings or enable tracing.")
+                else:
+                    st.markdown(response)
+
+                # Surface trace id for debugging
+                trace_id = getattr(st.session_state.agent, 'last_trace_id', None)
+                if trace_id and Config.TRACE_ENABLED:
+                    st.caption(f"Trace ID: {trace_id}")
         
         # Add assistant response to chat history
         st.session_state.messages.append({"role": "assistant", "content": response})
