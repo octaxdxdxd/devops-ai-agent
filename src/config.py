@@ -1,6 +1,4 @@
-"""
-Configuration management for the AI Logging Agent
-"""
+"""Configuration management for the AI Ops agent."""
 import os
 from dotenv import load_dotenv
 
@@ -28,16 +26,21 @@ class Config:
     OPENROUTER_APP_NAME = os.getenv('OPENROUTER_APP_NAME')
     TEMPERATURE = float(os.getenv('TEMPERATURE', '0.1'))
     
-    # Paths
+    # Legacy path setting retained for backward compatibility (not used for local log tools anymore)
     LOG_DIRECTORY = os.getenv('LOG_DIRECTORY', 'logs')
     
     # Kubernetes Configuration
     K8S_KUBECONFIG = os.getenv('K8S_KUBECONFIG', '')
-    K8S_CONTEXT = os.getenv('K8S_CONTEXT', 'default')
+    K8S_CONTEXT = os.getenv('K8S_CONTEXT', '')
     K8S_DEFAULT_NAMESPACE = os.getenv('K8S_DEFAULT_NAMESPACE', 'production')
+    K8S_DRY_RUN = os.getenv('K8S_DRY_RUN', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    K8S_REQUEST_TIMEOUT_SEC = int(os.getenv('K8S_REQUEST_TIMEOUT_SEC', '20'))
+    K8S_OUTPUT_MAX_CHARS = int(os.getenv('K8S_OUTPUT_MAX_CHARS', '12000'))
     
     # Agent Configuration
     MAX_ITERATIONS = 5
+    MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '12'))
+    MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '2'))
     VERBOSE = True
 
     # Tracing (structured JSONL)
@@ -49,7 +52,8 @@ class Config:
     @classmethod
     def is_k8s_configured(cls) -> bool:
         """Check if Kubernetes is configured"""
-        # For placeholder mode, always return True
+        # Provider-agnostic: if kubectl can reach any configured context, tools can run.
+        # This supports EKS/AKS/GKE as long as kubeconfig auth is already set up.
         return True
     
     @classmethod
@@ -72,8 +76,7 @@ class Config:
                 f"Unsupported LLM_PROVIDER: {cls.LLM_PROVIDER!r}. Use 'gemini' or 'openrouter'."
             )
         
-        if not os.path.exists(cls.LOG_DIRECTORY):
-            os.makedirs(cls.LOG_DIRECTORY)
+        # Local log directory is no longer required for normal operation.
 
     @classmethod
     def get_active_model_name(cls) -> str:

@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-AI Logging Agent
-Main entry point for the interactive agent
-"""
+"""AI Ops agent CLI entry point."""
 import sys
 
 from .agents import LogAnalyzerAgent
@@ -12,11 +9,12 @@ from .config import Config
 def print_banner():
     """Print welcome banner"""
     print("=" * 60)
-    print("AI Log Analyzer")
+    print("AI Ops Kubernetes Assistant")
     print("=" * 60)
     print("\nCapabilities:")
-    print("  - Read and analyze log files")
-    print("  - Answer questions about errors and patterns")
+    print("  - Diagnose Kubernetes cluster state")
+    print("  - Inspect pods, events, workloads, and pod logs")
+    print("  - Recommend and execute safe remediations")
     print("  - Maintain conversation context")
     print("\nCommands:")
     print("  'quit' or 'exit' - Exit the program")
@@ -33,11 +31,11 @@ def print_help():
     print("  clear      - Clear conversation history")
     print("  help       - Show this help message")
     print("\nExample questions:")
-    print("  - What log files are available?")
-    print("  - Read the app.log file")
-    print("  - What errors are in app.log?")
-    print("  - Search for 'ERROR' in app.log")
-    print("  - When did the database connection fail?")
+    print("  - Show current kubectl context and namespaces")
+    print("  - Find pods for service nexus in namespace nexus")
+    print("  - Get recent warning/error events in production")
+    print("  - Show pod logs for last 30 minutes")
+    print("  - Which pods are crash looping?")
     print()
 
 

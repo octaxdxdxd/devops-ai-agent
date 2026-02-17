@@ -1,7 +1,7 @@
 """
-Log Analyzer Agent with Kubernetes Actions (Chapter 9)
-AI agent for analyzing logs and managing Kubernetes pods
+Kubernetes Diagnostics Agent with controlled remediation actions.
 """
+import json
 import time
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -24,14 +24,12 @@ class _NullContext:
 
 class LogAnalyzerAgent:
     """
-    AI Logging Agent with Kubernetes Management Capabilities
+    AI Ops agent for Kubernetes diagnostics and remediation guidance.
     
     Capabilities:
-    - Read and analyze application logs from Kubernetes pods
-    - Detect critical issues (OutOfMemoryError, CrashLoopBackOff, etc.)
-    - Automatically restart failed pods for P1 issues
-    - Check pod status and retrieve pod logs
-    - Scale deployments when needed
+    - Diagnose incidents from cluster state, events, and pod logs
+    - Detect critical issues (OOMKilled, CrashLoopBackOff, etc.)
+    - Recommend and execute approved remediation actions
     - Maintain conversation history
     """
     
@@ -211,7 +209,11 @@ class LogAnalyzerAgent:
         
         # Agent loop: continue until no more tool calls
         max_iterations = getattr(Config, "MAX_ITERATIONS", 5)
+        max_tool_calls = getattr(Config, "MAX_TOOL_CALLS_PER_TURN", 12)
+        max_duplicate_tool_calls = getattr(Config, "MAX_DUPLICATE_TOOL_CALLS", 2)
         iteration = 0
+        total_tool_calls = 0
+        call_signature_counts: dict[str, int] = {}
         current_response = response
         
         while iteration < max_iterations:
@@ -227,6 +229,58 @@ class LogAnalyzerAgent:
             for tool_call in current_response.tool_calls:
                 tool_name = tool_call['name']
                 tool_args = tool_call['args']
+
+                # Hard budget on total tool calls in a single turn.
+                total_tool_calls += 1
+                if total_tool_calls > max_tool_calls:
+                    if tw and trace_id:
+                        tw.emit({
+                            "trace_id": trace_id,
+                            "event": "tool_loop.call_budget_hit",
+                            "max_tool_calls": max_tool_calls,
+                            "attempted_tool": tool_name,
+                        })
+                    messages.append(AIMessage(content=current_response.content, tool_calls=current_response.tool_calls))
+                    messages.append(
+                        HumanMessage(
+                            content=(
+                                "Stop calling tools now. You have enough evidence. "
+                                "Provide your best final incident summary using existing tool results."
+                            )
+                        )
+                    )
+                    forced = self.llm.invoke(messages)
+                    forced_text = extract_response_text(forced)
+                    if (forced_text or "").strip():
+                        return forced_text
+                    return "I stopped tool execution due to safety budget limits. Please narrow the request (service/pod/namespace/time window)."
+
+                # Duplicate suppression: repeated identical tool+args usually indicates loopiness.
+                try:
+                    signature = f"{tool_name}:{json.dumps(tool_args, sort_keys=True, ensure_ascii=False)}"
+                except Exception:
+                    signature = f"{tool_name}:{str(tool_args)}"
+                call_signature_counts[signature] = call_signature_counts.get(signature, 0) + 1
+                if call_signature_counts[signature] > max_duplicate_tool_calls:
+                    if tw and trace_id:
+                        tw.emit({
+                            "trace_id": trace_id,
+                            "event": "tool_loop.duplicate_suppressed",
+                            "tool": tool_name,
+                            "args": tool_args,
+                            "count": call_signature_counts[signature],
+                            "max_duplicate_tool_calls": max_duplicate_tool_calls,
+                        })
+                    tool_messages.append(
+                        ToolMessage(
+                            content=(
+                                "Duplicate tool call suppressed to avoid loops. "
+                                "Use previous tool results and provide a final answer."
+                            ),
+                            tool_call_id=tool_call['id']
+                        )
+                    )
+                    continue
                 
                 if tw and trace_id:
                     tw.emit({"trace_id": trace_id, "event": "tool.request", "tool": tool_name, "args": tool_args})

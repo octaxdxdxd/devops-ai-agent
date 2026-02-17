@@ -1,6 +1,4 @@
-"""
-AI Logging Agent
-"""
+"""AI Ops Kubernetes Assistant."""
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage
 import sys
@@ -15,7 +13,7 @@ from src.config import Config
 
 # Page configuration
 st.set_page_config(
-    page_title="AI Log Analyzer",
+    page_title="AI Ops K8s Assistant",
     page_icon="",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -44,7 +42,7 @@ def initialize_session_state():
 def display_sidebar():
     """Display sidebar with information and controls"""
     with st.sidebar:
-        st.title("AI Logging Agent")
+        st.title("AI Ops Agent")
         st.markdown("---")
 
         st.subheader("Model")
@@ -55,10 +53,9 @@ def display_sidebar():
         )
 
         openrouter_presets = [
-            "arcee-ai/trinity-large-preview:free",
-            "meta-llama/llama-3.1-8b-instruct:free",
-            "google/gemma-2-9b-it:free",
-            "microsoft/phi-3-mini-128k-instruct:free",
+            "qwen/qwen3-vl-235b-a22b-thinking",
+            "stepfun/step-3.5-flash:free",
+            "openai/gpt-oss-120b:free"
         ]
 
         model_name = None
@@ -76,38 +73,41 @@ def display_sidebar():
         
         st.subheader("About")
         st.markdown("""
-        AI-powered log analysis and incident response:
-        - Read and analyze pod logs
-        - Detect critical issues
-        - Action when needed
-        - Get intelligent recommendations
-        - Natural language interface
+        AI-powered Kubernetes diagnostics and incident response:
+        - Cluster and namespace diagnostics
+        - Pod/deployment/service investigation
+        - Pod logs from the cluster API
+        - Event and resource pressure analysis
+        - Safe action execution with approval
         """)
         
         st.markdown("---")
         
         st.subheader("Available Tools")
         st.markdown("""
-        **Log Analysis:**
-        - `read_log_file` - Read specific log file
-        - `list_log_files` - List available logs
-        - `search_logs` - Search log patterns
+        **Kubernetes Diagnostics (Read-only):**
+        - `k8s_current_context`, `k8s_list_contexts`, `k8s_cluster_info`
+        - `k8s_list_namespaces`, `k8s_list_nodes`, `k8s_top_nodes`
+        - `k8s_list_pods`, `k8s_find_pods`, `k8s_describe_pod`
+        - `k8s_get_pod_logs`, `k8s_get_events`, `k8s_get_crashloop_pods`
+        - `k8s_list_deployments`, `k8s_describe_deployment`
+        - `k8s_list_services`, `k8s_list_ingresses`, `k8s_list_hpa`
         
         **Kubernetes Actions:**
         - `restart_kubernetes_pod` - Restart failed pod
           - 🔒 Always asks for approval
-          - ⚡ Recommended for P1 OOM issues
+                    - ⚡ Use for crash-recovery scenarios
         """)
         
         st.markdown("---")
         
         st.subheader("Example Questions")
         st.markdown("""
-        - "Check k8s.log for issues"
-        - "What errors are in the Java pod logs?"
-        - "Analyze the OutOfMemoryError"
-        - "List all log files"
-        - "Search for 'CrashLoopBackOff'"
+        - "Show current context and list namespaces"
+        - "Find nexus pods and describe the unhealthy one"
+        - "Get pod logs for last 30 minutes"
+        - "Show recent warning/error events in production"
+        - "Which pods are in CrashLoopBackOff?"
         """)
         
         st.markdown("---")
@@ -124,10 +124,11 @@ def display_sidebar():
         
         st.subheader("How It Works")
         st.markdown("""
-        1. **Analysis**: AI examines logs and identifies issues
-        2. **Recommendation**: Suggests actions (e.g., pod restart)
-        3. **Confirmation**: Asks for your approval
-        4. **Execution**: Performs action after you confirm
+        1. **Discovery**: AI queries cluster state (pods, events, workloads)
+        2. **Diagnosis**: Correlates status, logs, and resource signals
+        3. **Recommendation**: Suggests actions (e.g., pod restart)
+        4. **Confirmation**: Asks for your approval
+        5. **Execution**: Performs action after you confirm
         """)
         
         st.markdown("---")
@@ -142,8 +143,8 @@ def display_sidebar():
         st.caption(f"Provider: {st.session_state.model_provider}")
         st.caption(f"Model: {st.session_state.model_name}")
         st.caption(f"Temperature: {Config.TEMPERATURE}")
-        st.caption(f"Log Directory: {Config.LOG_DIRECTORY}")
-        st.caption(f"K8s Namespace: {Config.K8S_DEFAULT_NAMESPACE}")
+        st.caption(f"K8s Context: {Config.K8S_CONTEXT or '(active kubectl context)'}")
+        st.caption(f"K8s Namespace: {Config.K8S_DEFAULT_NAMESPACE or '(auto/current context)'}")
 
         st.markdown("---")
         st.subheader("Tracing")
@@ -185,19 +186,19 @@ def main():
     display_sidebar()
     
     # Main content area
-    st.markdown("Analyze pod logs and manage incidents with intelligent automation")
+    st.markdown("Investigate Kubernetes incidents with intelligent cluster diagnostics")
     
     # Info banner
     st.info("""
-    💡 **Tip**: Ask me to check `k8s.log` to see intelligent incident analysis!
-    I will analyze the issue, recommend actions, and wait for your confirmation before executing.
+    💡 **Tip**: Ask me to inspect a namespace/service (pods, events, logs, resources).
+    I will diagnose first, recommend remediation, and ask confirmation before any write action.
     """)
     
     # Display chat messages
     display_chat_messages()
     
     # Chat input
-    if prompt := st.chat_input("Ask about Kubernetes logs or pod status..."):
+    if prompt := st.chat_input("Ask about cluster health, pods, events, or remediation..."):
         # Add user message to chat
         st.session_state.messages.append({"role": "user", "content": prompt})
         
@@ -207,7 +208,7 @@ def main():
         
         # Get agent response
         with st.chat_message("assistant"):
-            with st.spinner("Analyzing logs and checking pod status..."):
+            with st.spinner("Inspecting cluster state and diagnostics..."):
                 # Convert chat history to LangChain format
                 chat_history = convert_to_langchain_messages(
                     st.session_state.messages[:-1]  # Exclude the current message
