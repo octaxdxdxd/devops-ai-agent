@@ -8,6 +8,7 @@ These tools are intentionally non-mutating and provider-agnostic:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -57,6 +58,15 @@ def _validate_namespace(namespace: str) -> str | None:
     return None
 
 
+def _validate_resource_kind(kind: str) -> str | None:
+    value = (kind or "").strip().lower()
+    if not value:
+        return "❌ kind is required."
+    if not re.fullmatch(r"[a-z][a-z0-9\.-]*", value):
+        return f"❌ Invalid resource kind: {kind!r}."
+    return None
+
+
 def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
     if not rows:
         return "(no rows)"
@@ -69,6 +79,13 @@ def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
     line = sep.join("-" * widths[i] for i, _h in enumerate(headers))
     body = "\n".join(sep.join(c.ljust(widths[i]) for i, c in enumerate(r)) for r in rows)
     return f"{header}\n{line}\n{body}"
+
+
+def _get_ns_read_args(resource: str, namespace: str, *extra: str) -> list[str]:
+    ns = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    if ns.lower() == "all":
+        return ["get", resource, "-A", *extra]
+    return ["get", resource, "-n", ns, *extra]
 
 
 def _discover_pod_namespaces(pod_name: str) -> tuple[list[str], str | None]:
@@ -433,7 +450,7 @@ def k8s_list_statefulsets(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(["get", "statefulsets", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "statefulsets", "-A"])
+    return _run_readonly(_get_ns_read_args("statefulsets", namespace))
 
 
 @tool
@@ -444,7 +461,7 @@ def k8s_list_daemonsets(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(["get", "daemonsets", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "daemonsets", "-A"])
+    return _run_readonly(_get_ns_read_args("daemonsets", namespace))
 
 
 @tool
@@ -455,7 +472,7 @@ def k8s_list_services(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(["get", "services", "-A" if namespace.lower() == "all" else "-n", namespace, "-o", "wide"] if namespace.lower() != "all" else ["get", "services", "-A", "-o", "wide"])
+    return _run_readonly(_get_ns_read_args("services", namespace, "-o", "wide"))
 
 
 @tool
@@ -466,7 +483,7 @@ def k8s_list_ingresses(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(["get", "ingress", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "ingress", "-A"])
+    return _run_readonly(_get_ns_read_args("ingress", namespace))
 
 
 @tool
@@ -477,7 +494,7 @@ def k8s_list_hpa(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(["get", "hpa", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "hpa", "-A"])
+    return _run_readonly(_get_ns_read_args("hpa", namespace))
 
 
 @tool
@@ -489,7 +506,7 @@ def k8s_get_events(namespace: str = "all", since_minutes: int = 60, limit: int =
         if err:
             return err
 
-    code, data, err = _run_json(["get", "events", "-A" if ns.lower() == "all" else "-n", ns] if ns.lower() != "all" else ["get", "events", "-A"])
+    code, data, err = _run_json(_get_ns_read_args("events", ns))
     if code != 0 or data is None:
         return kube_access_help(err)
 
@@ -549,7 +566,7 @@ def k8s_get_pvcs(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(["get", "pvc", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "pvc", "-A"])
+    return _run_readonly(_get_ns_read_args("pvc", namespace))
 
 
 @tool
@@ -601,6 +618,207 @@ def k8s_get_crashloop_pods(namespace: str = "all", limit: int = 100) -> str:
     return truncate_text(_fmt_table(["NS", "POD", "CONTAINER", "REASON", "RESTARTS", "PHASE"], rows))
 
 
+@tool
+def k8s_list_pvs() -> str:
+    """List PersistentVolumes across the cluster."""
+    return _run_readonly(["get", "pv", "-o", "wide"])
+
+
+@tool
+def k8s_describe_pvc(pvc_name: str, namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
+    """Describe one PersistentVolumeClaim."""
+    pvc_name = (pvc_name or "").strip()
+    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    if not is_valid_k8s_name(pvc_name):
+        return f"❌ Invalid pvc name: {pvc_name!r}."
+    err = _validate_namespace(namespace)
+    if err:
+        return err
+    return _run_readonly(["describe", "pvc", pvc_name, "-n", namespace])
+
+
+@tool
+def k8s_describe_pv(pv_name: str) -> str:
+    """Describe one PersistentVolume."""
+    pv_name = (pv_name or "").strip()
+    if not pv_name:
+        return "❌ pv_name is required."
+    return _run_readonly(["describe", "pv", pv_name])
+
+
+@tool
+def k8s_describe_node(node_name: str) -> str:
+    """Describe one Kubernetes node (capacity, allocatable, pressure/conditions)."""
+    node_name = (node_name or "").strip()
+    if not node_name:
+        return "❌ node_name is required."
+    return _run_readonly(["describe", "node", node_name])
+
+
+@tool
+def k8s_get_resource_yaml(kind: str, name: str, namespace: str = "") -> str:
+    """Get full YAML for any Kubernetes resource (read-only)."""
+    kind = (kind or "").strip()
+    name = (name or "").strip()
+    namespace = (namespace or "").strip()
+
+    kind_err = _validate_resource_kind(kind)
+    if kind_err:
+        return kind_err
+    if not name:
+        return "❌ name is required."
+
+    # Cluster-scoped defaults for common kinds.
+    cluster_scoped_kinds = {
+        "pv", "persistentvolume", "persistentvolumes",
+        "node", "nodes",
+        "namespace", "namespaces",
+        "storageclass", "storageclasses",
+        "clusterrole", "clusterroles",
+        "clusterrolebinding", "clusterrolebindings",
+        "customresourcedefinition", "customresourcedefinitions", "crd", "crds",
+    }
+
+    args = ["get", kind, name, "-o", "yaml"]
+    if namespace and kind.lower() not in cluster_scoped_kinds:
+        ns_err = _validate_namespace(namespace)
+        if ns_err:
+            return ns_err
+        args += ["-n", namespace]
+
+    return _run_readonly(args)
+
+
+@tool
+def k8s_get_pod_scheduling_report(pod_name: str, namespace: str = "auto") -> str:
+    """Collect pod scheduling diagnostics including PVC/PV/node-affinity details in one report."""
+    pod_name = (pod_name or "").strip()
+    ns_input = (namespace or "auto").strip() or "auto"
+    if not is_valid_k8s_name(pod_name):
+        return f"❌ Invalid pod name: {pod_name!r}."
+
+    resolved_ns, resolve_err = _resolve_namespace_for_pod(pod_name, ns_input)
+    if resolve_err:
+        return resolve_err
+    if not resolved_ns:
+        return f"❌ Could not resolve namespace for pod '{pod_name}'."
+
+    err = _validate_namespace(resolved_ns)
+    if err:
+        return err
+
+    code_pod, pod_data, pod_err = _run_json(["get", "pod", pod_name, "-n", resolved_ns])
+    if code_pod != 0 or pod_data is None:
+        return kube_access_help(pod_err)
+
+    status = pod_data.get("status", {})
+    spec = pod_data.get("spec", {})
+    phase = str(status.get("phase", ""))
+    node_name = str(spec.get("nodeName", ""))
+    conditions = status.get("conditions") or []
+    ready_state = "unknown"
+    for cond in conditions:
+        if str(cond.get("type", "")) == "Ready":
+            ready_state = str(cond.get("status", ""))
+            break
+
+    rows_events: list[list[str]] = []
+    code_events, events_data, events_err = _run_json(["get", "events", "-n", resolved_ns])
+    if code_events == 0 and events_data is not None:
+        for item in events_data.get("items", []):
+            involved = item.get("involvedObject", {})
+            if str(involved.get("kind", "")) == "Pod" and str(involved.get("name", "")) == pod_name:
+                rows_events.append([
+                    str(item.get("type", "")),
+                    str(item.get("reason", "")),
+                    str(item.get("lastTimestamp") or item.get("eventTime") or item.get("metadata", {}).get("creationTimestamp") or ""),
+                    str(item.get("message", ""))[:140],
+                ])
+        rows_events.sort(key=lambda r: r[2], reverse=True)
+
+    pvc_rows: list[list[str]] = []
+    pv_names: list[str] = []
+    for vol in spec.get("volumes") or []:
+        pvc_ref = (vol.get("persistentVolumeClaim") or {}).get("claimName")
+        if not pvc_ref:
+            continue
+        code_pvc, pvc_data, _pvc_err = _run_json(["get", "pvc", str(pvc_ref), "-n", resolved_ns])
+        if code_pvc != 0 or pvc_data is None:
+            pvc_rows.append([str(pvc_ref), "(lookup failed)", "", ""])
+            continue
+        pvc_status = pvc_data.get("status", {})
+        pvc_spec = pvc_data.get("spec", {})
+        pv_name = str(pvc_spec.get("volumeName", ""))
+        if pv_name:
+            pv_names.append(pv_name)
+        pvc_rows.append([
+            str(pvc_ref),
+            str(pvc_status.get("phase", "")),
+            pv_name,
+            str(pvc_spec.get("storageClassName", "")),
+        ])
+
+    pv_rows: list[list[str]] = []
+    for pv_name in sorted(set(pv_names)):
+        code_pv, pv_data, _pv_err = _run_json(["get", "pv", pv_name])
+        if code_pv != 0 or pv_data is None:
+            pv_rows.append([pv_name, "(lookup failed)", ""])
+            continue
+        pv_spec = pv_data.get("spec", {})
+        node_aff = ((pv_spec.get("nodeAffinity") or {}).get("required") or {}).get("nodeSelectorTerms") or []
+        aff_summary = json.dumps(node_aff, ensure_ascii=False)[:220] if node_aff else "(none)"
+        pv_rows.append([
+            pv_name,
+            str((pv_data.get("status") or {}).get("phase", "")),
+            aff_summary,
+        ])
+
+    node_rows: list[list[str]] = []
+    code_nodes, nodes_data, _nodes_err = _run_json(["get", "nodes"])
+    if code_nodes == 0 and nodes_data is not None:
+        for node in nodes_data.get("items", []):
+            meta = node.get("metadata", {})
+            st = node.get("status", {})
+            name = str(meta.get("name", ""))
+            labels = meta.get("labels") or {}
+            zone = str(labels.get("topology.kubernetes.io/zone") or labels.get("failure-domain.beta.kubernetes.io/zone") or "")
+            alloc = st.get("allocatable") or {}
+            node_rows.append([
+                name,
+                zone,
+                str(alloc.get("cpu", "")),
+                str(alloc.get("memory", "")),
+            ])
+
+    parts: list[str] = []
+    parts.append("Pod Scheduling Report")
+    parts.append(f"Pod: {pod_name}")
+    parts.append(f"Namespace: {resolved_ns}")
+    parts.append(f"Phase: {phase}")
+    parts.append(f"Ready: {ready_state}")
+    parts.append(f"Assigned node: {node_name or '(none)'}")
+
+    if rows_events:
+        parts.append("\nRecent Pod Events")
+        parts.append(_fmt_table(["TYPE", "REASON", "TIME", "MESSAGE"], rows_events[:20]))
+    elif events_err:
+        parts.append(f"\nEvent lookup error: {events_err}")
+
+    if pvc_rows:
+        parts.append("\nPVC Bindings")
+        parts.append(_fmt_table(["PVC", "PHASE", "PV", "STORAGE_CLASS"], pvc_rows))
+
+    if pv_rows:
+        parts.append("\nPV Node Affinity")
+        parts.append(_fmt_table(["PV", "PHASE", "NODE_AFFINITY_REQUIRED"], pv_rows))
+
+    if node_rows:
+        parts.append("\nNode Allocatable (for scheduling context)")
+        parts.append(_fmt_table(["NODE", "ZONE", "CPU", "MEMORY"], node_rows))
+
+    return truncate_text("\n".join(parts))
+
+
 def get_k8s_read_tools() -> list:
     """Return all read-only Kubernetes diagnostic tools."""
     return [
@@ -627,5 +845,11 @@ def get_k8s_read_tools() -> list:
         k8s_get_events,
         k8s_get_resource_quotas,
         k8s_get_pvcs,
+        k8s_list_pvs,
+        k8s_describe_pvc,
+        k8s_describe_pv,
+        k8s_describe_node,
+        k8s_get_resource_yaml,
+        k8s_get_pod_scheduling_report,
         k8s_get_crashloop_pods,
     ]

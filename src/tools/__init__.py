@@ -26,15 +26,31 @@ from .k8s_diagnostics import (
     k8s_get_events,
     k8s_get_resource_quotas,
     k8s_get_pvcs,
+    k8s_list_pvs,
+    k8s_describe_pvc,
+    k8s_describe_pv,
+    k8s_describe_node,
+    k8s_get_resource_yaml,
+    k8s_get_pod_scheduling_report,
     k8s_get_crashloop_pods,
 )
-from .actions import restart_kubernetes_pod
+from .actions import (
+    restart_kubernetes_pod,
+    restart_kubernetes_pods_batch,
+    scale_kubernetes_deployment,
+    scale_kubernetes_statefulset,
+    scale_kubernetes_workloads_batch,
+)
 
 
 # Tool policy
 # Keep it simple: anything that can change infra/state must be explicitly approved.
 WRITE_TOOL_NAMES = {
     "restart_kubernetes_pod",
+    "restart_kubernetes_pods_batch",
+    "scale_kubernetes_deployment",
+    "scale_kubernetes_statefulset",
+    "scale_kubernetes_workloads_batch",
 }
 
 
@@ -47,6 +63,10 @@ def get_all_tools():
     """Get all available tools for the agent"""
     tools = get_k8s_read_tools()
     tools.append(restart_kubernetes_pod)
+    tools.append(restart_kubernetes_pods_batch)
+    tools.append(scale_kubernetes_deployment)
+    tools.append(scale_kubernetes_statefulset)
+    tools.append(scale_kubernetes_workloads_batch)
     return tools
 
 
@@ -74,9 +94,19 @@ __all__ = [
     'k8s_get_events',
     'k8s_get_resource_quotas',
     'k8s_get_pvcs',
+    'k8s_list_pvs',
+    'k8s_describe_pvc',
+    'k8s_describe_pv',
+    'k8s_describe_node',
+    'k8s_get_resource_yaml',
+    'k8s_get_pod_scheduling_report',
     'k8s_get_crashloop_pods',
     'get_k8s_read_tools',
     'restart_kubernetes_pod',
+    'restart_kubernetes_pods_batch',
+    'scale_kubernetes_deployment',
+    'scale_kubernetes_statefulset',
+    'scale_kubernetes_workloads_batch',
     'WRITE_TOOL_NAMES',
     'is_write_tool',
     'get_all_tools'

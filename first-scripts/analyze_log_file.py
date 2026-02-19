@@ -1,4 +1,5 @@
 import os
+import sys
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -7,14 +8,14 @@ load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     print("OPENAI_API_KEY not found in environment variables.")
-    exit(1)
+    sys.exit(1)
 
 client = OpenAI(
   base_url="https://openrouter.ai/api/v1",
   api_key=api_key,
 )
 
-with open('logs/sample_app.log', 'r') as file:
+with open('logs/sample_app.log', 'r', encoding='utf-8') as file:
     logs = file.read()
 
 prompt = f"""You are an expert DevOps engineer analyzing application logs.

@@ -1,11 +1,13 @@
 """AI Ops Kubernetes Assistant."""
-import streamlit as st
-from langchain_core.messages import HumanMessage, AIMessage
 import sys
 from pathlib import Path
 
+import streamlit as st
+from langchain_core.messages import AIMessage, HumanMessage
+
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent))
+ROOT_DIR = Path(__file__).parent
+sys.path.insert(0, str(ROOT_DIR))
 
 from src.agents import LogAnalyzerAgent
 from src.config import Config
@@ -37,6 +39,8 @@ def initialize_session_state():
         st.session_state.model_provider = Config.LLM_PROVIDER
     if 'model_name' not in st.session_state:
         st.session_state.model_name = Config.get_active_model_name()
+    if 'autonomy_last_scan' not in st.session_state:
+        st.session_state.autonomy_last_scan = None
 
 
 def display_sidebar():
@@ -53,8 +57,8 @@ def display_sidebar():
         )
 
         openrouter_presets = [
-            "qwen/qwen3-vl-235b-a22b-thinking",
             "stepfun/step-3.5-flash:free",
+            "qwen/qwen3-vl-235b-a22b-thinking",
             "openai/gpt-oss-120b:free"
         ]
 
@@ -90,13 +94,19 @@ def display_sidebar():
         - `k8s_list_namespaces`, `k8s_list_nodes`, `k8s_top_nodes`
         - `k8s_list_pods`, `k8s_find_pods`, `k8s_describe_pod`
         - `k8s_get_pod_logs`, `k8s_get_events`, `k8s_get_crashloop_pods`
+        - `k8s_list_pvs`, `k8s_describe_pvc`, `k8s_describe_pv`, `k8s_describe_node`
+        - `k8s_get_resource_yaml`, `k8s_get_pod_scheduling_report`
         - `k8s_list_deployments`, `k8s_describe_deployment`
         - `k8s_list_services`, `k8s_list_ingresses`, `k8s_list_hpa`
         
         **Kubernetes Actions:**
         - `restart_kubernetes_pod` - Restart failed pod
+        - `restart_kubernetes_pods_batch` - Restart multiple pods in one approved step
+        - `scale_kubernetes_deployment` - Scale a deployment
+        - `scale_kubernetes_statefulset` - Scale a statefulset
+        - `scale_kubernetes_workloads_batch` - Multi-workload scaling in one approved step
           - 🔒 Always asks for approval
-                    - ⚡ Use for crash-recovery scenarios
+        - ⚡ Use for crash-recovery and controlled mitigation scenarios
         """)
         
         st.markdown("---")
@@ -157,6 +167,23 @@ def display_sidebar():
             last_trace_id = None
         if last_trace_id:
             st.code(last_trace_id)
+
+        st.markdown("---")
+        st.subheader("Automated Alerting")
+        st.caption(f"Enabled: {Config.AUTONOMY_ENABLED}")
+        st.caption(f"Auto-scan on each turn: {Config.AUTONOMY_SCAN_ON_USER_TURN}")
+        st.caption(f"Scope: {Config.AUTONOMY_NAMESPACE}")
+        st.caption(f"Event lookback: {Config.AUTONOMY_RECENT_MINUTES}m")
+        st.caption(f"Pending grace: {Config.ALERT_PENDING_GRACE_MINUTES}m")
+        st.caption(f"Critical event threshold: {Config.ALERT_CRITICAL_EVENT_MIN_COUNT}")
+
+        if st.button("Run automated alert scan", use_container_width=True):
+            with st.spinner("Running automated Kubernetes health scan..."):
+                scan = st.session_state.agent.run_autonomous_scan(send_notifications=True)
+                st.session_state.autonomy_last_scan = scan
+
+        if st.session_state.autonomy_last_scan:
+            st.markdown(st.session_state.agent.format_autonomous_scan(st.session_state.autonomy_last_scan))
 
 
 def display_chat_messages():

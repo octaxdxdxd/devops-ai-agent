@@ -20,3 +20,6 @@ __pycache__/
 # Logs / traces
 *.log
 logs/traces/
+
+logs/autonomy_state.json
+*.autonomy_state.json
