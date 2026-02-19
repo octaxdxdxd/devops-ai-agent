@@ -36,6 +36,51 @@ class Config:
     K8S_DRY_RUN = os.getenv('K8S_DRY_RUN', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     K8S_REQUEST_TIMEOUT_SEC = int(os.getenv('K8S_REQUEST_TIMEOUT_SEC', '20'))
     K8S_OUTPUT_MAX_CHARS = int(os.getenv('K8S_OUTPUT_MAX_CHARS', '12000'))
+
+    # AWS CLI tools
+    AWS_CLI_ENABLED = os.getenv('AWS_CLI_ENABLED', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AWS_CLI_DRY_RUN = os.getenv('AWS_CLI_DRY_RUN', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AWS_CLI_TIMEOUT_SEC = int(os.getenv('AWS_CLI_TIMEOUT_SEC', '30'))
+    AWS_CLI_PROFILE = os.getenv('AWS_CLI_PROFILE', '').strip()
+    AWS_CLI_DEFAULT_REGION = os.getenv('AWS_CLI_DEFAULT_REGION', '').strip()
+    AWS_CLI_AUDIT_LOG = os.getenv('AWS_CLI_AUDIT_LOG', os.path.join(LOG_DIRECTORY, 'aws_cli_audit.jsonl'))
+    AWS_CLI_AUTO_REGION_RETRY = os.getenv('AWS_CLI_AUTO_REGION_RETRY', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AWS_CLI_PROMPT_FOR_REGION_ON_EMPTY = os.getenv('AWS_CLI_PROMPT_FOR_REGION_ON_EMPTY', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AWS_CLI_REQUIRE_DEFAULT_REGION_FOR_REGIONAL = os.getenv('AWS_CLI_REQUIRE_DEFAULT_REGION_FOR_REGIONAL', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AWS_CLI_AUTO_REGION_FANOUT_MAX = int(os.getenv('AWS_CLI_AUTO_REGION_FANOUT_MAX', '6'))
+    AWS_CLI_FALLBACK_REGIONS = os.getenv(
+        'AWS_CLI_FALLBACK_REGIONS',
+        'us-east-1,us-east-2,us-west-2,eu-west-1,eu-central-1,ap-southeast-1,ap-northeast-1',
+    )
+    AWS_CLI_READONLY_ALLOWLIST = os.getenv(
+        'AWS_CLI_READONLY_ALLOWLIST',
+        (
+            'sts:get-caller-identity,*:list*,*:get*,*:describe*,*:head*,'
+            '*:batch-get*,*:lookup*,*:query*,*:search*,*:select*,'
+            'cloudwatch:generate-query,logs:filter-log-events,logs:start-query,logs:get-query-results'
+        ),
+    )
+    AWS_CLI_WRITE_ALLOWLIST = os.getenv(
+        'AWS_CLI_WRITE_ALLOWLIST',
+        (
+            'autoscaling:resume-processes,autoscaling:suspend-processes,autoscaling:set-desired-capacity,'
+            'autoscaling:update-auto-scaling-group,autoscaling:start-instance-refresh,autoscaling:cancel-instance-refresh,'
+            'autoscaling:terminate-instance-in-auto-scaling-group,eks:update-nodegroup-config,eks:update-nodegroup-version,'
+            'eks:update-cluster-config,eks:update-cluster-version,eks:update-addon,eks:create-addon,eks:delete-addon,'
+            'ecs:update-service,ecs:run-task,ecs:start-task,ecs:stop-task,ecs:execute-command,'
+            'ec2:reboot-instances,ec2:start-instances,ec2:stop-instances,ec2:terminate-instances,ec2:create-tags,ec2:delete-tags,'
+            'rds:reboot-db-instance,rds:start-db-instance,rds:stop-db-instance,rds:modify-db-instance,'
+            'elasticloadbalancing:register-instances-with-load-balancer,elasticloadbalancing:deregister-instances-from-load-balancer,'
+            'elbv2:register-targets,elbv2:deregister-targets,elbv2:modify-target-group,elbv2:modify-listener,elbv2:modify-rule,'
+            'lambda:update-function-configuration,lambda:update-function-code,lambda:publish-version,lambda:put-function-concurrency,'
+            'route53:change-resource-record-sets,route53:create-health-check,route53:update-health-check,route53:delete-health-check,'
+            'cloudwatch:put-metric-alarm,cloudwatch:delete-alarms,cloudwatch:disable-alarm-actions,cloudwatch:enable-alarm-actions,'
+            'logs:put-retention-policy,logs:delete-retention-policy,logs:put-subscription-filter,logs:delete-subscription-filter,'
+            'ssm:send-command,ssm:start-automation-execution,ssm:start-session,ssm:cancel-command,'
+            'sns:publish,sns:subscribe,sns:unsubscribe,sqs:send-message,sqs:purge-queue,s3:put-object,s3:delete-object'
+        ),
+    ).strip()
+    AWS_CLI_BLOCKLIST = os.getenv('AWS_CLI_BLOCKLIST', 'iam:*,organizations:*,account:*').strip()
     
     # Agent Configuration
     MAX_ITERATIONS = 5
@@ -52,6 +97,8 @@ class Config:
     # Autonomous Hybrid Monitoring
     AUTONOMY_ENABLED = os.getenv('AUTONOMY_ENABLED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AUTONOMY_SCAN_ON_USER_TURN = os.getenv('AUTONOMY_SCAN_ON_USER_TURN', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AUTONOMY_PERIODIC_SCAN_ENABLED = os.getenv('AUTONOMY_PERIODIC_SCAN_ENABLED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AUTONOMY_SCAN_INTERVAL_SEC = int(os.getenv('AUTONOMY_SCAN_INTERVAL_SEC', '30'))
     AUTONOMY_NAMESPACE = os.getenv('AUTONOMY_NAMESPACE', 'all')
     AUTONOMY_RECENT_MINUTES = int(os.getenv('AUTONOMY_RECENT_MINUTES', '30'))
     AUTONOMY_BASELINE_MINUTES = int(os.getenv('AUTONOMY_BASELINE_MINUTES', '180'))

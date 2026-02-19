@@ -22,4 +22,5 @@ __pycache__/
 logs/traces/
 
 logs/autonomy_state.json
+logs/aws_cli_audit.jsonl
 *.autonomy_state.json

@@ -45,6 +45,11 @@ from .actions import (
     rollout_restart_kubernetes_daemonset,
     rollout_restart_kubernetes_workloads_batch,
 )
+from .aws_cli import (
+    get_aws_tools,
+    aws_cli_readonly,
+    aws_cli_execute,
+)
 
 
 # Tool policy
@@ -59,6 +64,7 @@ WRITE_TOOL_NAMES = {
     "rollout_restart_kubernetes_statefulset",
     "rollout_restart_kubernetes_daemonset",
     "rollout_restart_kubernetes_workloads_batch",
+    "aws_cli_execute",
 }
 
 
@@ -70,6 +76,7 @@ def is_write_tool(tool_name: str) -> bool:
 def get_all_tools():
     """Get all available tools for the agent"""
     tools = get_k8s_read_tools()
+    tools.extend(get_aws_tools())
     tools.append(restart_kubernetes_pod)
     tools.append(restart_kubernetes_pods_batch)
     tools.append(scale_kubernetes_deployment)
@@ -123,6 +130,9 @@ __all__ = [
     'rollout_restart_kubernetes_statefulset',
     'rollout_restart_kubernetes_daemonset',
     'rollout_restart_kubernetes_workloads_batch',
+    'aws_cli_readonly',
+    'aws_cli_execute',
+    'get_aws_tools',
     'WRITE_TOOL_NAMES',
     'is_write_tool',
     'get_all_tools'

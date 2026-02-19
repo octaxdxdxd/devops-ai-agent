@@ -8,3 +8,4 @@ langchain-openai>=0.3.0
 google-generativeai>=0.8.5
 langchain-google-genai>=3.0.3
 streamlit>=1.30.0
+streamlit-autorefresh>=1.0.1

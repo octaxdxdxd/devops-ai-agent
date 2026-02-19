@@ -110,7 +110,8 @@ class LogAnalyzerAgent:
                     inc = scan.get("incident", {})
                     notif = scan.get("notifications", {})
                     fingerprint = str(inc.get("fingerprint") or "")
-                    if fingerprint and fingerprint != self._last_announced_incident_fingerprint:
+                    should_show_banner = self._notification_was_sent(notif)
+                    if should_show_banner and fingerprint and fingerprint != self._last_announced_incident_fingerprint:
                         alert_prefix = (
                             "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
                             f"Severity: {inc.get('severity', 'unknown')} | "
@@ -119,6 +120,7 @@ class LogAnalyzerAgent:
                             f"Summary: {inc.get('issue_summary', '')}\n"
                             f"Notification result: {notif}\n\n"
                         )
+                    if fingerprint:
                         self._last_announced_incident_fingerprint = fingerprint
                 else:
                     self._last_announced_incident_fingerprint = None
@@ -132,12 +134,13 @@ class LogAnalyzerAgent:
                         pending_name = self._pending_action["tool"].name
                         pending_args = self._pending_action["args"]
                         cmd_preview = self._format_command_preview(pending_name, pending_args)
+                        cmd_block = self._commands_code_block(cmd_preview)
                         return (
                             alert_prefix
                             + "I switched this to a batch restart as requested.\n"
                             + f"Approval required before I can run `{pending_name}` with args {pending_args}.\n"
                             + "Planned command(s):\n"
-                            + cmd_preview
+                            + cmd_block
                             + "\nReply `yes` to approve or `no` to cancel."
                         )
 
@@ -145,6 +148,7 @@ class LogAnalyzerAgent:
                     tool = self._pending_action["tool"]
                     args = self._pending_action["args"]
                     cmd_preview = self._format_command_preview(tool.name, args)
+                    cmd_block = self._commands_code_block(cmd_preview)
                     self._pending_action = None
                     try:
                         if tw:
@@ -154,9 +158,9 @@ class LogAnalyzerAgent:
                         return (
                             alert_prefix +
                             "Write command(s) to execute:\n"
-                            f"{cmd_preview}\n\n"
+                            f"{cmd_block}\n\n"
                             f"Approved. Executed `{tool.name}`.\n\n"
-                            f"Executed command(s):\n{cmd_preview}\n\n"
+                            f"Executed command(s):\n{cmd_block}\n\n"
                             f"Result:\n{result}"
                         )
                     except Exception as e:
@@ -174,11 +178,12 @@ class LogAnalyzerAgent:
                 pending_name = self._pending_action["tool"].name
                 pending_args = self._pending_action["args"]
                 cmd_preview = self._format_command_preview(pending_name, pending_args)
+                cmd_block = self._commands_code_block(cmd_preview)
                 return (
                     alert_prefix +
                     f"Approval required before I can run `{pending_name}` with args {pending_args}.\n"
                     "Planned command(s):\n"
-                    f"{cmd_preview}\n"
+                    f"{cmd_block}\n"
                     "Reply `yes` to approve or `no` to cancel."
                 )
 
@@ -284,6 +289,12 @@ class LogAnalyzerAgent:
         return "\n".join(lines)
 
     @staticmethod
+    def _notification_was_sent(notifications: dict) -> bool:
+        if not isinstance(notifications, dict) or not notifications:
+            return False
+        return any(str(status).strip().lower() == "ok" for status in notifications.values())
+
+    @staticmethod
     def _extract_pod_candidates_from_text(text: str) -> list[str]:
         raw = text or ""
         tokens = re.findall(r"\b[a-z0-9]+(?:-[a-z0-9]+){2,}\b", raw)
@@ -306,6 +317,17 @@ class LogAnalyzerAgent:
             return False
         pending_tool = self._pending_action["tool"].name
         return pending_tool == "restart_kubernetes_pod" and self._is_batch_intent(decision)
+
+    def _should_offer_batch_prompt(self, tool_name: str, tool_args: dict) -> bool:
+        if tool_name != "restart_kubernetes_pod":
+            return False
+
+        requested = str(tool_args.get("pod_name") or "").strip()
+        candidates = [str(p).strip() for p in (self._recent_restart_candidates or []) if str(p).strip()]
+        if requested and requested not in candidates:
+            candidates.insert(0, requested)
+        unique_candidates = list(dict.fromkeys(candidates))
+        return len(unique_candidates) > 1
 
     def _promote_pending_to_batch(self) -> bool:
         if not self._pending_action:
@@ -392,7 +414,27 @@ class LogAnalyzerAgent:
                 name = str(item.get("name") or "<name>")
                 previews.append("- " + " ".join(["kubectl", "-n", namespace, "rollout", "restart", f"{kind}/{name}"]))
             return "\n".join(previews) if previews else "- (no workload restarts provided)"
+        if tool_name == "aws_cli_execute":
+            command = str(tool_args.get("command") or "").strip()
+            if not command:
+                return "- aws <service> <operation> [args]"
+            if command.lower().startswith("aws "):
+                return "- " + command
+            return "- aws " + command
         return "- command preview unavailable for this write tool"
+
+    @staticmethod
+    def _commands_code_block(command_preview: str) -> str:
+        lines: list[str] = []
+        for raw in (command_preview or "").splitlines():
+            line = raw.strip()
+            if line.startswith("- "):
+                line = line[2:]
+            if line:
+                lines.append(line)
+        if not lines:
+            lines = ["(no command preview)"]
+        return "```bash\n" + "\n".join(lines) + "\n```"
     
     def _handle_tool_calls(self, response, user_input: str, chat_history: list, *, trace_id: str | None = None) -> str:
         """
@@ -515,7 +557,6 @@ class LogAnalyzerAgent:
                             self._recent_restart_candidates = candidates[:20]
                             self._recent_restart_namespace = ns
                             self._recent_restart_reason = reason
-
                         cmd_preview = self._format_command_preview(tool_name, tool_args)
                         self._pending_action = {
                             "tool": tool_func,
@@ -523,11 +564,15 @@ class LogAnalyzerAgent:
                         }
                         if tw and trace_id:
                             tw.emit({"trace_id": trace_id, "event": "tool.requires_approval", "tool": tool_name, "args": tool_args})
+                        batch_prompt = ""
+                        if self._should_offer_batch_prompt(tool_name, tool_args):
+                            batch_prompt = "If you want all suggested pods restarted in one operation, reply: `do all at once`.\n"
+                        cmd_block = self._commands_code_block(cmd_preview)
                         return (
                             f"I recommend running `{tool_name}` with args {tool_args}, but it requires approval.\n"
                             "Planned command(s):\n"
-                            f"{cmd_preview}\n"
-                            "If you want all suggested pods restarted in one operation, reply: `do all at once`.\n"
+                            f"{cmd_block}\n"
+                            f"{batch_prompt}"
                             "Would you like me to proceed? (yes/no)"
                         )
                     try:
