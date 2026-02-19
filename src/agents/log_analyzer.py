@@ -1,12 +1,12 @@
 """
 Kubernetes Diagnostics Agent with controlled remediation actions.
 """
-from contextlib import nullcontext
 import json
 import re
 import time
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
 
 from ..models import get_model
 from ..tools import get_all_tools, is_write_tool
@@ -14,6 +14,14 @@ from ..utils.response import extract_response_text
 from ..utils.tracing import JsonlTraceWriter, TraceSpan, new_trace_id, trace_config_from_env
 from ..config import Config
 from ..autonomy import SimpleAutonomyEngine
+
+
+class _NullContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
 class LogAnalyzerAgent:
@@ -35,7 +43,6 @@ class LogAnalyzerAgent:
         
         # Get all tools (log readers + K8s actions)
         self.tools = get_all_tools()
-        self._tools_by_name = {tool.name: tool for tool in self.tools}
         
         # Bind tools to model
         self.llm_with_tools = self.model.get_llm_with_tools(self.tools)
@@ -67,18 +74,6 @@ class LogAnalyzerAgent:
             MessagesPlaceholder(variable_name="chat_history"),
             ("user", "{input}"),
         ])
-
-    _APPROVE_WORDS = {"yes", "y", "approve", "proceed", "do it", "run it", "ok"}
-    _CANCEL_WORDS = {"no", "n", "cancel", "stop"}
-
-    @staticmethod
-    def _empty_response_message(stage: str, *, trace_id: str | None = None) -> str:
-        trace_hint = f" Trace ID: {trace_id}" if trace_id else ""
-        return (
-            f"I got an empty response from the model ({stage}). "
-            f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
-            + trace_hint
-        )
     
     def process_query(self, user_input: str, chat_history: list = None) -> str:
         """
@@ -115,8 +110,7 @@ class LogAnalyzerAgent:
                     inc = scan.get("incident", {})
                     notif = scan.get("notifications", {})
                     fingerprint = str(inc.get("fingerprint") or "")
-                    suppressed = bool((notif or {}).get("suppressed"))
-                    if (not suppressed) and fingerprint and fingerprint != self._last_announced_incident_fingerprint:
+                    if fingerprint and fingerprint != self._last_announced_incident_fingerprint:
                         alert_prefix = (
                             "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
                             f"Severity: {inc.get('severity', 'unknown')} | "
@@ -147,7 +141,7 @@ class LogAnalyzerAgent:
                             + "\nReply `yes` to approve or `no` to cancel."
                         )
 
-                if decision in self._APPROVE_WORDS or decision.startswith("approve "):
+                if decision in {"yes", "y", "approve", "proceed", "do it", "run it", "ok"} or decision.startswith("approve "):
                     tool = self._pending_action["tool"]
                     args = self._pending_action["args"]
                     cmd_preview = self._format_command_preview(tool.name, args)
@@ -155,7 +149,7 @@ class LogAnalyzerAgent:
                     try:
                         if tw:
                             tw.emit({"trace_id": trace_id, "event": "approval.accept", "tool": tool.name, "args": args})
-                        with TraceSpan(tw, trace_id, "tool.invoke", {"tool": getattr(tool, "name", "<unknown>") , "args": args}) if tw else nullcontext():
+                        with TraceSpan(tw, trace_id, "tool.invoke", {"tool": getattr(tool, "name", "<unknown>") , "args": args}) if tw else _NullContext():
                             result = tool.invoke(args)
                         return (
                             alert_prefix +
@@ -170,7 +164,7 @@ class LogAnalyzerAgent:
                             tw.emit({"trace_id": trace_id, "event": "approval.exec_error", "tool": tool.name, "error": str(e)})
                         return f"Approved, but execution failed: {e}"
 
-                if decision in self._CANCEL_WORDS:
+                if decision in {"no", "n", "cancel", "stop"}:
                     pending_name = self._pending_action["tool"].name
                     self._pending_action = None
                     if tw:
@@ -180,7 +174,13 @@ class LogAnalyzerAgent:
                 pending_name = self._pending_action["tool"].name
                 pending_args = self._pending_action["args"]
                 cmd_preview = self._format_command_preview(pending_name, pending_args)
-                return alert_prefix + self._format_approval_request(pending_name, pending_args, cmd_preview)
+                return (
+                    alert_prefix +
+                    f"Approval required before I can run `{pending_name}` with args {pending_args}.\n"
+                    "Planned command(s):\n"
+                    f"{cmd_preview}\n"
+                    "Reply `yes` to approve or `no` to cancel."
+                )
 
             # Format messages for the prompt
             messages = self.prompt.format_messages(
@@ -209,9 +209,11 @@ class LogAnalyzerAgent:
                 if tw:
                     tw.emit({"trace_id": trace_id, "event": "turn.end", "final_len": len(final)})
                 if not (final or "").strip():
-                    return self._empty_response_message(
-                        "after tool execution",
-                        trace_id=trace_id if tw else None,
+                    trace_hint = f" Trace ID: {trace_id}" if (tw and trace_id) else ""
+                    return (
+                        "I got an empty response from the model after tool execution. "
+                        f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
+                        + trace_hint
                     )
                 return alert_prefix + final
             else:
@@ -220,9 +222,11 @@ class LogAnalyzerAgent:
                 if tw:
                     tw.emit({"trace_id": trace_id, "event": "turn.end", "final_len": len(final)})
                 if not (final or "").strip():
-                    return self._empty_response_message(
-                        "no text content",
-                        trace_id=trace_id if tw else None,
+                    trace_hint = f" Trace ID: {trace_id}" if (tw and trace_id) else ""
+                    return (
+                        "I got an empty response from the model (no text content). "
+                        f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
+                        + trace_hint
                     )
                 return alert_prefix + final
         
@@ -317,7 +321,11 @@ class LogAnalyzerAgent:
         namespace = self._recent_restart_namespace or self._pending_action["args"].get("namespace") or Config.K8S_DEFAULT_NAMESPACE
         reason = self._recent_restart_reason or self._pending_action["args"].get("reason") or "Batch restart requested by user"
 
-        batch_tool = self._tools_by_name.get("restart_kubernetes_pods_batch")
+        batch_tool = None
+        for tool in self.tools:
+            if tool.name == "restart_kubernetes_pods_batch":
+                batch_tool = tool
+                break
         if batch_tool is None:
             return False
 
@@ -330,15 +338,6 @@ class LogAnalyzerAgent:
             },
         }
         return True
-
-    @staticmethod
-    def _format_approval_request(tool_name: str, tool_args: dict, cmd_preview: str) -> str:
-        return (
-            f"Approval required before I can run `{tool_name}` with args {tool_args}.\n"
-            "Planned command(s):\n"
-            f"{cmd_preview}\n"
-            "Reply `yes` to approve or `no` to cancel."
-        )
 
     @staticmethod
     def _format_command_preview(tool_name: str, tool_args: dict) -> str:
@@ -374,6 +373,25 @@ class LogAnalyzerAgent:
                 replicas = str(item.get("replicas") if item.get("replicas") is not None else "<replicas>")
                 previews.append("- " + " ".join(["kubectl", "-n", namespace, "scale", kind, name, "--replicas", replicas]))
             return "\n".join(previews) if previews else "- (no workload changes provided)"
+        if tool_name == "rollout_restart_kubernetes_deployment":
+            name = str(tool_args.get("deployment_name") or "<deployment>")
+            return "- " + " ".join(["kubectl", "-n", namespace, "rollout", "restart", f"deployment/{name}"])
+        if tool_name == "rollout_restart_kubernetes_statefulset":
+            name = str(tool_args.get("statefulset_name") or "<statefulset>")
+            return "- " + " ".join(["kubectl", "-n", namespace, "rollout", "restart", f"statefulset/{name}"])
+        if tool_name == "rollout_restart_kubernetes_daemonset":
+            name = str(tool_args.get("daemonset_name") or "<daemonset>")
+            return "- " + " ".join(["kubectl", "-n", namespace, "rollout", "restart", f"daemonset/{name}"])
+        if tool_name == "rollout_restart_kubernetes_workloads_batch":
+            workloads = tool_args.get("workloads") or []
+            previews: list[str] = []
+            for item in workloads:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or "<kind>")
+                name = str(item.get("name") or "<name>")
+                previews.append("- " + " ".join(["kubectl", "-n", namespace, "rollout", "restart", f"{kind}/{name}"]))
+            return "\n".join(previews) if previews else "- (no workload restarts provided)"
         return "- command preview unavailable for this write tool"
     
     def _handle_tool_calls(self, response, user_input: str, chat_history: list, *, trace_id: str | None = None) -> str:
@@ -388,7 +406,7 @@ class LogAnalyzerAgent:
         Returns:
             Final response after executing tools
         """
-        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from langchain_core.messages import AIMessage, ToolMessage
 
         tw = self._trace_writer
         
@@ -476,7 +494,12 @@ class LogAnalyzerAgent:
                 if tw and trace_id:
                     tw.emit({"trace_id": trace_id, "event": "tool.request", "tool": tool_name, "args": tool_args})
                 
-                tool_func = self._tools_by_name.get(tool_name)
+                # Find and execute the tool
+                tool_func = None
+                for tool in self.tools:
+                    if tool.name == tool_name:
+                        tool_func = tool
+                        break
                 
                 if tool_func:
                     # Enforce explicit approval for write tools.
@@ -588,9 +611,11 @@ class LogAnalyzerAgent:
         # If we hit max iterations, return what we have
         final = extract_response_text(current_response)
         if not (final or "").strip():
-            return self._empty_response_message(
-                "end of the tool loop",
-                trace_id=trace_id if tw else None,
+            trace_hint = f" Trace ID: {trace_id}" if (tw and trace_id) else ""
+            return (
+                "I got an empty response from the model at the end of the tool loop. "
+                f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
+                + trace_hint
             )
         return final
 

@@ -81,13 +81,6 @@ def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
     return f"{header}\n{line}\n{body}"
 
 
-def _get_ns_read_args(resource: str, namespace: str, *extra: str) -> list[str]:
-    ns = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
-    if ns.lower() == "all":
-        return ["get", resource, "-A", *extra]
-    return ["get", resource, "-n", ns, *extra]
-
-
 def _discover_pod_namespaces(pod_name: str) -> tuple[list[str], str | None]:
     """Return namespaces containing pod_name across the cluster."""
     if not ensure_kubectl_installed():
@@ -450,7 +443,7 @@ def k8s_list_statefulsets(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(_get_ns_read_args("statefulsets", namespace))
+    return _run_readonly(["get", "statefulsets", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "statefulsets", "-A"])
 
 
 @tool
@@ -461,7 +454,7 @@ def k8s_list_daemonsets(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(_get_ns_read_args("daemonsets", namespace))
+    return _run_readonly(["get", "daemonsets", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "daemonsets", "-A"])
 
 
 @tool
@@ -472,7 +465,7 @@ def k8s_list_services(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(_get_ns_read_args("services", namespace, "-o", "wide"))
+    return _run_readonly(["get", "services", "-A" if namespace.lower() == "all" else "-n", namespace, "-o", "wide"] if namespace.lower() != "all" else ["get", "services", "-A", "-o", "wide"])
 
 
 @tool
@@ -483,7 +476,7 @@ def k8s_list_ingresses(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(_get_ns_read_args("ingress", namespace))
+    return _run_readonly(["get", "ingress", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "ingress", "-A"])
 
 
 @tool
@@ -494,7 +487,7 @@ def k8s_list_hpa(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(_get_ns_read_args("hpa", namespace))
+    return _run_readonly(["get", "hpa", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "hpa", "-A"])
 
 
 @tool
@@ -506,7 +499,7 @@ def k8s_get_events(namespace: str = "all", since_minutes: int = 60, limit: int =
         if err:
             return err
 
-    code, data, err = _run_json(_get_ns_read_args("events", ns))
+    code, data, err = _run_json(["get", "events", "-A" if ns.lower() == "all" else "-n", ns] if ns.lower() != "all" else ["get", "events", "-A"])
     if code != 0 or data is None:
         return kube_access_help(err)
 
@@ -566,7 +559,7 @@ def k8s_get_pvcs(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
         err = _validate_namespace(namespace)
         if err:
             return err
-    return _run_readonly(_get_ns_read_args("pvc", namespace))
+    return _run_readonly(["get", "pvc", "-A" if namespace.lower() == "all" else "-n", namespace] if namespace.lower() != "all" else ["get", "pvc", "-A"])
 
 
 @tool

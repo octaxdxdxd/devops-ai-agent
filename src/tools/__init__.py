@@ -40,6 +40,10 @@ from .actions import (
     scale_kubernetes_deployment,
     scale_kubernetes_statefulset,
     scale_kubernetes_workloads_batch,
+    rollout_restart_kubernetes_deployment,
+    rollout_restart_kubernetes_statefulset,
+    rollout_restart_kubernetes_daemonset,
+    rollout_restart_kubernetes_workloads_batch,
 )
 
 
@@ -51,6 +55,10 @@ WRITE_TOOL_NAMES = {
     "scale_kubernetes_deployment",
     "scale_kubernetes_statefulset",
     "scale_kubernetes_workloads_batch",
+    "rollout_restart_kubernetes_deployment",
+    "rollout_restart_kubernetes_statefulset",
+    "rollout_restart_kubernetes_daemonset",
+    "rollout_restart_kubernetes_workloads_batch",
 }
 
 
@@ -67,6 +75,10 @@ def get_all_tools():
     tools.append(scale_kubernetes_deployment)
     tools.append(scale_kubernetes_statefulset)
     tools.append(scale_kubernetes_workloads_batch)
+    tools.append(rollout_restart_kubernetes_deployment)
+    tools.append(rollout_restart_kubernetes_statefulset)
+    tools.append(rollout_restart_kubernetes_daemonset)
+    tools.append(rollout_restart_kubernetes_workloads_batch)
     return tools
 
 
@@ -107,6 +119,10 @@ __all__ = [
     'scale_kubernetes_deployment',
     'scale_kubernetes_statefulset',
     'scale_kubernetes_workloads_batch',
+    'rollout_restart_kubernetes_deployment',
+    'rollout_restart_kubernetes_statefulset',
+    'rollout_restart_kubernetes_daemonset',
+    'rollout_restart_kubernetes_workloads_batch',
     'WRITE_TOOL_NAMES',
     'is_write_tool',
     'get_all_tools'

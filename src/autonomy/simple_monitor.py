@@ -94,17 +94,6 @@ class StateStore:
         prev_sev = str(record.get("severity") or "info")
         last_sent_raw = str(record.get("last_sent_at") or "")
 
-        # Treat ongoing incidents in the same scope as one active thread.
-        # Do not re-alert just because fine-grained fingerprint details changed.
-        if prev_fp != fingerprint and Config.ALERT_ANNOUNCE_ONCE_UNTIL_RESOLVED:
-            try:
-                last_sent = datetime.fromisoformat(last_sent_raw)
-            except ValueError:
-                return True
-            if datetime.now(timezone.utc) - last_sent < timedelta(minutes=max(1, repeat_minutes)):
-                return False
-            return True
-
         if prev_fp != fingerprint:
             return True
         if self._severity_rank(severity) > self._severity_rank(prev_sev):

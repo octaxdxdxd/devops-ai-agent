@@ -1,13 +1,11 @@
 """AI Ops Kubernetes Assistant."""
+import streamlit as st
+from langchain_core.messages import HumanMessage, AIMessage
 import sys
 from pathlib import Path
 
-import streamlit as st
-from langchain_core.messages import AIMessage, HumanMessage
-
 # Add src to path
-ROOT_DIR = Path(__file__).parent
-sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from src.agents import LogAnalyzerAgent
 from src.config import Config
@@ -100,13 +98,11 @@ def display_sidebar():
         - `k8s_list_services`, `k8s_list_ingresses`, `k8s_list_hpa`
         
         **Kubernetes Actions:**
-        - `restart_kubernetes_pod` - Restart failed pod
-        - `restart_kubernetes_pods_batch` - Restart multiple pods in one approved step
-        - `scale_kubernetes_deployment` - Scale a deployment
-        - `scale_kubernetes_statefulset` - Scale a statefulset
-        - `scale_kubernetes_workloads_batch` - Multi-workload scaling in one approved step
-          - 🔒 Always asks for approval
-        - ⚡ Use for crash-recovery and controlled mitigation scenarios
+        - `restart_kubernetes_pod`, `restart_kubernetes_pods_batch`
+        - `scale_kubernetes_deployment`, `scale_kubernetes_statefulset`, `scale_kubernetes_workloads_batch`
+        - `rollout_restart_kubernetes_deployment`, `rollout_restart_kubernetes_statefulset`
+        - `rollout_restart_kubernetes_daemonset`, `rollout_restart_kubernetes_workloads_batch`
+        - 🔒 All actions require explicit approval before execution
         """)
         
         st.markdown("---")

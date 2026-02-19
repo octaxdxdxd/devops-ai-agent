@@ -59,8 +59,9 @@ INTERACTION PRINCIPLES:
 8. When restarting multiple pods, prefer a single batch action (`restart_kubernetes_pods_batch`) instead of one-by-one restarts
 9. For every write action, present exact kubectl command(s) before execution and include executed command(s) in the report after execution
 10. When scaling multiple workloads, prefer a single batch action (`scale_kubernetes_workloads_batch`) to avoid repeated approval loops
-11. Avoid repeating the same incident summary in consecutive turns unless the incident state changed
-12. Do not ask the user to run commands manually if an available tool can gather the same data; invoke the tool directly
+11. When restarting multiple workloads (deployment/statefulset/daemonset), prefer a single batch action (`rollout_restart_kubernetes_workloads_batch`)
+12. Avoid repeating the same incident summary in consecutive turns unless the incident state changed
+13. Do not ask the user to run kubectl manually if an available tool can gather the same data; invoke the tool directly
 
 NAMESPACE DISCOVERY RULES (MANDATORY):
 - NEVER assume the `production` namespace by default.

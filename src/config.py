@@ -49,11 +49,13 @@ class Config:
     TRACE_MAX_FIELD_CHARS = int(os.getenv('TRACE_MAX_FIELD_CHARS', '2000'))
     TRACE_REDACT = os.getenv('TRACE_REDACT', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
-    # Autonomous monitoring
+    # Autonomous Hybrid Monitoring
     AUTONOMY_ENABLED = os.getenv('AUTONOMY_ENABLED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AUTONOMY_SCAN_ON_USER_TURN = os.getenv('AUTONOMY_SCAN_ON_USER_TURN', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AUTONOMY_NAMESPACE = os.getenv('AUTONOMY_NAMESPACE', 'all')
     AUTONOMY_RECENT_MINUTES = int(os.getenv('AUTONOMY_RECENT_MINUTES', '30'))
+    AUTONOMY_BASELINE_MINUTES = int(os.getenv('AUTONOMY_BASELINE_MINUTES', '180'))
+    AUTONOMY_RESTART_HEAVY_THRESHOLD = int(os.getenv('AUTONOMY_RESTART_HEAVY_THRESHOLD', '3'))
     AUTONOMY_STATE_FILE = os.getenv('AUTONOMY_STATE_FILE', os.path.join(LOG_DIRECTORY, 'autonomy_state.json'))
 
     # Simple alert monitor thresholds
@@ -61,7 +63,6 @@ class Config:
     ALERT_CRITICAL_EVENT_MIN_COUNT = int(os.getenv('ALERT_CRITICAL_EVENT_MIN_COUNT', '3'))
     ALERT_MIN_CONFIDENCE = int(os.getenv('ALERT_MIN_CONFIDENCE', '75'))
     ALERT_REPEAT_MINUTES = int(os.getenv('ALERT_REPEAT_MINUTES', '120'))
-    ALERT_ANNOUNCE_ONCE_UNTIL_RESOLVED = os.getenv('ALERT_ANNOUNCE_ONCE_UNTIL_RESOLVED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
     # Alerts and notification channels
     ALERT_COOLDOWN_MINUTES = int(os.getenv('ALERT_COOLDOWN_MINUTES', '30'))
