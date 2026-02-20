@@ -97,8 +97,6 @@ class Config:
     # Autonomous Hybrid Monitoring
     AUTONOMY_ENABLED = os.getenv('AUTONOMY_ENABLED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AUTONOMY_SCAN_ON_USER_TURN = os.getenv('AUTONOMY_SCAN_ON_USER_TURN', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AUTONOMY_PERIODIC_SCAN_ENABLED = os.getenv('AUTONOMY_PERIODIC_SCAN_ENABLED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AUTONOMY_SCAN_INTERVAL_SEC = int(os.getenv('AUTONOMY_SCAN_INTERVAL_SEC', '30'))
     AUTONOMY_NAMESPACE = os.getenv('AUTONOMY_NAMESPACE', 'all')
     AUTONOMY_RECENT_MINUTES = int(os.getenv('AUTONOMY_RECENT_MINUTES', '30'))
     AUTONOMY_BASELINE_MINUTES = int(os.getenv('AUTONOMY_BASELINE_MINUTES', '180'))
