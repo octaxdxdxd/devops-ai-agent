@@ -59,9 +59,7 @@ def _preflight_cluster_access() -> str | None:
     if code == 0:
         return None
     return (
-        "❌ Cannot access Kubernetes cluster with current kubectl context. "
-        "For EKS/AKS/GKE, ensure kubeconfig/auth is configured (e.g., aws eks update-kubeconfig / "
-        "az aks get-credentials / gcloud container clusters get-credentials). "
+        "❌ Cannot access Kubernetes cluster from this runtime context. "
         f"Details: {err or 'unknown error'}"
     )
 
@@ -92,7 +90,7 @@ def restart_kubernetes_pod(pod_name: str, namespace: str = Config.K8S_DEFAULT_NA
         return ns_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:
@@ -163,7 +161,7 @@ def restart_kubernetes_pods_batch(
         return f"❌ Invalid pod names: {invalid}"
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:
@@ -229,7 +227,7 @@ def scale_kubernetes_deployment(
         return ns_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:
@@ -287,7 +285,7 @@ def scale_kubernetes_statefulset(
         return ns_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:
@@ -342,7 +340,7 @@ def scale_kubernetes_workloads_batch(
         return "❌ changes must be a non-empty list."
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:
@@ -420,7 +418,7 @@ def rollout_restart_kubernetes_deployment(
         return ns_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:
@@ -475,7 +473,7 @@ def rollout_restart_kubernetes_statefulset(
         return ns_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:
@@ -530,7 +528,7 @@ def rollout_restart_kubernetes_daemonset(
         return ns_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:
@@ -585,7 +583,7 @@ def rollout_restart_kubernetes_workloads_batch(
         return "❌ workloads must be a non-empty list."
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH. Install kubectl and configure cluster access first."
+        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
     preflight_err = _preflight_cluster_access()
     if preflight_err:

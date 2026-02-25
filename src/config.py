@@ -1,5 +1,6 @@
 """Configuration management for the AI Ops agent."""
 import os
+import shutil
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -32,10 +33,20 @@ class Config:
     # Kubernetes Configuration
     K8S_KUBECONFIG = os.getenv('K8S_KUBECONFIG', '')
     K8S_CONTEXT = os.getenv('K8S_CONTEXT', '')
-    K8S_DEFAULT_NAMESPACE = os.getenv('K8S_DEFAULT_NAMESPACE', 'production')
+    K8S_DEFAULT_NAMESPACE = os.getenv('K8S_DEFAULT_NAMESPACE', 'default')
     K8S_DRY_RUN = os.getenv('K8S_DRY_RUN', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     K8S_REQUEST_TIMEOUT_SEC = int(os.getenv('K8S_REQUEST_TIMEOUT_SEC', '20'))
     K8S_OUTPUT_MAX_CHARS = int(os.getenv('K8S_OUTPUT_MAX_CHARS', '12000'))
+    K8S_CLI_ALLOW_ALL_READ = os.getenv('K8S_CLI_ALLOW_ALL_READ', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    K8S_CLI_ALLOW_ALL_WRITE = os.getenv('K8S_CLI_ALLOW_ALL_WRITE', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    K8S_CLI_READONLY_VERBS = os.getenv(
+        'K8S_CLI_READONLY_VERBS',
+        'get,describe,logs,top,api-resources,api-versions,cluster-info,version,config,explain,auth,events,diff,wait',
+    )
+    K8S_CLI_WRITE_ALLOWLIST_VERBS = os.getenv(
+        'K8S_CLI_WRITE_ALLOWLIST_VERBS',
+        'apply,create,delete,edit,patch,replace,scale,rollout,set,cordon,uncordon,drain,taint,label,annotate,autoscale',
+    )
 
     # AWS CLI tools
     AWS_CLI_ENABLED = os.getenv('AWS_CLI_ENABLED', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
@@ -48,6 +59,9 @@ class Config:
     AWS_CLI_PROMPT_FOR_REGION_ON_EMPTY = os.getenv('AWS_CLI_PROMPT_FOR_REGION_ON_EMPTY', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AWS_CLI_REQUIRE_DEFAULT_REGION_FOR_REGIONAL = os.getenv('AWS_CLI_REQUIRE_DEFAULT_REGION_FOR_REGIONAL', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AWS_CLI_AUTO_REGION_FANOUT_MAX = int(os.getenv('AWS_CLI_AUTO_REGION_FANOUT_MAX', '6'))
+    AWS_CLI_ALLOW_ALL_READ = os.getenv('AWS_CLI_ALLOW_ALL_READ', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AWS_CLI_ALLOW_ALL_WRITE = os.getenv('AWS_CLI_ALLOW_ALL_WRITE', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AWS_CLI_ENFORCE_BLOCKLIST = os.getenv('AWS_CLI_ENFORCE_BLOCKLIST', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AWS_CLI_FALLBACK_REGIONS = os.getenv(
         'AWS_CLI_FALLBACK_REGIONS',
         'us-east-1,us-east-2,us-west-2,eu-west-1,eu-central-1,ap-southeast-1,ap-northeast-1',
@@ -86,6 +100,8 @@ class Config:
     MAX_ITERATIONS = 5
     MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '12'))
     MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '2'))
+    MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '14'))
+    AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '5000'))
     VERBOSE = True
 
     # Tracing (structured JSONL)
@@ -126,9 +142,7 @@ class Config:
     @classmethod
     def is_k8s_configured(cls) -> bool:
         """Check if Kubernetes is configured"""
-        # Provider-agnostic: if kubectl can reach any configured context, tools can run.
-        # This supports EKS/AKS/GKE as long as kubeconfig auth is already set up.
-        return True
+        return bool(shutil.which("kubectl"))
     
     @classmethod
     def validate(cls):

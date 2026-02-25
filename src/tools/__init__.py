@@ -50,6 +50,11 @@ from .aws_cli import (
     aws_cli_readonly,
     aws_cli_execute,
 )
+from .k8s_cli import (
+    get_k8s_cli_tools,
+    kubectl_readonly,
+    kubectl_execute,
+)
 
 
 # Tool policy
@@ -64,6 +69,7 @@ WRITE_TOOL_NAMES = {
     "rollout_restart_kubernetes_statefulset",
     "rollout_restart_kubernetes_daemonset",
     "rollout_restart_kubernetes_workloads_batch",
+    "kubectl_execute",
     "aws_cli_execute",
 }
 
@@ -73,20 +79,22 @@ def is_write_tool(tool_name: str) -> bool:
     return tool_name in WRITE_TOOL_NAMES
 
 
+_WRITE_TOOLS = [
+    restart_kubernetes_pod,
+    restart_kubernetes_pods_batch,
+    scale_kubernetes_deployment,
+    scale_kubernetes_statefulset,
+    scale_kubernetes_workloads_batch,
+    rollout_restart_kubernetes_deployment,
+    rollout_restart_kubernetes_statefulset,
+    rollout_restart_kubernetes_daemonset,
+    rollout_restart_kubernetes_workloads_batch,
+]
+
+
 def get_all_tools():
     """Get all available tools for the agent"""
-    tools = get_k8s_read_tools()
-    tools.extend(get_aws_tools())
-    tools.append(restart_kubernetes_pod)
-    tools.append(restart_kubernetes_pods_batch)
-    tools.append(scale_kubernetes_deployment)
-    tools.append(scale_kubernetes_statefulset)
-    tools.append(scale_kubernetes_workloads_batch)
-    tools.append(rollout_restart_kubernetes_deployment)
-    tools.append(rollout_restart_kubernetes_statefulset)
-    tools.append(rollout_restart_kubernetes_daemonset)
-    tools.append(rollout_restart_kubernetes_workloads_batch)
-    return tools
+    return [*get_k8s_read_tools(), *get_k8s_cli_tools(), *get_aws_tools(), *_WRITE_TOOLS]
 
 
 __all__ = [
@@ -120,6 +128,9 @@ __all__ = [
     'k8s_get_resource_yaml',
     'k8s_get_pod_scheduling_report',
     'k8s_get_crashloop_pods',
+    'kubectl_readonly',
+    'kubectl_execute',
+    'get_k8s_cli_tools',
     'get_k8s_read_tools',
     'restart_kubernetes_pod',
     'restart_kubernetes_pods_batch',

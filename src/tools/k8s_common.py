@@ -55,13 +55,11 @@ def truncate_text(value: str, max_chars: int | None = None) -> str:
 
 
 def kubectl_not_found_msg() -> str:
-    return "❌ `kubectl` not found in PATH. Install kubectl and configure kubeconfig/context first."
+    return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
 
 def kube_access_help(details: str) -> str:
     return (
-        "❌ Kubernetes access failed. Ensure kubeconfig/auth is configured for your cluster "
-        "(EKS: aws eks update-kubeconfig, AKS: az aks get-credentials, "
-        "GKE: gcloud container clusters get-credentials). "
+        "❌ Kubernetes access failed in the current runtime context. "
         f"Details: {details or 'unknown error'}"
     )

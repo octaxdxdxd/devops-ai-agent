@@ -35,6 +35,54 @@ _GLOBAL_SERVICES = {
     "shield",
 }
 _META_KEYS = {"responsemetadata", "nexttoken", "marker", "istruncated", "continuationtoken"}
+_READONLY_OPERATION_EXCEPTIONS = {
+    "start-query",
+    "get-query-results",
+    "filter-log-events",
+    "generate-query",
+}
+_MUTATING_OPERATION_PREFIXES = (
+    "add",
+    "associate",
+    "attach",
+    "cancel",
+    "copy",
+    "create",
+    "delete",
+    "deregister",
+    "detach",
+    "disable",
+    "disassociate",
+    "enable",
+    "execute",
+    "export",
+    "import",
+    "modify",
+    "patch",
+    "promote",
+    "publish",
+    "put",
+    "reboot",
+    "register",
+    "remove",
+    "replace",
+    "reset",
+    "restore",
+    "resume",
+    "revoke",
+    "rotate",
+    "run",
+    "send",
+    "set",
+    "start",
+    "stop",
+    "suspend",
+    "tag",
+    "terminate",
+    "untag",
+    "update",
+    "upgrade",
+)
 
 
 def _csv_to_list(value: str) -> list[str]:
@@ -96,6 +144,15 @@ def _is_action_allowed(service: str, operation: str, patterns: list[str]) -> boo
         if fnmatch.fnmatch(action_lower, p):
             return True
     return False
+
+
+def _looks_mutating_operation(operation: str) -> bool:
+    op = (operation or "").strip().lower()
+    if not op:
+        return True
+    if op in _READONLY_OPERATION_EXCEPTIONS:
+        return False
+    return op.startswith(_MUTATING_OPERATION_PREFIXES)
 
 
 def _build_final_args(tokens: list[str]) -> list[str]:
@@ -242,43 +299,63 @@ def _execute(tokens: list[str], *, mode: str, reason: str = "") -> str:
     service = tokens[0].lower()
     operation = tokens[1].lower()
 
-    blocklist = _csv_to_list(Config.AWS_CLI_BLOCKLIST)
-    if _is_action_allowed(service, operation, blocklist):
-        _audit(
-            mode=mode,
-            command=" ".join(["aws", *tokens]),
-            service=service,
-            operation=operation,
-            allowed=False,
-            reason="blocked_by_blocklist",
-            exit_code=None,
-            duration_ms=None,
-            stdout_len=0,
-            stderr_len=0,
-        )
-        return f"❌ Action `{service}:{operation}` is blocked by policy."
-
-    if mode == "readonly":
-        readonly_allowlist = _csv_to_list(Config.AWS_CLI_READONLY_ALLOWLIST)
-        if not _is_action_allowed(service, operation, readonly_allowlist):
+    if Config.AWS_CLI_ENFORCE_BLOCKLIST:
+        blocklist = _csv_to_list(Config.AWS_CLI_BLOCKLIST)
+        if _is_action_allowed(service, operation, blocklist):
             _audit(
                 mode=mode,
                 command=" ".join(["aws", *tokens]),
                 service=service,
                 operation=operation,
                 allowed=False,
-                reason="not_in_readonly_allowlist",
+                reason="blocked_by_blocklist",
+                exit_code=None,
+                duration_ms=None,
+                stdout_len=0,
+                stderr_len=0,
+            )
+            return f"❌ Action `{service}:{operation}` is blocked by policy."
+
+    if mode == "readonly":
+        if _looks_mutating_operation(operation):
+            _audit(
+                mode=mode,
+                command=" ".join(["aws", *tokens]),
+                service=service,
+                operation=operation,
+                allowed=False,
+                reason="mutating_operation_in_readonly_mode",
                 exit_code=None,
                 duration_ms=None,
                 stdout_len=0,
                 stderr_len=0,
             )
             return (
-                f"❌ Action `{service}:{operation}` is not in readonly allowlist. "
-                "Use `aws_cli_execute` (with approval) and allowlist configuration for mutating commands."
+                f"❌ Action `{service}:{operation}` looks mutating and is blocked in `aws_cli_readonly`. "
+                "Use `aws_cli_execute` (approval required)."
             )
 
-    if mode == "write":
+        if not Config.AWS_CLI_ALLOW_ALL_READ:
+            readonly_allowlist = _csv_to_list(Config.AWS_CLI_READONLY_ALLOWLIST)
+            if not _is_action_allowed(service, operation, readonly_allowlist):
+                _audit(
+                    mode=mode,
+                    command=" ".join(["aws", *tokens]),
+                    service=service,
+                    operation=operation,
+                    allowed=False,
+                    reason="not_in_readonly_allowlist",
+                    exit_code=None,
+                    duration_ms=None,
+                    stdout_len=0,
+                    stderr_len=0,
+                )
+                return (
+                    f"❌ Action `{service}:{operation}` is not in readonly allowlist. "
+                    "Use `aws_cli_execute` (with approval) and allowlist configuration for mutating commands."
+                )
+
+    if mode == "write" and not Config.AWS_CLI_ALLOW_ALL_WRITE:
         write_allowlist = _csv_to_list(Config.AWS_CLI_WRITE_ALLOWLIST)
         if not _is_action_allowed(service, operation, write_allowlist):
             _audit(
@@ -440,16 +517,18 @@ def _execute(tokens: list[str], *, mode: str, reason: str = "") -> str:
 
 @tool
 def aws_cli_readonly(command: str) -> str:
-    """Run an AWS CLI command through a strict readonly allowlist.
+    """Run an AWS CLI readonly command.
 
     Input examples:
     - sts get-caller-identity
     - ec2 describe-instances --region us-east-1
+
+    When AWS_CLI_ALLOW_ALL_READ=1, readonly allowlist checks are bypassed.
     """
     if not Config.AWS_CLI_ENABLED:
         return "❌ AWS CLI tools are disabled. Set AWS_CLI_ENABLED=1 to enable."
     if not _ensure_aws_cli_installed():
-        return "❌ `aws` CLI not found in PATH. Install and configure AWS CLI first."
+        return "❌ `aws` CLI not found in PATH in this runtime. I cannot execute AWS commands here until it is available."
 
     tokens, err = _normalize_command(command)
     if err:
@@ -459,14 +538,15 @@ def aws_cli_readonly(command: str) -> str:
 
 @tool
 def aws_cli_execute(command: str, reason: str = "") -> str:
-    """Run an AWS CLI command through write allowlist.
+    """Run an AWS CLI mutating-capable command.
 
     IMPORTANT: This is a mutating-capable tool and should require explicit user approval.
+    When AWS_CLI_ALLOW_ALL_WRITE=1, write allowlist checks are bypassed.
     """
     if not Config.AWS_CLI_ENABLED:
         return "❌ AWS CLI tools are disabled. Set AWS_CLI_ENABLED=1 to enable."
     if not _ensure_aws_cli_installed():
-        return "❌ `aws` CLI not found in PATH. Install and configure AWS CLI first."
+        return "❌ `aws` CLI not found in PATH in this runtime. I cannot execute AWS commands here until it is available."
 
     tokens, err = _normalize_command(command)
     if err:
