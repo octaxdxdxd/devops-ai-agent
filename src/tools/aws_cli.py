@@ -130,6 +130,12 @@ def _normalize_command(command: str) -> tuple[list[str] | None, str | None]:
             "❌ Invalid AWS CLI command: this looks like a Kubernetes command. "
             "Use Kubernetes tools (`kubectl_readonly` / `kubectl_execute`) instead.",
         )
+    if service == "helm":
+        return (
+            None,
+            "❌ Invalid AWS CLI command: this looks like a Helm command. "
+            "Use Helm tools (`helm_readonly` / `helm_execute`) instead.",
+        )
 
     if not _SAFE_TOKEN.fullmatch(service):
         return None, f"❌ Invalid AWS service token: {service!r}."

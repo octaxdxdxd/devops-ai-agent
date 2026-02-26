@@ -63,6 +63,19 @@ _MUTATING_KUBECTL_VERBS = {
     "autoscale",
     "expose",
 }
+_TARGET_ONLY_VERBS = {"exec", "logs", "attach", "port-forward"}
+_SKIP_AUTONAMESPACE_VERBS = {
+    "cp",
+    "debug",
+    "auth",
+    "api-resources",
+    "api-versions",
+    "cluster-info",
+    "config",
+    "version",
+    "completion",
+    "plugin",
+}
 
 
 def _csv_to_set(value: str) -> set[str]:
@@ -87,6 +100,12 @@ def _normalize_kubectl_command(command: str) -> tuple[list[str] | None, str | No
 
     if not tokens:
         return None, "❌ command is required after `kubectl`."
+
+    first = tokens[0].lower()
+    if first == "helm":
+        return None, "❌ Invalid kubectl command: this looks like a Helm command. Use `helm_readonly` or `helm_execute`."
+    if first == "aws":
+        return None, "❌ Invalid kubectl command: this looks like an AWS CLI command. Use `aws_cli_readonly` or `aws_cli_execute`."
 
     return tokens, None
 
@@ -169,6 +188,8 @@ def _parse_target_kind_name(tokens: list[str]) -> tuple[str | None, str | None]:
 
     if verb in {"apply", "create"}:
         return None, None
+    if verb in _SKIP_AUTONAMESPACE_VERBS:
+        return None, None
 
     if verb in {"set", "rollout"}:
         sub_idx = _next_positional_index(tokens, verb_idx + 1)
@@ -185,6 +206,19 @@ def _parse_target_kind_name(tokens: list[str]) -> tuple[str | None, str | None]:
         if name_idx is None:
             return None, None
         return target, str(tokens[name_idx]).strip()
+
+    if verb in _TARGET_ONLY_VERBS:
+        target_idx = _next_positional_index(tokens, verb_idx + 1)
+        if target_idx is None:
+            return None, None
+        target = str(tokens[target_idx]).strip()
+        if not target:
+            return None, None
+        if "/" in target:
+            kind, name = target.split("/", 1)
+            return kind.strip(), name.strip()
+        # For exec/logs/attach, bare target is usually a pod name.
+        return "pod", target
 
     kind_idx = _next_positional_index(tokens, verb_idx + 1)
     if kind_idx is None:
@@ -206,13 +240,18 @@ def _autoresolve_namespace(tokens: list[str]) -> tuple[list[str] | None, str | N
     if _uses_all_namespaces(tokens):
         return list(tokens), None
 
+    namespace_hint, ns_idx, ns_eq = _extract_namespace(tokens)
+    explicit_namespace = (namespace_hint or "").strip()
+    if explicit_namespace and explicit_namespace.lower() not in {"auto", "any", "all"}:
+        # Respect explicit namespace; do not reinterpret command grammar.
+        return list(tokens), None
+
     kind, name = _parse_target_kind_name(tokens)
     if not kind or not name:
         return list(tokens), None
     if is_cluster_scoped_kind(kind):
         return list(tokens), None
 
-    namespace_hint, ns_idx, ns_eq = _extract_namespace(tokens)
     resolved_ns, resolve_err = resolve_namespace_for_resource(kind, name, namespace_hint or "")
     if resolve_err:
         return None, resolve_err

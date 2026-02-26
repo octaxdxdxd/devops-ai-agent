@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from ..config import Config
 from ..tools import is_write_tool
+from ..utils.command_intent import CommandIntent, classify_command_intent, target_tool_for_intent
 from ..utils.llm_retry import invoke_with_retries
 from ..utils.response import extract_response_text
 from .approval import ApprovalCoordinator, PendingAction, commands_code_block, format_command_preview
@@ -21,6 +22,44 @@ _AWS_ID_TOKEN_RE = re.compile(
     r"\b(?:ami|i|lt|sg|subnet|vpc|vol|snap|eni|igw|nat|rtb|eipalloc|eipassoc|vpce|pcx|tgw|fs|db)-[0-9a-zA-Z]{6,}\b",
     re.IGNORECASE,
 )
+
+
+def _resolve_tool_call(
+    *,
+    tool_name: str,
+    tool_args: Any,
+    tool_lookup: dict[str, Any],
+) -> tuple[str, Any, CommandIntent | None, bool]:
+    """Route command tools by command intent; returns effective tool + args."""
+    if not isinstance(tool_args, dict):
+        return tool_name, tool_args, None, False
+
+    command_text = str(tool_args.get("command") or "").strip()
+    if not command_text:
+        return tool_name, tool_args, None, False
+
+    intent = classify_command_intent(tool_name, command_text)
+    if intent.family == "unknown":
+        return tool_name, tool_args, None, False
+
+    effective_name = tool_name
+    target_name = target_tool_for_intent(intent)
+    if target_name and target_name in tool_lookup:
+        effective_name = target_name
+
+    normalized_args = dict(tool_args)
+    if intent.normalized_command:
+        normalized_args["command"] = intent.normalized_command
+
+    routed = effective_name != tool_name
+    return effective_name, normalized_args, intent, routed
+
+
+def _requires_explicit_approval(*, tool_name: str, intent: CommandIntent | None) -> bool:
+    """Approval is determined by command mutability when available; else tool policy."""
+    if intent is not None:
+        return intent.is_mutating
+    return is_write_tool(tool_name)
 
 
 def _tool_result_to_message_content(result: Any) -> tuple[str, int]:
@@ -198,10 +237,37 @@ def handle_tool_calls(
         if not (hasattr(current_response, "tool_calls") and current_response.tool_calls):
             return extract_response_text(current_response)
 
+        resolved_calls: list[dict[str, Any]] = []
+        for tool_call in current_response.tool_calls:
+            original_name = str(tool_call["name"])
+            original_args = tool_call["args"]
+            effective_name, effective_args, intent, routed = _resolve_tool_call(
+                tool_name=original_name,
+                tool_args=original_args,
+                tool_lookup=tool_lookup,
+            )
+            resolved_calls.append(
+                {
+                    "tool_call_id": tool_call["id"],
+                    "original_name": original_name,
+                    "original_args": original_args,
+                    "name": effective_name,
+                    "args": effective_args,
+                    "intent": intent,
+                    "routed": routed,
+                    "requires_approval": _requires_explicit_approval(tool_name=effective_name, intent=intent),
+                }
+            )
+
         tool_messages: list[ToolMessage] = []
-        for call_idx, tool_call in enumerate(current_response.tool_calls):
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
+        for call_idx, resolved in enumerate(resolved_calls):
+            tool_call_id = resolved["tool_call_id"]
+            original_name = resolved["original_name"]
+            original_args = resolved["original_args"]
+            tool_name = resolved["name"]
+            tool_args = resolved["args"]
+            tool_intent = resolved["intent"]
+            requires_approval = bool(resolved["requires_approval"])
 
             total_tool_calls += 1
             if total_tool_calls > max_tool_calls:
@@ -212,6 +278,7 @@ def handle_tool_calls(
                             "event": "tool_loop.call_budget_hit",
                             "max_tool_calls": max_tool_calls,
                             "attempted_tool": tool_name,
+                            "requested_tool": original_name,
                         }
                     )
 
@@ -251,6 +318,7 @@ def handle_tool_calls(
                             "trace_id": trace_id,
                             "event": "tool_loop.duplicate_suppressed",
                             "tool": tool_name,
+                            "requested_tool": original_name,
                             "args": tool_args,
                             "count": call_signature_counts[signature],
                             "max_duplicate_tool_calls": max_duplicate_tool_calls,
@@ -262,33 +330,63 @@ def handle_tool_calls(
                             "Duplicate tool call suppressed to avoid loops. "
                             "Use previous tool results and provide a final answer."
                         ),
-                        tool_call_id=tool_call["id"],
+                        tool_call_id=tool_call_id,
                     )
                 )
                 continue
 
             if tw and trace_id:
-                tw.emit({"trace_id": trace_id, "event": "tool.request", "tool": tool_name, "args": tool_args})
+                if resolved["routed"]:
+                    intent_payload: dict[str, Any] = {}
+                    if tool_intent is not None:
+                        intent_payload = {
+                            "family": tool_intent.family,
+                            "verb": tool_intent.verb,
+                            "is_mutating": tool_intent.is_mutating,
+                        }
+                    tw.emit(
+                        {
+                            "trace_id": trace_id,
+                            "event": "tool.route",
+                            "requested_tool": original_name,
+                            "requested_args": original_args,
+                            "tool": tool_name,
+                            "args": tool_args,
+                            "intent": intent_payload,
+                        }
+                    )
+                tw.emit(
+                    {
+                        "trace_id": trace_id,
+                        "event": "tool.request",
+                        "tool": tool_name,
+                        "requested_tool": original_name,
+                        "args": tool_args,
+                    }
+                )
 
             tool_func = tool_lookup.get(tool_name)
             if tool_func is None:
                 tool_messages.append(
                     ToolMessage(
                         content=f"Error: unknown tool '{tool_name}'.",
-                        tool_call_id=tool_call["id"],
+                        tool_call_id=tool_call_id,
                     )
                 )
                 continue
 
-            if is_write_tool(tool_name):
+            if requires_approval:
                 evidence_corpus = _build_evidence_corpus(messages)
                 pending_actions: list[PendingAction] = []
                 blocked_messages: list[ToolMessage] = []
 
-                for pending_call in current_response.tool_calls[call_idx:]:
-                    pending_name = pending_call["name"]
-                    pending_args = pending_call["args"]
-                    if not is_write_tool(pending_name):
+                for pending in resolved_calls[call_idx:]:
+                    pending_name = str(pending["name"])
+                    pending_args = pending["args"]
+                    pending_intent = pending["intent"]
+                    pending_tool_call_id = str(pending["tool_call_id"])
+
+                    if not bool(pending["requires_approval"]):
                         continue
 
                     pending_tool = tool_lookup.get(pending_name)
@@ -296,12 +394,21 @@ def handle_tool_calls(
                         blocked_messages.append(
                             ToolMessage(
                                 content=f"Error: unknown write tool '{pending_name}'.",
-                                tool_call_id=pending_call["id"],
+                                tool_call_id=pending_tool_call_id,
                             )
                         )
                         continue
 
-                    if pending_name == "aws_cli_execute":
+                    if not isinstance(pending_args, dict):
+                        blocked_messages.append(
+                            ToolMessage(
+                                content=f"Error: invalid args for write tool '{pending_name}'.",
+                                tool_call_id=pending_tool_call_id,
+                            )
+                        )
+                        continue
+
+                    if pending_intent is not None and pending_intent.family == "aws" and pending_intent.is_mutating:
                         command_text = str((pending_args or {}).get("command") or "")
                         grounding_issue = _validate_aws_write_grounding(command_text, evidence_corpus)
                         if grounding_issue is not None:
@@ -318,7 +425,7 @@ def handle_tool_calls(
                             blocked_messages.append(
                                 ToolMessage(
                                     content=guard_msg,
-                                    tool_call_id=pending_call["id"],
+                                    tool_call_id=pending_tool_call_id,
                                 )
                             )
                             continue
@@ -398,16 +505,25 @@ def handle_tool_calls(
                             "trace_id": trace_id,
                             "event": "tool.result",
                             "tool": tool_name,
+                            "requested_tool": original_name,
                             "result_type": type(result).__name__,
                             "result_len": raw_result_len,
                             "result_injected_len": len(result_content),
                         }
                     )
-                tool_messages.append(ToolMessage(content=result_content, tool_call_id=tool_call["id"]))
+                tool_messages.append(ToolMessage(content=result_content, tool_call_id=tool_call_id))
             except Exception as exc:
                 if tw and trace_id:
-                    tw.emit({"trace_id": trace_id, "event": "tool.error", "tool": tool_name, "error": str(exc)})
-                tool_messages.append(ToolMessage(content=f"Error: {exc}", tool_call_id=tool_call["id"]))
+                    tw.emit(
+                        {
+                            "trace_id": trace_id,
+                            "event": "tool.error",
+                            "tool": tool_name,
+                            "requested_tool": original_name,
+                            "error": str(exc),
+                        }
+                    )
+                tool_messages.append(ToolMessage(content=f"Error: {exc}", tool_call_id=tool_call_id))
 
         messages.append(AIMessage(content=current_response.content, tool_calls=current_response.tool_calls))
         messages.extend(tool_messages)

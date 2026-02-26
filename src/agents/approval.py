@@ -207,6 +207,14 @@ def format_command_preview(tool_name: str, tool_args: dict) -> str:
             return "- " + command
         return "- kubectl " + command
 
+    if tool_name == "helm_execute":
+        command = str(tool_args.get("command") or "").strip()
+        if not command:
+            return "- helm <verb> [args]"
+        if command.lower().startswith("helm "):
+            return "- " + command
+        return "- helm " + command
+
     return "- command preview unavailable for this write tool"
 
 

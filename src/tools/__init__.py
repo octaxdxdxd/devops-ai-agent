@@ -55,6 +55,11 @@ from .k8s_cli import (
     kubectl_readonly,
     kubectl_execute,
 )
+from .helm_cli import (
+    get_helm_tools,
+    helm_readonly,
+    helm_execute,
+)
 
 
 # Tool policy
@@ -70,6 +75,7 @@ WRITE_TOOL_NAMES = {
     "rollout_restart_kubernetes_daemonset",
     "rollout_restart_kubernetes_workloads_batch",
     "kubectl_execute",
+    "helm_execute",
     "aws_cli_execute",
 }
 
@@ -94,7 +100,7 @@ _WRITE_TOOLS = [
 
 def get_all_tools():
     """Get all available tools for the agent"""
-    return [*get_k8s_read_tools(), *get_k8s_cli_tools(), *get_aws_tools(), *_WRITE_TOOLS]
+    return [*get_k8s_read_tools(), *get_k8s_cli_tools(), *get_helm_tools(), *get_aws_tools(), *_WRITE_TOOLS]
 
 
 __all__ = [
@@ -131,6 +137,9 @@ __all__ = [
     'kubectl_readonly',
     'kubectl_execute',
     'get_k8s_cli_tools',
+    'helm_readonly',
+    'helm_execute',
+    'get_helm_tools',
     'get_k8s_read_tools',
     'restart_kubernetes_pod',
     'restart_kubernetes_pods_batch',
