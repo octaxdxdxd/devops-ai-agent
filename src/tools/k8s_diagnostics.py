@@ -86,7 +86,7 @@ def _discover_pod_namespaces(pod_name: str) -> tuple[list[str], str | None]:
     if not ensure_kubectl_installed():
         return [], kubectl_not_found_msg()
 
-    args = kubectl_base_args(all_namespaces=True) + ["get", "pods", "-o", "json"]
+    args = kubectl_base_args() + ["get", "pods", "-A", "-o", "json"]
     code, out, err = run_kubectl(args)
     if code != 0:
         return [], kube_access_help(err or out)
@@ -226,8 +226,10 @@ def k8s_list_pods(
     if not ensure_kubectl_installed():
         return kubectl_not_found_msg()
 
-    args = kubectl_base_args(all_namespaces=(ns.lower() == "all"), namespace=None if ns.lower() == "all" else ns)
+    args = kubectl_base_args(namespace=None if ns.lower() == "all" else ns)
     args += ["get", "pods", "-o", "wide"]
+    if ns.lower() == "all":
+        args.append("-A")
     if label_selector:
         args += ["-l", label_selector]
     if field_selector:
@@ -257,8 +259,10 @@ def k8s_find_pods(name_contains: str, namespace: str = "all", limit: int = 50) -
     if not ensure_kubectl_installed():
         return kubectl_not_found_msg()
 
-    args = kubectl_base_args(all_namespaces=(ns.lower() == "all"), namespace=None if ns.lower() == "all" else ns)
+    args = kubectl_base_args(namespace=None if ns.lower() == "all" else ns)
     args += ["get", "pods", "-o", "json"]
+    if ns.lower() == "all":
+        args.append("-A")
 
     code, out, err = run_kubectl(args)
     if code != 0:
@@ -383,8 +387,10 @@ def k8s_top_pods(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
     if not ensure_kubectl_installed():
         return kubectl_not_found_msg()
 
-    args = kubectl_base_args(all_namespaces=(namespace.lower() == "all"), namespace=None if namespace.lower() == "all" else namespace)
+    args = kubectl_base_args(namespace=None if namespace.lower() == "all" else namespace)
     args += ["top", "pods"]
+    if namespace.lower() == "all":
+        args.append("-A")
     code, out, stderr = run_kubectl(args)
     if code != 0:
         return kube_access_help(stderr or out)
@@ -403,8 +409,10 @@ def k8s_list_deployments(namespace: str = Config.K8S_DEFAULT_NAMESPACE, label_se
     if not ensure_kubectl_installed():
         return kubectl_not_found_msg()
 
-    args = kubectl_base_args(all_namespaces=(namespace.lower() == "all"), namespace=None if namespace.lower() == "all" else namespace)
+    args = kubectl_base_args(namespace=None if namespace.lower() == "all" else namespace)
     args += ["get", "deployments", "-o", "wide"]
+    if namespace.lower() == "all":
+        args.append("-A")
     if label_selector:
         args += ["-l", label_selector]
 
@@ -574,8 +582,10 @@ def k8s_get_crashloop_pods(namespace: str = "all", limit: int = 100) -> str:
     if not ensure_kubectl_installed():
         return kubectl_not_found_msg()
 
-    args = kubectl_base_args(all_namespaces=(ns.lower() == "all"), namespace=None if ns.lower() == "all" else ns)
+    args = kubectl_base_args(namespace=None if ns.lower() == "all" else ns)
     args += ["get", "pods", "-o", "json"]
+    if ns.lower() == "all":
+        args.append("-A")
     code, out, stderr = run_kubectl(args)
     if code != 0:
         return kube_access_help(stderr or out)

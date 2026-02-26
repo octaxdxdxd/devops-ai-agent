@@ -49,7 +49,7 @@ class Config:
     )
 
     # AWS CLI tools
-    AWS_CLI_ENABLED = os.getenv('AWS_CLI_ENABLED', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AWS_CLI_ENABLED = os.getenv('AWS_CLI_ENABLED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AWS_CLI_DRY_RUN = os.getenv('AWS_CLI_DRY_RUN', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AWS_CLI_TIMEOUT_SEC = int(os.getenv('AWS_CLI_TIMEOUT_SEC', '30'))
     AWS_CLI_PROFILE = os.getenv('AWS_CLI_PROFILE', '').strip()
@@ -97,11 +97,16 @@ class Config:
     AWS_CLI_BLOCKLIST = os.getenv('AWS_CLI_BLOCKLIST', 'iam:*,organizations:*,account:*').strip()
     
     # Agent Configuration
-    MAX_ITERATIONS = 5
-    MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '12'))
-    MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '2'))
+    MAX_ITERATIONS = int(os.getenv('MAX_ITERATIONS', '8'))
+    MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '24'))
+    MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '3'))
     MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '14'))
     AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '5000'))
+    DEEP_INITIAL_INVESTIGATION = os.getenv('DEEP_INITIAL_INVESTIGATION', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    LLM_RETRY_ON_RATE_LIMIT = os.getenv('LLM_RETRY_ON_RATE_LIMIT', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    LLM_RETRY_MAX_ATTEMPTS = int(os.getenv('LLM_RETRY_MAX_ATTEMPTS', '3'))
+    LLM_RETRY_BASE_DELAY_SEC = float(os.getenv('LLM_RETRY_BASE_DELAY_SEC', '1.0'))
+    LLM_RETRY_MAX_DELAY_SEC = float(os.getenv('LLM_RETRY_MAX_DELAY_SEC', '8.0'))
     VERBOSE = True
 
     # Tracing (structured JSONL)

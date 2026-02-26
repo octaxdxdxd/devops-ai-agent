@@ -6,9 +6,6 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import Config
-
-
 @dataclass
 class PendingAction:
     """Pending write tool invocation awaiting explicit approval."""
@@ -22,21 +19,31 @@ class ApprovalCoordinator:
 
     def __init__(self) -> None:
         self.pending_action: PendingAction | None = None
+        self.pending_actions: list[PendingAction] = []
         self.recent_restart_candidates: list[str] = []
         self.recent_restart_namespace: str | None = None
         self.recent_restart_reason: str = ""
 
     def clear(self) -> None:
         self.pending_action = None
+        self.pending_actions = []
         self.recent_restart_candidates = []
         self.recent_restart_namespace = None
         self.recent_restart_reason = ""
 
     def set_pending_action(self, tool: Any, args: dict) -> None:
+        self.pending_actions = []
         self.pending_action = PendingAction(tool=tool, args=args)
 
+    def set_pending_actions(self, actions: list[PendingAction]) -> None:
+        self.pending_action = None
+        self.pending_actions = list(actions)
+
+    def has_pending(self) -> bool:
+        return self.pending_action is not None or bool(self.pending_actions)
+
     def record_restart_context(self, tool_args: dict, model_response_text: str) -> None:
-        namespace = str(tool_args.get("namespace") or Config.K8S_DEFAULT_NAMESPACE)
+        namespace = str(tool_args.get("namespace") or "").strip() or "auto"
         reason = str(tool_args.get("reason") or "")
         candidates = extract_pod_candidates_from_text(model_response_text)
 
@@ -79,7 +86,8 @@ class ApprovalCoordinator:
         if batch_tool is None:
             return False
 
-        namespace = self.recent_restart_namespace or self.pending_action.args.get("namespace") or Config.K8S_DEFAULT_NAMESPACE
+        # Batch restarts should default to namespace auto-resolution per pod.
+        namespace = "auto"
         reason = self.recent_restart_reason or self.pending_action.args.get("reason") or "Batch restart requested by user"
 
         self.pending_action = PendingAction(
@@ -90,6 +98,7 @@ class ApprovalCoordinator:
                 "reason": reason,
             },
         )
+        self.pending_actions = []
         return True
 
 
@@ -114,7 +123,12 @@ def is_batch_intent(decision: str) -> bool:
 
 def format_command_preview(tool_name: str, tool_args: dict) -> str:
     """Render planned kubectl/aws command(s) for approval prompts."""
-    namespace = str(tool_args.get("namespace") or Config.K8S_DEFAULT_NAMESPACE)
+    namespace_raw = str(tool_args.get("namespace") or "").strip()
+    auto_namespace = namespace_raw.lower() in {"", "default", "auto", "any", "all"}
+    if auto_namespace:
+        namespace = "<auto-resolve>"
+    else:
+        namespace = namespace_raw
     base = ["kubectl", "-n", namespace, "delete", "pod"]
 
     if tool_name == "restart_kubernetes_pod":
@@ -125,8 +139,10 @@ def format_command_preview(tool_name: str, tool_args: dict) -> str:
         pod_names = [str(p) for p in (tool_args.get("pod_names") or []) if str(p).strip()]
         if not pod_names:
             return "- (no pods provided)"
+        ns_for_batch = "<auto-resolve-per-pod>" if auto_namespace else namespace
+        batch_base = ["kubectl", "-n", ns_for_batch, "delete", "pod"]
         return "\n".join(
-            "- " + " ".join(base + [pod, "--wait=false", "--ignore-not-found=true"])
+            "- " + " ".join(batch_base + [pod, "--wait=false", "--ignore-not-found=true"])
             for pod in pod_names
         )
 

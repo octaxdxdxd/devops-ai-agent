@@ -1,16 +1,24 @@
-"""
-Action Tools
-"""
+"""Kubernetes mutation tools (approval-gated by agent policy)."""
+
 from __future__ import annotations
 
+import shlex
+
 from langchain.tools import tool
+
 from ..config import Config
 from .k8s_common import (
     ensure_kubectl_installed,
     is_valid_k8s_name,
     kubectl_base_args,
+    resolve_namespace_for_resource,
     run_kubectl,
+    truncate_text,
 )
+
+
+def _kubectl_missing_msg() -> str:
+    return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
 
 
 def _build_restart_cmd(pod_name: str, namespace: str) -> list[str]:
@@ -41,21 +49,27 @@ def _build_rollout_restart_cmd(kind: str, name: str, namespace: str) -> list[str
     ]
 
 
-def _validate_namespace(namespace: str) -> str | None:
-    if not is_valid_k8s_name(namespace):
+def _validate_name(value: str, label: str) -> str | None:
+    if not is_valid_k8s_name(value):
+        return f"❌ Invalid {label}: {value!r}."
+    return None
+
+
+def _validate_namespace_hint(namespace: str) -> str | None:
+    ns = (namespace or "").strip()
+    if not ns or ns.lower() in {"auto", "any", "all"}:
+        return None
+    if not is_valid_k8s_name(ns):
         return f"❌ Invalid namespace: {namespace!r}."
     return None
 
 
-def _validate_pod_name(pod_name: str) -> str | None:
-    if not is_valid_k8s_name(pod_name):
-        return f"❌ Invalid pod name: {pod_name!r}."
-    return None
+def _resolve_namespace(kind: str, name: str, namespace_hint: str) -> tuple[str | None, str | None]:
+    return resolve_namespace_for_resource(kind, name, namespace_hint)
 
 
 def _preflight_cluster_access() -> str | None:
-    preflight = kubectl_base_args(namespace=None) + ["cluster-info"]
-    code, _out, err = run_kubectl(preflight)
+    code, _out, err = run_kubectl(kubectl_base_args(namespace=None) + ["cluster-info"])
     if code == 0:
         return None
     return (
@@ -64,62 +78,100 @@ def _preflight_cluster_access() -> str | None:
     )
 
 
-@tool
-def restart_kubernetes_pod(pod_name: str, namespace: str = Config.K8S_DEFAULT_NAMESPACE, reason: str = "") -> str:
-    """
-    Restart a Kubernetes pod by deleting it (will be recreated by deployment/replicaset).
-    IMPORTANT: Always ask for user approval before using this tool as it will cause service disruption.
-    
-    Args:
-        pod_name: Name of the pod to restart (e.g., 'pod-java-app-7d9f8b6c5-xk2m9')
-        namespace: Kubernetes namespace (default: Config.K8S_DEFAULT_NAMESPACE)
-        reason: Reason for restart (e.g., 'OutOfMemoryError recovery')
-    
-    Returns:
-        str: Success or error message
-    """
-    pod_name = (pod_name or "").strip()
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
-    reason = (reason or "").strip()
-
-    pod_err = _validate_pod_name(pod_name)
-    if pod_err:
-        return pod_err
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
-
-    if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
-    preflight_err = _preflight_cluster_access()
-    if preflight_err:
-        return preflight_err
-
-    cmd = _build_restart_cmd(pod_name, namespace)
-    cmd_text = " ".join(cmd)
+def _run_single_command(cmd: list[str], *, reason: str, success_text: str) -> str:
+    cmd_text = shlex.join(cmd)
 
     if Config.K8S_DRY_RUN:
         return (
             "🧪 DRY RUN enabled; no mutation executed.\n"
-            f"Planned command: {cmd_text}\n"
+            f"Planned command:\n```bash\n{cmd_text}\n```\n"
             f"Reason: {reason or 'n/a'}"
         )
 
     code, out, err = run_kubectl(cmd)
     if code != 0:
         return (
-            f"Planned command: {cmd_text}\n"
-            f"❌ Failed to restart pod '{pod_name}' in namespace '{namespace}'. "
-            f"kubectl exit code: {code}. Details: {err or out or 'unknown error'}"
+            f"Planned command:\n```bash\n{cmd_text}\n```\n"
+            f"❌ kubectl command failed (exit={code}). "
+            f"Details: {truncate_text(err or out or 'unknown error')}"
         )
 
     return (
-        f"Planned command: {cmd_text}\n"
-        f"✅ Successfully requested restart of pod '{pod_name}' in namespace '{namespace}'.\n"
+        f"Planned command:\n```bash\n{cmd_text}\n```\n"
+        f"✅ {success_text}\n"
         f"Reason: {reason or 'n/a'}\n"
         f"Executed command: {cmd_text}\n"
-        f"kubectl output: {out or '(no output)'}"
+        f"kubectl output: {truncate_text(out or '(no output)')}"
+    )
+
+
+def _run_batch_commands(commands: list[tuple[str, list[str]]], *, reason: str, title: str) -> str:
+    command_lines = [shlex.join(cmd) for _label, cmd in commands]
+
+    if Config.K8S_DRY_RUN:
+        return (
+            "🧪 DRY RUN enabled; no mutation executed.\n"
+            f"{title}\n"
+            "Planned commands:\n"
+            + "\n".join(f"- {line}" for line in command_lines)
+            + f"\nReason: {reason or 'n/a'}"
+        )
+
+    successes: list[str] = []
+    failures: list[str] = []
+
+    for label, cmd in commands:
+        code, out, err = run_kubectl(cmd)
+        if code == 0:
+            successes.append(f"✅ {label}: {truncate_text(out or '(no output)')}")
+        else:
+            failures.append(f"❌ {label}: {truncate_text(err or out or 'unknown error')}")
+
+    summary = "✅ Completed." if not failures else "⚠️ Completed with failures."
+    return "\n".join(
+        [
+            f"{title} {summary}",
+            f"Reason: {reason or 'n/a'}",
+            "Planned commands:",
+            *[f"- {line}" for line in command_lines],
+            "Execution results:",
+            *successes,
+            *failures,
+        ]
+    )
+
+
+@tool
+def restart_kubernetes_pod(pod_name: str, namespace: str = Config.K8S_DEFAULT_NAMESPACE, reason: str = "") -> str:
+    """Restart a pod by deleting it (controller recreates it)."""
+    pod_name = (pod_name or "").strip()
+    namespace_hint = (namespace or "").strip()
+    reason = (reason or "").strip()
+
+    name_err = _validate_name(pod_name, "pod name")
+    if name_err:
+        return name_err
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
+
+    if not ensure_kubectl_installed():
+        return _kubectl_missing_msg()
+    preflight_err = _preflight_cluster_access()
+    if preflight_err:
+        return preflight_err
+
+    resolved_ns, resolve_err = _resolve_namespace("pod", pod_name, namespace_hint)
+    if resolve_err:
+        return resolve_err
+    if not resolved_ns:
+        return f"❌ Could not resolve namespace for pod '{pod_name}'."
+
+    cmd = _build_restart_cmd(pod_name, resolved_ns)
+    return _run_single_command(
+        cmd,
+        reason=reason,
+        success_text=f"Successfully requested restart of pod '{pod_name}' in namespace '{resolved_ns}'.",
     )
 
 
@@ -129,77 +181,39 @@ def restart_kubernetes_pods_batch(
     namespace: str = Config.K8S_DEFAULT_NAMESPACE,
     reason: str = "",
 ) -> str:
-    """
-    Restart multiple Kubernetes pods in one operation by deleting each pod.
-    IMPORTANT: Always ask for user approval before using this tool as it mutates cluster state.
-
-    Args:
-        pod_names: List of pod names to restart in the same namespace.
-        namespace: Kubernetes namespace.
-        reason: Reason for batch restart.
-    """
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    """Restart multiple pods (can resolve namespaces per pod)."""
+    namespace_hint = (namespace or "").strip()
     reason = (reason or "").strip()
-    pod_names = [str(p).strip() for p in (pod_names or []) if str(p).strip()]
+    pods = [str(p).strip() for p in (pod_names or []) if str(p).strip()]
 
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
-    if not pod_names:
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
+    if not pods:
         return "❌ pod_names must contain at least one pod name."
 
-    unique_pods: list[str] = []
-    seen: set[str] = set()
-    for name in pod_names:
-        if name in seen:
-            continue
-        seen.add(name)
-        unique_pods.append(name)
-
-    invalid = [name for name in unique_pods if _validate_pod_name(name)]
+    unique_pods = list(dict.fromkeys(pods))
+    invalid = [name for name in unique_pods if _validate_name(name, "pod name")]
     if invalid:
         return f"❌ Invalid pod names: {invalid}"
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
+        return _kubectl_missing_msg()
     preflight_err = _preflight_cluster_access()
     if preflight_err:
         return preflight_err
 
-    commands = [_build_restart_cmd(name, namespace) for name in unique_pods]
-    command_lines = [" ".join(cmd) for cmd in commands]
+    commands: list[tuple[str, list[str]]] = []
+    for pod_name in unique_pods:
+        resolved_ns, resolve_err = _resolve_namespace("pod", pod_name, namespace_hint)
+        if resolve_err:
+            return resolve_err
+        if not resolved_ns:
+            return f"❌ Could not resolve namespace for pod '{pod_name}'."
+        cmd = _build_restart_cmd(pod_name, resolved_ns)
+        commands.append((f"pod/{pod_name} (ns={resolved_ns})", cmd))
 
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            "Planned commands:\n"
-            + "\n".join(f"- {line}" for line in command_lines)
-            + f"\nReason: {reason or 'n/a'}"
-        )
-
-    results: list[str] = []
-    failures: list[str] = []
-
-    for pod_name, cmd in zip(unique_pods, commands):
-        code, out, err = run_kubectl(cmd)
-        if code == 0:
-            results.append(f"✅ {pod_name}: {out or '(no output)'}")
-        else:
-            failures.append(f"❌ {pod_name}: {err or out or 'unknown error'}")
-
-    status = "✅ Batch restart completed." if not failures else "⚠️ Batch restart completed with failures."
-    body_lines = [
-        status,
-        f"Namespace: {namespace}",
-        f"Reason: {reason or 'n/a'}",
-        "Planned commands:",
-        *[f"- {line}" for line in command_lines],
-        "Execution results:",
-        *results,
-        *failures,
-    ]
-    return "\n".join(body_lines)
+    return _run_batch_commands(commands, reason=reason, title="Batch pod restart")
 
 
 @tool
@@ -209,9 +223,9 @@ def scale_kubernetes_deployment(
     replicas: int = 0,
     reason: str = "",
 ) -> str:
-    """Scale a Kubernetes deployment to a target replica count (write action)."""
+    """Scale a deployment."""
     deployment_name = (deployment_name or "").strip()
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    namespace_hint = (namespace or "").strip()
     reason = (reason or "").strip()
 
     if not deployment_name:
@@ -219,44 +233,32 @@ def scale_kubernetes_deployment(
     if replicas < 0:
         return "❌ replicas must be >= 0."
 
-    name_err = _validate_pod_name(deployment_name)
+    name_err = _validate_name(deployment_name, "deployment name")
     if name_err:
-        return name_err.replace("pod name", "deployment name")
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
+        return name_err
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
+        return _kubectl_missing_msg()
     preflight_err = _preflight_cluster_access()
     if preflight_err:
         return preflight_err
 
-    cmd = _build_scale_cmd("deployment", deployment_name, namespace, replicas)
-    cmd_text = " ".join(cmd)
+    resolved_ns, resolve_err = _resolve_namespace("deployment", deployment_name, namespace_hint)
+    if resolve_err:
+        return resolve_err
+    if not resolved_ns:
+        return f"❌ Could not resolve namespace for deployment '{deployment_name}'."
 
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            f"Planned command: {cmd_text}\n"
-            f"Reason: {reason or 'n/a'}"
-        )
-
-    code, out, err = run_kubectl(cmd)
-    if code != 0:
-        return (
-            f"Planned command: {cmd_text}\n"
-            f"❌ Failed to scale deployment '{deployment_name}' in namespace '{namespace}'. "
-            f"kubectl exit code: {code}. Details: {err or out or 'unknown error'}"
-        )
-
-    return (
-        f"Planned command: {cmd_text}\n"
-        f"✅ Successfully scaled deployment '{deployment_name}' in namespace '{namespace}' to replicas={replicas}.\n"
-        f"Reason: {reason or 'n/a'}\n"
-        f"Executed command: {cmd_text}\n"
-        f"kubectl output: {out or '(no output)'}"
+    cmd = _build_scale_cmd("deployment", deployment_name, resolved_ns, replicas)
+    return _run_single_command(
+        cmd,
+        reason=reason,
+        success_text=(
+            f"Successfully scaled deployment '{deployment_name}' in namespace '{resolved_ns}' to replicas={replicas}."
+        ),
     )
 
 
@@ -267,9 +269,9 @@ def scale_kubernetes_statefulset(
     replicas: int = 0,
     reason: str = "",
 ) -> str:
-    """Scale a Kubernetes statefulset to a target replica count (write action)."""
+    """Scale a statefulset."""
     statefulset_name = (statefulset_name or "").strip()
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    namespace_hint = (namespace or "").strip()
     reason = (reason or "").strip()
 
     if not statefulset_name:
@@ -277,44 +279,32 @@ def scale_kubernetes_statefulset(
     if replicas < 0:
         return "❌ replicas must be >= 0."
 
-    name_err = _validate_pod_name(statefulset_name)
+    name_err = _validate_name(statefulset_name, "statefulset name")
     if name_err:
-        return name_err.replace("pod name", "statefulset name")
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
+        return name_err
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
+        return _kubectl_missing_msg()
     preflight_err = _preflight_cluster_access()
     if preflight_err:
         return preflight_err
 
-    cmd = _build_scale_cmd("statefulset", statefulset_name, namespace, replicas)
-    cmd_text = " ".join(cmd)
+    resolved_ns, resolve_err = _resolve_namespace("statefulset", statefulset_name, namespace_hint)
+    if resolve_err:
+        return resolve_err
+    if not resolved_ns:
+        return f"❌ Could not resolve namespace for statefulset '{statefulset_name}'."
 
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            f"Planned command: {cmd_text}\n"
-            f"Reason: {reason or 'n/a'}"
-        )
-
-    code, out, err = run_kubectl(cmd)
-    if code != 0:
-        return (
-            f"Planned command: {cmd_text}\n"
-            f"❌ Failed to scale statefulset '{statefulset_name}' in namespace '{namespace}'. "
-            f"kubectl exit code: {code}. Details: {err or out or 'unknown error'}"
-        )
-
-    return (
-        f"Planned command: {cmd_text}\n"
-        f"✅ Successfully scaled statefulset '{statefulset_name}' in namespace '{namespace}' to replicas={replicas}.\n"
-        f"Reason: {reason or 'n/a'}\n"
-        f"Executed command: {cmd_text}\n"
-        f"kubectl output: {out or '(no output)'}"
+    cmd = _build_scale_cmd("statefulset", statefulset_name, resolved_ns, replicas)
+    return _run_single_command(
+        cmd,
+        reason=reason,
+        success_text=(
+            f"Successfully scaled statefulset '{statefulset_name}' in namespace '{resolved_ns}' to replicas={replicas}."
+        ),
     )
 
 
@@ -324,76 +314,49 @@ def scale_kubernetes_workloads_batch(
     changes: list[dict],
     reason: str = "",
 ) -> str:
-    """
-    Scale multiple workloads in one approved write operation.
-
-    Each item in changes must be:
-    {"kind": "deployment"|"statefulset", "name": "<resource>", "replicas": <int>}.
-    """
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    """Scale multiple workloads in one operation."""
+    namespace_hint = (namespace or "").strip()
     reason = (reason or "").strip()
 
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
     if not isinstance(changes, list) or not changes:
         return "❌ changes must be a non-empty list."
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
+        return _kubectl_missing_msg()
     preflight_err = _preflight_cluster_access()
     if preflight_err:
         return preflight_err
 
-    parsed: list[tuple[str, str, int]] = []
+    commands: list[tuple[str, list[str]]] = []
     for idx, item in enumerate(changes, start=1):
         if not isinstance(item, dict):
             return f"❌ changes[{idx}] must be an object."
+
         kind = str(item.get("kind", "")).strip().lower()
         name = str(item.get("name", "")).strip()
         replicas = item.get("replicas", 0)
+
         if kind not in {"deployment", "statefulset"}:
             return f"❌ changes[{idx}].kind must be 'deployment' or 'statefulset'."
-        name_err = _validate_pod_name(name)
-        if name_err:
+        if _validate_name(name, f"changes[{idx}] workload name"):
             return f"❌ changes[{idx}] invalid workload name: {name!r}."
         if not isinstance(replicas, int) or replicas < 0:
             return f"❌ changes[{idx}].replicas must be integer >= 0."
-        parsed.append((kind, name, replicas))
 
-    commands = [_build_scale_cmd(kind, name, namespace, replicas) for kind, name, replicas in parsed]
-    command_lines = [" ".join(cmd) for cmd in commands]
+        resolved_ns, resolve_err = _resolve_namespace(kind, name, namespace_hint)
+        if resolve_err:
+            return resolve_err
+        if not resolved_ns:
+            return f"❌ Could not resolve namespace for {kind} '{name}'."
 
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            "Planned commands:\n"
-            + "\n".join(f"- {line}" for line in command_lines)
-            + f"\nReason: {reason or 'n/a'}"
-        )
+        cmd = _build_scale_cmd(kind, name, resolved_ns, replicas)
+        label = f"{kind}/{name} (ns={resolved_ns}) -> replicas={replicas}"
+        commands.append((label, cmd))
 
-    successes: list[str] = []
-    failures: list[str] = []
-    for (kind, name, replicas), cmd in zip(parsed, commands):
-        code, out, err = run_kubectl(cmd)
-        label = f"{kind}/{name} -> replicas={replicas}"
-        if code == 0:
-            successes.append(f"✅ {label}: {out or '(no output)'}")
-        else:
-            failures.append(f"❌ {label}: {err or out or 'unknown error'}")
-
-    summary = "✅ Batch scaling completed." if not failures else "⚠️ Batch scaling completed with failures."
-    return "\n".join([
-        summary,
-        f"Namespace: {namespace}",
-        f"Reason: {reason or 'n/a'}",
-        "Planned commands:",
-        *[f"- {line}" for line in command_lines],
-        "Execution results:",
-        *successes,
-        *failures,
-    ])
+    return _run_batch_commands(commands, reason=reason, title="Batch scaling")
 
 
 @tool
@@ -402,52 +365,38 @@ def rollout_restart_kubernetes_deployment(
     namespace: str = Config.K8S_DEFAULT_NAMESPACE,
     reason: str = "",
 ) -> str:
-    """Restart a deployment using `kubectl rollout restart` (write action)."""
+    """Rollout-restart a deployment."""
     deployment_name = (deployment_name or "").strip()
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    namespace_hint = (namespace or "").strip()
     reason = (reason or "").strip()
 
     if not deployment_name:
         return "❌ deployment_name is required."
 
-    name_err = _validate_pod_name(deployment_name)
+    name_err = _validate_name(deployment_name, "deployment name")
     if name_err:
-        return name_err.replace("pod name", "deployment name")
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
+        return name_err
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
+        return _kubectl_missing_msg()
     preflight_err = _preflight_cluster_access()
     if preflight_err:
         return preflight_err
 
-    cmd = _build_rollout_restart_cmd("deployment", deployment_name, namespace)
-    cmd_text = " ".join(cmd)
+    resolved_ns, resolve_err = _resolve_namespace("deployment", deployment_name, namespace_hint)
+    if resolve_err:
+        return resolve_err
+    if not resolved_ns:
+        return f"❌ Could not resolve namespace for deployment '{deployment_name}'."
 
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            f"Planned command: {cmd_text}\n"
-            f"Reason: {reason or 'n/a'}"
-        )
-
-    code, out, err = run_kubectl(cmd)
-    if code != 0:
-        return (
-            f"Planned command: {cmd_text}\n"
-            f"❌ Failed to rollout restart deployment '{deployment_name}' in namespace '{namespace}'. "
-            f"kubectl exit code: {code}. Details: {err or out or 'unknown error'}"
-        )
-
-    return (
-        f"Planned command: {cmd_text}\n"
-        f"✅ Successfully requested rollout restart of deployment '{deployment_name}' in namespace '{namespace}'.\n"
-        f"Reason: {reason or 'n/a'}\n"
-        f"Executed command: {cmd_text}\n"
-        f"kubectl output: {out or '(no output)'}"
+    cmd = _build_rollout_restart_cmd("deployment", deployment_name, resolved_ns)
+    return _run_single_command(
+        cmd,
+        reason=reason,
+        success_text=f"Successfully requested rollout restart of deployment '{deployment_name}' in namespace '{resolved_ns}'.",
     )
 
 
@@ -457,52 +406,40 @@ def rollout_restart_kubernetes_statefulset(
     namespace: str = Config.K8S_DEFAULT_NAMESPACE,
     reason: str = "",
 ) -> str:
-    """Restart a statefulset using `kubectl rollout restart` (write action)."""
+    """Rollout-restart a statefulset."""
     statefulset_name = (statefulset_name or "").strip()
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    namespace_hint = (namespace or "").strip()
     reason = (reason or "").strip()
 
     if not statefulset_name:
         return "❌ statefulset_name is required."
 
-    name_err = _validate_pod_name(statefulset_name)
+    name_err = _validate_name(statefulset_name, "statefulset name")
     if name_err:
-        return name_err.replace("pod name", "statefulset name")
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
+        return name_err
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
+        return _kubectl_missing_msg()
     preflight_err = _preflight_cluster_access()
     if preflight_err:
         return preflight_err
 
-    cmd = _build_rollout_restart_cmd("statefulset", statefulset_name, namespace)
-    cmd_text = " ".join(cmd)
+    resolved_ns, resolve_err = _resolve_namespace("statefulset", statefulset_name, namespace_hint)
+    if resolve_err:
+        return resolve_err
+    if not resolved_ns:
+        return f"❌ Could not resolve namespace for statefulset '{statefulset_name}'."
 
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            f"Planned command: {cmd_text}\n"
-            f"Reason: {reason or 'n/a'}"
-        )
-
-    code, out, err = run_kubectl(cmd)
-    if code != 0:
-        return (
-            f"Planned command: {cmd_text}\n"
-            f"❌ Failed to rollout restart statefulset '{statefulset_name}' in namespace '{namespace}'. "
-            f"kubectl exit code: {code}. Details: {err or out or 'unknown error'}"
-        )
-
-    return (
-        f"Planned command: {cmd_text}\n"
-        f"✅ Successfully requested rollout restart of statefulset '{statefulset_name}' in namespace '{namespace}'.\n"
-        f"Reason: {reason or 'n/a'}\n"
-        f"Executed command: {cmd_text}\n"
-        f"kubectl output: {out or '(no output)'}"
+    cmd = _build_rollout_restart_cmd("statefulset", statefulset_name, resolved_ns)
+    return _run_single_command(
+        cmd,
+        reason=reason,
+        success_text=(
+            f"Successfully requested rollout restart of statefulset '{statefulset_name}' in namespace '{resolved_ns}'."
+        ),
     )
 
 
@@ -512,52 +449,38 @@ def rollout_restart_kubernetes_daemonset(
     namespace: str = Config.K8S_DEFAULT_NAMESPACE,
     reason: str = "",
 ) -> str:
-    """Restart a daemonset using `kubectl rollout restart` (write action)."""
+    """Rollout-restart a daemonset."""
     daemonset_name = (daemonset_name or "").strip()
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    namespace_hint = (namespace or "").strip()
     reason = (reason or "").strip()
 
     if not daemonset_name:
         return "❌ daemonset_name is required."
 
-    name_err = _validate_pod_name(daemonset_name)
+    name_err = _validate_name(daemonset_name, "daemonset name")
     if name_err:
-        return name_err.replace("pod name", "daemonset name")
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
+        return name_err
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
+        return _kubectl_missing_msg()
     preflight_err = _preflight_cluster_access()
     if preflight_err:
         return preflight_err
 
-    cmd = _build_rollout_restart_cmd("daemonset", daemonset_name, namespace)
-    cmd_text = " ".join(cmd)
+    resolved_ns, resolve_err = _resolve_namespace("daemonset", daemonset_name, namespace_hint)
+    if resolve_err:
+        return resolve_err
+    if not resolved_ns:
+        return f"❌ Could not resolve namespace for daemonset '{daemonset_name}'."
 
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            f"Planned command: {cmd_text}\n"
-            f"Reason: {reason or 'n/a'}"
-        )
-
-    code, out, err = run_kubectl(cmd)
-    if code != 0:
-        return (
-            f"Planned command: {cmd_text}\n"
-            f"❌ Failed to rollout restart daemonset '{daemonset_name}' in namespace '{namespace}'. "
-            f"kubectl exit code: {code}. Details: {err or out or 'unknown error'}"
-        )
-
-    return (
-        f"Planned command: {cmd_text}\n"
-        f"✅ Successfully requested rollout restart of daemonset '{daemonset_name}' in namespace '{namespace}'.\n"
-        f"Reason: {reason or 'n/a'}\n"
-        f"Executed command: {cmd_text}\n"
-        f"kubectl output: {out or '(no output)'}"
+    cmd = _build_rollout_restart_cmd("daemonset", daemonset_name, resolved_ns)
+    return _run_single_command(
+        cmd,
+        reason=reason,
+        success_text=f"Successfully requested rollout restart of daemonset '{daemonset_name}' in namespace '{resolved_ns}'.",
     )
 
 
@@ -567,70 +490,43 @@ def rollout_restart_kubernetes_workloads_batch(
     workloads: list[dict],
     reason: str = "",
 ) -> str:
-    """
-    Restart multiple workloads in one approved write operation.
-
-    Each item in workloads must be:
-    {"kind": "deployment"|"statefulset"|"daemonset", "name": "<resource>"}.
-    """
-    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    """Rollout-restart multiple workloads in one operation."""
+    namespace_hint = (namespace or "").strip()
     reason = (reason or "").strip()
 
-    ns_err = _validate_namespace(namespace)
-    if ns_err:
-        return ns_err
+    ns_hint_err = _validate_namespace_hint(namespace_hint)
+    if ns_hint_err:
+        return ns_hint_err
     if not isinstance(workloads, list) or not workloads:
         return "❌ workloads must be a non-empty list."
 
     if not ensure_kubectl_installed():
-        return "❌ `kubectl` not found in PATH in this runtime. I cannot execute Kubernetes commands here until it is available."
-
+        return _kubectl_missing_msg()
     preflight_err = _preflight_cluster_access()
     if preflight_err:
         return preflight_err
 
-    parsed: list[tuple[str, str]] = []
+    commands: list[tuple[str, list[str]]] = []
     for idx, item in enumerate(workloads, start=1):
         if not isinstance(item, dict):
             return f"❌ workloads[{idx}] must be an object."
+
         kind = str(item.get("kind", "")).strip().lower()
         name = str(item.get("name", "")).strip()
+
         if kind not in {"deployment", "statefulset", "daemonset"}:
             return f"❌ workloads[{idx}].kind must be 'deployment', 'statefulset', or 'daemonset'."
-        name_err = _validate_pod_name(name)
-        if name_err:
+        if _validate_name(name, f"workloads[{idx}] workload name"):
             return f"❌ workloads[{idx}] invalid workload name: {name!r}."
-        parsed.append((kind, name))
 
-    commands = [_build_rollout_restart_cmd(kind, name, namespace) for kind, name in parsed]
-    command_lines = [" ".join(cmd) for cmd in commands]
+        resolved_ns, resolve_err = _resolve_namespace(kind, name, namespace_hint)
+        if resolve_err:
+            return resolve_err
+        if not resolved_ns:
+            return f"❌ Could not resolve namespace for {kind} '{name}'."
 
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            "Planned commands:\n"
-            + "\n".join(f"- {line}" for line in command_lines)
-            + f"\nReason: {reason or 'n/a'}"
-        )
+        cmd = _build_rollout_restart_cmd(kind, name, resolved_ns)
+        label = f"{kind}/{name} (ns={resolved_ns})"
+        commands.append((label, cmd))
 
-    successes: list[str] = []
-    failures: list[str] = []
-    for (kind, name), cmd in zip(parsed, commands):
-        code, out, err = run_kubectl(cmd)
-        label = f"{kind}/{name}"
-        if code == 0:
-            successes.append(f"✅ {label}: {out or '(no output)'}")
-        else:
-            failures.append(f"❌ {label}: {err or out or 'unknown error'}")
-
-    summary = "✅ Batch rollout restart completed." if not failures else "⚠️ Batch rollout restart completed with failures."
-    return "\n".join([
-        summary,
-        f"Namespace: {namespace}",
-        f"Reason: {reason or 'n/a'}",
-        "Planned commands:",
-        *[f"- {line}" for line in command_lines],
-        "Execution results:",
-        *successes,
-        *failures,
-    ])
+    return _run_batch_commands(commands, reason=reason, title="Batch rollout restart")

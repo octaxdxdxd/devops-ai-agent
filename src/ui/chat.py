@@ -31,21 +31,27 @@ def process_chat_turn() -> None:
         with st.chat_message("user"):
             st.markdown(prompt)
 
+        response = ""
         with st.chat_message("assistant"):
             with st.spinner("Inspecting cluster state and diagnostics..."):
                 chat_history = convert_to_langchain_messages(st.session_state.messages[:-1])
-                response = st.session_state.agent.process_query(
-                    user_input=prompt,
-                    chat_history=chat_history,
-                )
+                try:
+                    response = st.session_state.agent.process_query(
+                        user_input=prompt,
+                        chat_history=chat_history,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    response = f"Error processing query: {exc}"
 
-                if not (response or "").strip():
-                    st.warning("Agent returned an empty response. Check model/provider settings or enable tracing.")
-                else:
-                    st.markdown(response)
+            assistant_content = (response or "").strip()
+            if not assistant_content:
+                assistant_content = "Agent returned an empty response. Check model/provider settings or enable tracing."
 
-                trace_id = getattr(st.session_state.agent, "last_trace_id", None)
-                if trace_id and Config.TRACE_ENABLED:
-                    st.caption(f"Trace ID: {trace_id}")
+            trace_id = getattr(st.session_state.agent, "last_trace_id", None)
+            if trace_id and Config.TRACE_ENABLED:
+                assistant_content += f"\n\nTrace ID: `{trace_id}`"
 
-        st.session_state.messages.append({"role": "assistant", "content": response})
+            st.markdown(assistant_content)
+
+        st.session_state.messages.append({"role": "assistant", "content": assistant_content})
+        st.rerun()

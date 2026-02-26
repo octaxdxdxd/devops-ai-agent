@@ -13,8 +13,10 @@ from langchain_core.tools import tool
 from ..config import Config
 from .k8s_common import (
     ensure_kubectl_installed,
+    is_cluster_scoped_kind,
     kubectl_base_args,
     kubectl_not_found_msg,
+    resolve_namespace_for_resource,
     run_kubectl,
     truncate_text,
 )
@@ -40,6 +42,7 @@ _OPTIONS_WITH_VALUE = {
     "--user",
     "--request-timeout",
 }
+_ALL_NAMESPACE_FLAGS = {"-A", "--all-namespaces"}
 
 _MUTATING_KUBECTL_VERBS = {
     "apply",
@@ -114,6 +117,117 @@ def _extract_verb(tokens: list[str]) -> str:
         return token.lower()
 
     return ""
+
+
+def _next_positional_index(tokens: list[str], start: int = 0) -> int | None:
+    i = start
+    while i < len(tokens):
+        token = str(tokens[i]).strip()
+        if not token:
+            i += 1
+            continue
+
+        if token == "--":
+            if i + 1 < len(tokens):
+                return i + 1
+            return None
+
+        if token.startswith("-"):
+            if token in _OPTIONS_WITH_VALUE:
+                i += 2
+                continue
+            i += 1
+            continue
+
+        return i
+    return None
+
+
+def _extract_namespace(tokens: list[str]) -> tuple[str | None, int | None, bool]:
+    for i, raw in enumerate(tokens):
+        token = str(raw).strip()
+        if token in {"-n", "--namespace"}:
+            if i + 1 < len(tokens):
+                return str(tokens[i + 1]).strip(), i, False
+            return "", i, False
+        if token.startswith("--namespace="):
+            return token.split("=", 1)[1].strip(), i, True
+    return None, None, False
+
+
+def _uses_all_namespaces(tokens: list[str]) -> bool:
+    lowered = {str(t).strip().lower() for t in tokens}
+    return bool(lowered & {x.lower() for x in _ALL_NAMESPACE_FLAGS})
+
+
+def _parse_target_kind_name(tokens: list[str]) -> tuple[str | None, str | None]:
+    verb_idx = _next_positional_index(tokens, 0)
+    if verb_idx is None:
+        return None, None
+
+    verb = str(tokens[verb_idx]).strip().lower()
+
+    if verb in {"apply", "create"}:
+        return None, None
+
+    if verb in {"set", "rollout"}:
+        sub_idx = _next_positional_index(tokens, verb_idx + 1)
+        if sub_idx is None:
+            return None, None
+        target_idx = _next_positional_index(tokens, sub_idx + 1)
+        if target_idx is None:
+            return None, None
+        target = str(tokens[target_idx]).strip()
+        if "/" in target:
+            kind, name = target.split("/", 1)
+            return kind.strip(), name.strip()
+        name_idx = _next_positional_index(tokens, target_idx + 1)
+        if name_idx is None:
+            return None, None
+        return target, str(tokens[name_idx]).strip()
+
+    kind_idx = _next_positional_index(tokens, verb_idx + 1)
+    if kind_idx is None:
+        return None, None
+
+    kind = str(tokens[kind_idx]).strip()
+    if "/" in kind:
+        kind_part, name_part = kind.split("/", 1)
+        if name_part:
+            return kind_part.strip(), name_part.strip()
+
+    name_idx = _next_positional_index(tokens, kind_idx + 1)
+    if name_idx is None:
+        return None, None
+    return kind, str(tokens[name_idx]).strip()
+
+
+def _autoresolve_namespace(tokens: list[str]) -> tuple[list[str] | None, str | None]:
+    if _uses_all_namespaces(tokens):
+        return list(tokens), None
+
+    kind, name = _parse_target_kind_name(tokens)
+    if not kind or not name:
+        return list(tokens), None
+    if is_cluster_scoped_kind(kind):
+        return list(tokens), None
+
+    namespace_hint, ns_idx, ns_eq = _extract_namespace(tokens)
+    resolved_ns, resolve_err = resolve_namespace_for_resource(kind, name, namespace_hint or "")
+    if resolve_err:
+        return None, resolve_err
+    if not resolved_ns:
+        return None, f"❌ Could not resolve namespace for {kind} '{name}'."
+
+    rewritten = list(tokens)
+    if ns_idx is None:
+        rewritten.extend(["-n", resolved_ns])
+    elif ns_eq:
+        rewritten[ns_idx] = f"--namespace={resolved_ns}"
+    elif ns_idx + 1 < len(rewritten):
+        rewritten[ns_idx + 1] = resolved_ns
+
+    return rewritten, None
 
 
 def _build_kubectl_args(tokens: list[str]) -> list[str]:
@@ -204,7 +318,12 @@ def kubectl_execute(command: str, reason: str = "") -> str:
             "Enable K8S_CLI_ALLOW_ALL_WRITE=1 or add verb to K8S_CLI_WRITE_ALLOWLIST_VERBS."
         )
 
-    args = _build_kubectl_args(tokens)
+    resolved_tokens, resolve_err = _autoresolve_namespace(tokens)
+    if resolve_err:
+        return resolve_err
+    assert resolved_tokens is not None
+
+    args = _build_kubectl_args(resolved_tokens)
     command_text = shlex.join(args)
 
     if Config.K8S_DRY_RUN:

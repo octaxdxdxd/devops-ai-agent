@@ -124,6 +124,13 @@ def _normalize_command(command: str) -> tuple[list[str] | None, str | None]:
     service = (tokens[0] or "").strip().lower()
     operation = (tokens[1] or "").strip().lower()
 
+    if service in {"kubectl", "k8s", "kubernetes"}:
+        return (
+            None,
+            "❌ Invalid AWS CLI command: this looks like a Kubernetes command. "
+            "Use Kubernetes tools (`kubectl_readonly` / `kubectl_execute`) instead.",
+        )
+
     if not _SAFE_TOKEN.fullmatch(service):
         return None, f"❌ Invalid AWS service token: {service!r}."
     if not _SAFE_TOKEN.fullmatch(operation):
