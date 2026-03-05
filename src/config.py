@@ -100,8 +100,10 @@ class Config:
     MAX_ITERATIONS = int(os.getenv('MAX_ITERATIONS', '8'))
     MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '24'))
     MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '3'))
-    MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '14'))
-    AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '5000'))
+    MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '10'))
+    AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '2500'))
+    AGENT_ENABLE_DIRECT_READ_ROUTER = os.getenv('AGENT_ENABLE_DIRECT_READ_ROUTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    AGENT_ENABLE_INTENT_TOOL_FILTER = os.getenv('AGENT_ENABLE_INTENT_TOOL_FILTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     DEEP_INITIAL_INVESTIGATION = os.getenv('DEEP_INITIAL_INVESTIGATION', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     LLM_RETRY_ON_RATE_LIMIT = os.getenv('LLM_RETRY_ON_RATE_LIMIT', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     LLM_RETRY_MAX_ATTEMPTS = int(os.getenv('LLM_RETRY_MAX_ATTEMPTS', '3'))

@@ -62,10 +62,75 @@ def _requires_explicit_approval(*, tool_name: str, intent: CommandIntent | None)
     return is_write_tool(tool_name)
 
 
-def _tool_result_to_message_content(result: Any) -> tuple[str, int]:
+_VERBOSE_CONTEXT_TOOLS = {
+    "k8s_describe_pod",
+    "k8s_describe_deployment",
+    "k8s_describe_node",
+    "k8s_get_pod_logs",
+    "k8s_get_events",
+    "k8s_get_resource_yaml",
+    "k8s_get_pod_scheduling_report",
+    "kubectl_readonly",
+    "aws_cli_readonly",
+}
+_SIGNAL_LINE_RE = re.compile(
+    r"(warning|error|fail|backoff|crashloop|oom|evict|pending|notready|unschedul|reason|message|event|status|condition)",
+    re.IGNORECASE,
+)
+
+
+def _tool_context_budget(tool_name: str, default_max: int) -> int:
+    """Return a per-tool context budget for prompt injection."""
+    if tool_name in {"k8s_get_pod_logs", "k8s_get_resource_yaml", "k8s_describe_node", "kubectl_readonly"}:
+        return max(800, min(default_max, 1800))
+    if tool_name in {
+        "k8s_describe_pod",
+        "k8s_describe_deployment",
+        "k8s_get_events",
+        "k8s_get_pod_scheduling_report",
+        "aws_cli_readonly",
+    }:
+        return max(900, min(default_max, 2200))
+    return default_max
+
+
+def _compact_high_signal_lines(text: str, *, max_lines: int = 120) -> str:
+    """Extract likely high-signal lines to preserve RCA quality with lower token usage."""
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+
+    selected: list[str] = []
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        if raw.endswith(":") or _SIGNAL_LINE_RE.search(raw):
+            selected.append(line)
+            if len(selected) >= max_lines:
+                break
+
+    if not selected:
+        # Fallback to tail if no obvious signal lines were found.
+        selected = lines[-max_lines:]
+
+    return "\n".join(selected)
+
+
+def _tool_result_to_message_content(result: Any, *, tool_name: str) -> tuple[str, int]:
     """Convert tool result to model context with truncation for token control."""
     text = str(result)
-    max_chars = max(0, int(getattr(Config, "AGENT_TOOL_RESULT_MAX_CHARS", 5000)))
+    max_chars_default = max(0, int(getattr(Config, "AGENT_TOOL_RESULT_MAX_CHARS", 5000)))
+    max_chars = _tool_context_budget(tool_name, max_chars_default)
+
+    if tool_name in _VERBOSE_CONTEXT_TOOLS and len(text) > max_chars:
+        compacted = _compact_high_signal_lines(text)
+        if compacted and len(compacted) < len(text):
+            text = (
+                "[Context compressed before model injection to reduce tokens while preserving high-signal evidence]\n"
+                + compacted
+            )
+
     if max_chars and len(text) > max_chars:
         marker = "\n... [middle truncated before sending to model; see full tool output in logs/trace] ...\n"
         marker_len = len(marker)
@@ -498,7 +563,7 @@ def handle_tool_calls(
 
             try:
                 result = tool_func.invoke(tool_args)
-                result_content, raw_result_len = _tool_result_to_message_content(result)
+                result_content, raw_result_len = _tool_result_to_message_content(result, tool_name=tool_name)
                 if tw and trace_id:
                     tw.emit(
                         {
