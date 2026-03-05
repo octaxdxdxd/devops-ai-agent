@@ -227,6 +227,44 @@ class LogAnalyzerAgent:
                     "If multiple write steps are required, emit all required write tool calls in this single response."
                 )
 
+        # If user already said they don't know/missing details, do not keep asking the same question.
+        combined_user_text = " ".join(
+            [user_input]
+            + [
+                str(getattr(msg, "content", ""))
+                for msg in chat_history
+                if str(getattr(msg, "type", "")).lower() == "human"
+            ]
+        ).lower()
+        user_unknown_markers = (
+            "i don't know",
+            "i dont know",
+            "no idea",
+            "not sure",
+            "i'm not sure",
+            "im not sure",
+            "stop asking",
+            "i have no values",
+            "i have no values.yaml",
+            "i dont have the secret",
+            "i don't have the secret",
+            "no backup",
+        )
+        if any(marker in combined_user_text for marker in user_unknown_markers):
+            directives.append(
+                "The user already said they do not know the missing details. "
+                "Do NOT repeat the same clarifying question. Continue autonomous investigation using read-only tools and derive/recover evidence directly where possible."
+            )
+            directives.append(
+                "Prioritize alternative evidence paths before asking anything else: "
+                "k8s_list_secrets, k8s_get_resource_yaml, k8s_describe_pod, k8s_get_pod_logs, kubectl_readonly, helm_readonly, aws_cli_readonly."
+            )
+
+        if "stop asking" in combined_user_text:
+            directives.append(
+                "Do not ask clarifying questions in this turn unless there is an absolute hard blocker after exhausting all read-only evidence paths."
+            )
+
         if not directives:
             return user_input
         return f"{user_input}\n\n[Agent directive: {' '.join(directives)}]"
@@ -254,6 +292,7 @@ class LogAnalyzerAgent:
             "k8s_list_statefulsets",
             "k8s_list_daemonsets",
             "k8s_list_services",
+            "k8s_list_secrets",
             "k8s_list_ingresses",
             "k8s_get_events",
             "k8s_get_pvcs",
@@ -264,6 +303,8 @@ class LogAnalyzerAgent:
             "k8s_get_resource_yaml",
             "k8s_get_pod_scheduling_report",
             "k8s_get_crashloop_pods",
+            "kubectl_readonly",
+            "helm_readonly",
             "aws_cli_readonly",
             "aws_cli_execute",
             "restart_kubernetes_pod",

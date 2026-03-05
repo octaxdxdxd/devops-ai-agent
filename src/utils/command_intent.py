@@ -84,6 +84,7 @@ _AWS_MUTATING_OPERATION_PREFIXES = (
     "associate",
     "attach",
     "cancel",
+    "complete",
     "copy",
     "create",
     "delete",

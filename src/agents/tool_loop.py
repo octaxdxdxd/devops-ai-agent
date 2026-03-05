@@ -181,6 +181,28 @@ def _build_evidence_corpus(messages: list[Any]) -> str:
     return "\n".join(parts)
 
 
+def _user_signaled_unknown(*, user_input: str, chat_history: list[Any]) -> bool:
+    text_parts: list[str] = [str(user_input or "")]
+    for msg in chat_history:
+        if str(getattr(msg, "type", "")).lower() != "human":
+            continue
+        text_parts.append(_message_content_text(msg))
+    text = " ".join(text_parts).lower()
+    markers = (
+        "i don't know",
+        "i dont know",
+        "no idea",
+        "not sure",
+        "i'm not sure",
+        "im not sure",
+        "stop asking",
+        "no backup",
+        "i dont have",
+        "i don't have",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _extract_aws_reference_tokens(command: str) -> list[str]:
     """Extract likely AWS resource identifiers (IDs/ARNs) from command text."""
     raw = (command or "").strip()
@@ -393,7 +415,9 @@ def handle_tool_calls(
                     ToolMessage(
                         content=(
                             "Duplicate tool call suppressed to avoid loops. "
-                            "Use previous tool results and provide a final answer."
+                            "Pick a different tool/arguments and continue investigation. "
+                            "Good pivots: k8s_list_secrets, k8s_get_resource_yaml, k8s_describe_pod, "
+                            "k8s_get_pod_logs, kubectl_readonly, helm_readonly, aws_cli_readonly."
                         ),
                         tool_call_id=tool_call_id,
                     )
@@ -434,7 +458,11 @@ def handle_tool_calls(
             if tool_func is None:
                 tool_messages.append(
                     ToolMessage(
-                        content=f"Error: unknown tool '{tool_name}'.",
+                        content=(
+                            f"Error: unknown tool '{tool_name}'. "
+                            "Use available alternatives such as k8s_list_secrets, k8s_get_resource_yaml, "
+                            "kubectl_readonly, helm_readonly, and aws_cli_readonly."
+                        ),
                         tool_call_id=tool_call_id,
                     )
                 )
@@ -612,11 +640,18 @@ def handle_tool_calls(
                 }
             )
 
+        user_unknown = _user_signaled_unknown(user_input=user_input, chat_history=chat_history)
+        blocker_guidance = (
+            "Do NOT ask for credentials/secret names again; user already said they do not know. "
+            "Give best-effort diagnosis and concrete next actions from existing evidence."
+            if user_unknown
+            else "If evidence is insufficient, ask ONE specific clarifying question."
+        )
         messages.append(
             HumanMessage(
                 content=(
                     "Stop calling tools now. Provide your best incident summary based only on the tool results already retrieved. "
-                    "If the evidence is insufficient, ask ONE specific clarifying question instead of calling more tools."
+                    f"{blocker_guidance}"
                 )
             )
         )
