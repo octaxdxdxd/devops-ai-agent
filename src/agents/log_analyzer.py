@@ -14,8 +14,10 @@ from ..utils.llm_retry import invoke_with_retries
 from ..utils.query_intent import QueryIntent, classify_query_intent
 from ..utils.response import extract_response_text
 from ..utils.tracing import JsonlTraceWriter, TraceSpan, new_trace_id, trace_config_from_env
+from .planner import build_turn_plan, render_turn_plan_directive
 from .approval import ApprovalCoordinator, commands_code_block, format_command_preview
 from .autonomy_helpers import format_autonomous_scan, notification_was_sent
+from .state import IncidentState, apply_turn_outcome_to_state
 from .tool_loop import handle_tool_calls
 
 
@@ -39,6 +41,8 @@ class LogAnalyzerAgent:
 
         self._approval = ApprovalCoordinator()
         self._last_announced_incident_fingerprint: str | None = None
+        self._incident_state = IncidentState()
+        self._turn_index = 0
 
         self._autonomy = SimpleAutonomyEngine() if Config.AUTONOMY_ENABLED else None
         self.last_autonomous_scan: dict | None = None
@@ -64,6 +68,9 @@ class LogAnalyzerAgent:
         """Process one user query and return the assistant response."""
         if chat_history is None:
             chat_history = []
+
+        self._turn_index += 1
+        turn_index = self._turn_index
 
         trace_id = new_trace_id()
         self.last_trace_id = trace_id
@@ -98,6 +105,29 @@ class LogAnalyzerAgent:
                 return approval_response
 
             intent = classify_query_intent(user_input)
+            turn_plan = build_turn_plan(
+                user_input=user_input,
+                intent=intent,
+                chat_history=chat_history,
+                incident_state=self._incident_state,
+                approval_pending=self._approval.has_pending(),
+            )
+            if turn_plan.reset_existing_context:
+                self._incident_state.clear()
+            if tw:
+                tw.emit(
+                    {
+                        "trace_id": trace_id,
+                        "event": "turn.plan",
+                        "mode": turn_plan.mode,
+                        "stage": turn_plan.stage,
+                        "focus": turn_plan.focus,
+                        "continue_existing": turn_plan.continue_existing,
+                        "allow_broad_discovery": turn_plan.allow_broad_discovery,
+                        "prefer_cached_reads": turn_plan.prefer_cached_reads,
+                        "prefer_fresh_reads": turn_plan.prefer_fresh_reads,
+                    }
+                )
             if Config.AGENT_ENABLE_DIRECT_READ_ROUTER and intent.mode == "chat":
                 reply = "Ready. Ask for diagnostics or a specific cluster action."
                 final_chat = alert_prefix + reply
@@ -105,9 +135,22 @@ class LogAnalyzerAgent:
                 return final_chat
 
             if Config.AGENT_ENABLE_DIRECT_READ_ROUTER:
-                direct = self._handle_direct_read_request(intent=intent, user_input=user_input)
+                direct = self._handle_direct_read_request(
+                    intent=intent,
+                    user_input=user_input,
+                    incident_state=self._incident_state,
+                )
                 if direct is not None:
                     final_direct = alert_prefix + direct
+                    self._incident_state = apply_turn_outcome_to_state(
+                        incident_state=self._incident_state,
+                        user_input=user_input,
+                        intent_mode=intent.mode,
+                        turn_plan=turn_plan,
+                        outcome=None,
+                        final_text=direct,
+                        turn_index=turn_index,
+                    )
                     end_turn(final_direct)
                     return final_direct
 
@@ -115,6 +158,8 @@ class LogAnalyzerAgent:
                 user_input=user_input,
                 chat_history=chat_history,
                 intent_mode=intent.mode,
+                turn_plan=turn_plan,
+                incident_state=self._incident_state,
             )
 
             selected_tools = self._select_tools_for_turn(intent=intent, user_input=user_input)
@@ -142,7 +187,7 @@ class LogAnalyzerAgent:
             )
 
             if hasattr(response, "tool_calls") and response.tool_calls:
-                final = handle_tool_calls(
+                outcome = handle_tool_calls(
                     response=response,
                     user_input=prompt_input,
                     chat_history=chat_history,
@@ -152,9 +197,12 @@ class LogAnalyzerAgent:
                     tools=selected_tools,
                     tools_by_name=selected_tools_by_name,
                     approval=self._approval,
+                    turn_plan=turn_plan,
+                    incident_state=self._incident_state,
                     trace_writer=tw,
                     trace_id=trace_id,
                 )
+                final = outcome.final_text
                 if not (final or "").strip():
                     trace_hint = f" Trace ID: {trace_id}" if (tw and trace_id) else ""
                     final = (
@@ -162,6 +210,15 @@ class LogAnalyzerAgent:
                         f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
                         + trace_hint
                     )
+                self._incident_state = apply_turn_outcome_to_state(
+                    incident_state=self._incident_state,
+                    user_input=user_input,
+                    intent_mode=intent.mode,
+                    turn_plan=turn_plan,
+                    outcome=outcome,
+                    final_text=final,
+                    turn_index=turn_index,
+                )
                 final = alert_prefix + final
                 end_turn(final)
                 return final
@@ -174,6 +231,15 @@ class LogAnalyzerAgent:
                     f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
                     + trace_hint
                 )
+            self._incident_state = apply_turn_outcome_to_state(
+                incident_state=self._incident_state,
+                user_input=user_input,
+                intent_mode=intent.mode,
+                turn_plan=turn_plan,
+                outcome=None,
+                final_text=final,
+                turn_index=turn_index,
+            )
             final = alert_prefix + final
             end_turn(final)
             return final
@@ -188,7 +254,14 @@ class LogAnalyzerAgent:
                 end_turn("")
 
     @staticmethod
-    def _prepare_prompt_input(*, user_input: str, chat_history: list, intent_mode: str) -> str:
+    def _prepare_prompt_input(
+        *,
+        user_input: str,
+        chat_history: list,
+        intent_mode: str,
+        turn_plan: Any,
+        incident_state: IncidentState,
+    ) -> str:
         """Augment prompt input with execution behavior hints when useful."""
         directives: list[str] = []
         if Config.DEEP_INITIAL_INVESTIGATION and not chat_history and intent_mode == "incident_rca":
@@ -265,9 +338,16 @@ class LogAnalyzerAgent:
                 "Do not ask clarifying questions in this turn unless there is an absolute hard blocker after exhausting all read-only evidence paths."
             )
 
-        if not directives:
+        plan_block = render_turn_plan_directive(turn_plan=turn_plan, incident_state=incident_state)
+        extra_blocks: list[str] = []
+        if directives:
+            extra_blocks.append("[Agent directive]\n" + "\n".join(f"- {item}" for item in directives))
+        if plan_block:
+            extra_blocks.append(plan_block)
+
+        if not extra_blocks:
             return user_input
-        return f"{user_input}\n\n[Agent directive: {' '.join(directives)}]"
+        return f"{user_input}\n\n" + "\n\n".join(extra_blocks)
 
     def _select_tools_for_turn(self, *, intent: QueryIntent, user_input: str) -> list[Any]:
         """Choose a tool subset to reduce prompt cost and off-target tool drift."""
@@ -322,12 +402,22 @@ class LogAnalyzerAgent:
         selected = [tool for tool in self.tools if tool.name in incident_core]
         return selected or self.tools
 
-    def _handle_direct_read_request(self, *, intent: QueryIntent, user_input: str) -> str | None:
+    def _handle_direct_read_request(
+        self,
+        *,
+        intent: QueryIntent,
+        user_input: str,
+        incident_state: IncidentState | None = None,
+    ) -> str | None:
         """Run simple read requests deterministically without LLM/tool loops."""
         if intent.mode != "direct_read":
             return None
 
-        namespace = intent.namespace or ("all" if intent.all_namespaces else Config.K8S_DEFAULT_NAMESPACE)
+        inherited_namespace = ""
+        if incident_state is not None and incident_state.active:
+            inherited_namespace = str(incident_state.namespace or "").strip()
+
+        namespace = intent.namespace or ("all" if intent.all_namespaces else inherited_namespace or Config.K8S_DEFAULT_NAMESPACE)
         if intent.resource in {"pods", "deployments", "statefulsets", "daemonsets", "services", "ingresses", "hpa"}:
             namespace = namespace or "all"
         if intent.resource == "pods" and ("cluster" in user_input.lower() or "all pods" in user_input.lower()):

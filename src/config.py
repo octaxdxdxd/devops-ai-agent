@@ -100,8 +100,11 @@ class Config:
     MAX_ITERATIONS = int(os.getenv('MAX_ITERATIONS', '8'))
     MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '24'))
     MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '3'))
+    MAX_SEMANTIC_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_SEMANTIC_DUPLICATE_TOOL_CALLS', '2'))
     MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '10'))
     AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '2500'))
+    INCIDENT_STATE_MAX_EVIDENCE = int(os.getenv('INCIDENT_STATE_MAX_EVIDENCE', '8'))
+    INCIDENT_STATE_MAX_CACHE_ENTRIES = int(os.getenv('INCIDENT_STATE_MAX_CACHE_ENTRIES', '24'))
     AGENT_ENABLE_DIRECT_READ_ROUTER = os.getenv('AGENT_ENABLE_DIRECT_READ_ROUTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AGENT_ENABLE_INTENT_TOOL_FILTER = os.getenv('AGENT_ENABLE_INTENT_TOOL_FILTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     COMMAND_SAFETY_POSTURE = os.getenv('COMMAND_SAFETY_POSTURE', 'powerful').strip().lower()

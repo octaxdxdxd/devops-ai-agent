@@ -15,6 +15,8 @@ from ..utils.command_intent import CommandIntent, classify_command_intent, targe
 from ..utils.llm_retry import invoke_with_retries
 from ..utils.response import extract_response_text
 from .approval import ApprovalCoordinator, PendingAction, commands_code_block, format_command_preview
+from .planner import TurnPlan
+from .state import IncidentState, ToolExecutionRecord, ToolLoopOutcome
 
 
 _AWS_ARN_RE = re.compile(r"\barn:aws[a-z-]*:[^\s'\"]+\b", re.IGNORECASE)
@@ -22,6 +24,25 @@ _AWS_ID_TOKEN_RE = re.compile(
     r"\b(?:ami|i|lt|sg|subnet|vpc|vol|snap|eni|igw|nat|rtb|eipalloc|eipassoc|vpce|pcx|tgw|fs|db)-[0-9a-zA-Z]{6,}\b",
     re.IGNORECASE,
 )
+_SEMANTIC_IGNORE_ARGS_BY_TOOL: dict[str, set[str]] = {
+    "k8s_list_pods": {"limit"},
+    "k8s_find_pods": {"limit"},
+    "k8s_get_events": {"limit"},
+}
+_BROAD_DISCOVERY_TOOLS = {
+    "k8s_list_namespaces",
+    "k8s_list_nodes",
+    "k8s_top_nodes",
+    "k8s_list_pods",
+    "k8s_find_pods",
+    "k8s_list_deployments",
+    "k8s_list_statefulsets",
+    "k8s_list_daemonsets",
+    "k8s_list_services",
+    "k8s_list_ingresses",
+    "k8s_get_events",
+    "k8s_get_crashloop_pods",
+}
 
 
 def _resolve_tool_call(
@@ -300,6 +321,206 @@ def _validate_aws_write_grounding(command: str, evidence_corpus: str) -> tuple[l
     return unresolved, message
 
 
+def _semantic_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _semantic_jsonable(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, list):
+        return [_semantic_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_semantic_jsonable(item) for item in value]
+    return value
+
+
+def _semantic_tool_signature(tool_name: str, tool_args: Any, intent: CommandIntent | None = None) -> str:
+    """Normalize tool calls so near-duplicate investigations collapse together."""
+    if isinstance(tool_args, dict) and "command" in tool_args:
+        command_text = ""
+        if intent is not None and intent.normalized_command:
+            command_text = intent.normalized_command
+        else:
+            command_text = str(tool_args.get("command") or "").strip()
+        return f"{tool_name}:command:{command_text}"
+
+    if not isinstance(tool_args, dict):
+        return f"{tool_name}:{str(tool_args)}"
+
+    ignored = set(_SEMANTIC_IGNORE_ARGS_BY_TOOL.get(tool_name, set()))
+    normalized: dict[str, Any] = {}
+    for key, value in sorted(tool_args.items(), key=lambda item: str(item[0])):
+        if key in {"reason"} or key in ignored:
+            continue
+        normalized[str(key)] = _semantic_jsonable(value)
+    return f"{tool_name}:{json.dumps(normalized, sort_keys=True, ensure_ascii=False)}"
+
+
+def _trim_record_excerpt(text: Any, *, max_chars: int = 1200) -> str:
+    clean = str(text or "").strip()
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 3].rstrip() + "..."
+
+
+def _summarize_tool_result(tool_name: str, result_text: Any) -> str:
+    lines = [line.strip() for line in str(result_text or "").splitlines() if line.strip()]
+    for line in lines:
+        if line in {"```", "```bash", "```text"}:
+            continue
+        if line.startswith("Planned command:"):
+            continue
+        if line.startswith("Output:"):
+            continue
+        return _trim_record_excerpt(line, max_chars=240)
+    if not lines:
+        return f"{tool_name} returned no output."
+    return _trim_record_excerpt(lines[0], max_chars=240)
+
+
+def _evidence_categories_for_call(
+    *,
+    tool_name: str,
+    tool_args: Any,
+    intent: CommandIntent | None = None,
+) -> tuple[str, ...]:
+    categories: set[str] = set()
+    args = tool_args if isinstance(tool_args, dict) else {}
+    namespace = str(args.get("namespace") or "").strip().lower() if isinstance(args, dict) else ""
+
+    if tool_name in {"k8s_list_namespaces", "k8s_find_pods"}:
+        categories.update({"discovery_cluster", "pod_health"})
+    if tool_name == "k8s_list_pods":
+        categories.add("pod_health")
+        if namespace in {"", "all"}:
+            categories.add("discovery_cluster")
+    if tool_name in {"k8s_describe_pod", "k8s_get_pod_logs", "k8s_top_pods", "k8s_get_crashloop_pods"}:
+        categories.add("pod_health")
+    if tool_name in {
+        "k8s_list_deployments",
+        "k8s_describe_deployment",
+        "k8s_list_statefulsets",
+        "k8s_list_daemonsets",
+        "helm_readonly",
+    }:
+        categories.add("workload_health")
+    if tool_name in {"k8s_list_services", "k8s_list_ingresses"}:
+        categories.add("service_network")
+    if tool_name == "k8s_get_resource_yaml":
+        kind = str(args.get("kind") or "").strip().lower()
+        if kind in {"service", "ingress"}:
+            categories.add("service_network")
+        else:
+            categories.add("workload_health")
+    if tool_name in {"k8s_get_events", "k8s_get_pod_scheduling_report"}:
+        categories.add("events")
+    if tool_name in {"k8s_list_nodes", "k8s_top_nodes", "k8s_describe_node"}:
+        categories.add("node_health")
+    if tool_name in {"k8s_get_pvcs", "k8s_list_pvs", "k8s_describe_pvc", "k8s_describe_pv"}:
+        categories.add("storage")
+    if tool_name == "aws_cli_readonly":
+        categories.add("aws")
+        command = str(args.get("command") or "").lower()
+        if any(token in command for token in {"elbv2", "load-balancer", "target-group", "listener"}):
+            categories.add("service_network")
+        if any(token in command for token in {"autoscaling", "ec2", "eks", "nodegroup"}):
+            categories.add("node_health")
+    if tool_name == "kubectl_readonly":
+        command = str(args.get("command") or "").lower()
+        if any(token in command for token in {"service", "svc", "ingress"}):
+            categories.add("service_network")
+        if any(token in command for token in {"pod", "logs", "container"}):
+            categories.add("pod_health")
+        if any(token in command for token in {"node", "taint", "drain"}):
+            categories.add("node_health")
+        if any(token in command for token in {"pvc", "pv", "volume"}):
+            categories.add("storage")
+        if not categories and intent is not None and intent.verb in {"get", "describe"}:
+            categories.add("discovery_cluster")
+    if not categories:
+        categories.add("general")
+    return tuple(sorted(categories))
+
+
+def _cached_result_for_call(
+    *,
+    incident_state: IncidentState | None,
+    turn_plan: TurnPlan | None,
+    semantic_key: str,
+    tool_name: str,
+    requires_approval: bool,
+) -> str | None:
+    if incident_state is None or turn_plan is None:
+        return None
+    if requires_approval or turn_plan.prefer_fresh_reads or not turn_plan.prefer_cached_reads:
+        return None
+
+    cached = incident_state.cached_tool_results.get(semantic_key)
+    if cached is None:
+        return None
+
+    if turn_plan.allow_broad_discovery and tool_name not in _BROAD_DISCOVERY_TOOLS:
+        return None
+
+    content = cached.content or cached.summary or "(cached evidence unavailable)"
+    return (
+        f"Reusing evidence already gathered earlier in this incident for `{tool_name}` to avoid redundant rediscovery.\n"
+        f"Cached summary: {cached.summary or '(no summary)'}\n"
+        f"Cached result:\n{content}"
+    )
+
+
+def _plan_has_enough_evidence(turn_plan: TurnPlan | None, records: list[ToolExecutionRecord]) -> bool:
+    if turn_plan is None:
+        return False
+    if turn_plan.mode not in {"incident_rca", "general"}:
+        return False
+
+    successful = [record for record in records if record.success]
+    if not successful:
+        return False
+
+    categories: set[str] = set()
+    fresh_categories: set[str] = set()
+    fresh_count = 0
+    for record in successful:
+        categories.update(record.evidence_categories)
+        if not record.from_cache:
+            fresh_count += 1
+            fresh_categories.update(record.evidence_categories)
+
+    required = set(turn_plan.required_categories)
+    if turn_plan.prefer_fresh_reads and not fresh_count:
+        return False
+    if turn_plan.prefer_fresh_reads and required and required.issubset(fresh_categories):
+        return True
+    if required and required.issubset(categories):
+        minimum_calls = 1 if turn_plan.stage == "verify" else max(2, min(3, len(required)))
+        return len(successful) >= minimum_calls
+
+    if turn_plan.continue_existing and len(categories) >= 2 and len(successful) >= 2:
+        return True
+    return False
+
+
+def _plan_synthesis_prompt(turn_plan: TurnPlan, incident_state: IncidentState | None) -> str:
+    scope_lines: list[str] = []
+    if incident_state is not None:
+        if incident_state.namespace:
+            scope_lines.append(f"namespace={incident_state.namespace}")
+        if incident_state.workloads:
+            scope_lines.append(f"workloads={', '.join(incident_state.workloads[:3])}")
+        if incident_state.services:
+            scope_lines.append(f"services={', '.join(incident_state.services[:3])}")
+        if incident_state.pods:
+            scope_lines.append(f"pods={', '.join(incident_state.pods[:3])}")
+
+    scope_text = ", ".join(scope_lines) if scope_lines else "no locked scope"
+    return (
+        "Stop calling tools now and synthesize the current incident.\n"
+        f"Current stage: {turn_plan.stage}. Focus: {turn_plan.focus}. Scope: {scope_text}.\n"
+        "Use only the evidence already collected in this turn plus the carried incident context. "
+        "Do not restart discovery. Provide one consolidated diagnosis, confidence, and the next best action."
+    )
+
+
 def handle_tool_calls(
     *,
     response: Any,
@@ -311,9 +532,11 @@ def handle_tool_calls(
     tools: list,
     tools_by_name: dict[str, Any] | None = None,
     approval: ApprovalCoordinator,
+    turn_plan: TurnPlan | None = None,
+    incident_state: IncidentState | None = None,
     trace_writer: Any = None,
     trace_id: str | None = None,
-) -> str:
+) -> ToolLoopOutcome:
     """Execute iterative tool calls until the model produces a final response."""
     tw = trace_writer
 
@@ -323,17 +546,27 @@ def handle_tool_calls(
     max_iterations = getattr(Config, "MAX_ITERATIONS", 5)
     max_tool_calls = getattr(Config, "MAX_TOOL_CALLS_PER_TURN", 12)
     max_duplicate_tool_calls = getattr(Config, "MAX_DUPLICATE_TOOL_CALLS", 2)
+    max_semantic_duplicate_tool_calls = getattr(
+        Config,
+        "MAX_SEMANTIC_DUPLICATE_TOOL_CALLS",
+        max_duplicate_tool_calls,
+    )
 
     iteration = 0
     total_tool_calls = 0
     call_signature_counts: dict[str, int] = {}
+    semantic_signature_counts: dict[str, int] = {}
+    execution_records: list[ToolExecutionRecord] = []
     current_response = response
 
     while iteration < max_iterations:
         iteration += 1
 
         if not (hasattr(current_response, "tool_calls") and current_response.tool_calls):
-            return extract_response_text(current_response)
+            return ToolLoopOutcome(
+                final_text=extract_response_text(current_response),
+                records=execution_records,
+            )
 
         resolved_calls: list[dict[str, Any]] = []
         for tool_call in current_response.tool_calls:
@@ -404,14 +637,27 @@ def handle_tool_calls(
                 )
                 forced_text = extract_response_text(forced)
                 if (forced_text or "").strip():
-                    return forced_text
+                    return ToolLoopOutcome(
+                        final_text=forced_text,
+                        records=execution_records,
+                        stopped_reason="tool_budget_hit",
+                    )
 
-                return "I stopped tool execution due to safety budget limits. Please narrow the request (service/pod/namespace/time window)."
+                return ToolLoopOutcome(
+                    final_text=(
+                        "I stopped tool execution due to safety budget limits. "
+                        "Please narrow the request (service/pod/namespace/time window)."
+                    ),
+                    records=execution_records,
+                    stopped_reason="tool_budget_hit",
+                )
 
             try:
                 signature = f"{tool_name}:{json.dumps(tool_args, sort_keys=True, ensure_ascii=False)}"
             except Exception:
                 signature = f"{tool_name}:{str(tool_args)}"
+
+            semantic_signature = _semantic_tool_signature(tool_name, tool_args, tool_intent)
 
             call_signature_counts[signature] = call_signature_counts.get(signature, 0) + 1
             if call_signature_counts[signature] > max_duplicate_tool_calls:
@@ -436,6 +682,64 @@ def handle_tool_calls(
                             "k8s_get_pod_logs, kubectl_readonly, helm_readonly, aws_cli_readonly."
                         ),
                         tool_call_id=tool_call_id,
+                    )
+                )
+                execution_records.append(
+                    ToolExecutionRecord(
+                        tool_name=tool_name,
+                        requested_tool=original_name,
+                        args=tool_args,
+                        semantic_key=semantic_signature,
+                        success=False,
+                        summary="Duplicate tool call suppressed inside the same turn.",
+                        capability=tool_intent.capability if tool_intent is not None else "",
+                        evidence_categories=_evidence_categories_for_call(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            intent=tool_intent,
+                        ),
+                    )
+                )
+                continue
+
+            semantic_signature_counts[semantic_signature] = semantic_signature_counts.get(semantic_signature, 0) + 1
+            if semantic_signature_counts[semantic_signature] > max_semantic_duplicate_tool_calls:
+                if tw and trace_id:
+                    tw.emit(
+                        {
+                            "trace_id": trace_id,
+                            "event": "tool_loop.semantic_duplicate_suppressed",
+                            "tool": tool_name,
+                            "requested_tool": original_name,
+                            "args": tool_args,
+                            "semantic_key": semantic_signature,
+                            "count": semantic_signature_counts[semantic_signature],
+                            "max_semantic_duplicate_tool_calls": max_semantic_duplicate_tool_calls,
+                        }
+                    )
+                tool_messages.append(
+                    ToolMessage(
+                        content=(
+                            "Near-duplicate investigation step suppressed. "
+                            "Reuse the evidence already gathered and pivot to a different target, scope, or tool."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                )
+                execution_records.append(
+                    ToolExecutionRecord(
+                        tool_name=tool_name,
+                        requested_tool=original_name,
+                        args=tool_args,
+                        semantic_key=semantic_signature,
+                        success=False,
+                        summary="Semantic duplicate tool call suppressed to reduce loopiness.",
+                        capability=tool_intent.capability if tool_intent is not None else "",
+                        evidence_categories=_evidence_categories_for_call(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            intent=tool_intent,
+                        ),
                     )
                 )
                 continue
@@ -468,6 +772,22 @@ def handle_tool_calls(
                         }
                     )
                 tool_messages.append(ToolMessage(content=guard_message, tool_call_id=tool_call_id))
+                execution_records.append(
+                    ToolExecutionRecord(
+                        tool_name=tool_name,
+                        requested_tool=original_name,
+                        args=tool_args,
+                        semantic_key=semantic_signature,
+                        success=False,
+                        summary=guard_message,
+                        capability=tool_intent.capability if tool_intent is not None else "",
+                        evidence_categories=_evidence_categories_for_call(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            intent=tool_intent,
+                        ),
+                    )
+                )
                 continue
 
             if tw and trace_id:
@@ -510,6 +830,61 @@ def handle_tool_calls(
                             "kubectl_readonly, helm_readonly, and aws_cli_readonly."
                         ),
                         tool_call_id=tool_call_id,
+                    )
+                )
+                execution_records.append(
+                    ToolExecutionRecord(
+                        tool_name=tool_name,
+                        requested_tool=original_name,
+                        args=tool_args,
+                        semantic_key=semantic_signature,
+                        success=False,
+                        summary=f"Unknown tool requested: {tool_name}.",
+                        capability=tool_intent.capability if tool_intent is not None else "",
+                        evidence_categories=_evidence_categories_for_call(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            intent=tool_intent,
+                        ),
+                    )
+                )
+                continue
+
+            cached_result = _cached_result_for_call(
+                incident_state=incident_state,
+                turn_plan=turn_plan,
+                semantic_key=semantic_signature,
+                tool_name=tool_name,
+                requires_approval=requires_approval,
+            )
+            if cached_result:
+                if tw and trace_id:
+                    tw.emit(
+                        {
+                            "trace_id": trace_id,
+                            "event": "tool.cache_hit",
+                            "tool": tool_name,
+                            "requested_tool": original_name,
+                            "semantic_key": semantic_signature,
+                        }
+                    )
+                tool_messages.append(ToolMessage(content=cached_result, tool_call_id=tool_call_id))
+                execution_records.append(
+                    ToolExecutionRecord(
+                        tool_name=tool_name,
+                        requested_tool=original_name,
+                        args=tool_args,
+                        semantic_key=semantic_signature,
+                        success=True,
+                        from_cache=True,
+                        result_excerpt=_trim_record_excerpt(cached_result),
+                        summary=_summarize_tool_result(tool_name, cached_result),
+                        capability=tool_intent.capability if tool_intent is not None else "",
+                        evidence_categories=_evidence_categories_for_call(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            intent=tool_intent,
+                        ),
                     )
                 )
                 continue
@@ -594,11 +969,15 @@ def handle_tool_calls(
                                 "tools": [action.tool.name for action in pending_actions],
                             }
                         )
-                    return (
-                        f"I recommend running {len(pending_actions)} write actions as one approved plan.\n"
-                        "Planned command(s):\n"
-                        f"{cmd_block}\n"
-                        "Would you like me to proceed with all of them? (yes/no)"
+                    return ToolLoopOutcome(
+                        final_text=(
+                            f"I recommend running {len(pending_actions)} write actions as one approved plan.\n"
+                            "Planned command(s):\n"
+                            f"{cmd_block}\n"
+                            "Would you like me to proceed with all of them? (yes/no)"
+                        ),
+                        records=execution_records,
+                        stopped_reason="approval_requested",
                     )
 
                 single = pending_actions[0]
@@ -627,12 +1006,16 @@ def handle_tool_calls(
                     batch_prompt = "If you want all suggested pods restarted in one operation, reply: `do all at once`.\n"
 
                 cmd_block = commands_code_block(cmd_preview)
-                return (
-                    f"I recommend running `{single_name}` with args {single_args}, but it requires approval.\n"
-                    "Planned command(s):\n"
-                    f"{cmd_block}\n"
-                    f"{batch_prompt}"
-                    "Would you like me to proceed? (yes/no)"
+                return ToolLoopOutcome(
+                    final_text=(
+                        f"I recommend running `{single_name}` with args {single_args}, but it requires approval.\n"
+                        "Planned command(s):\n"
+                        f"{cmd_block}\n"
+                        f"{batch_prompt}"
+                        "Would you like me to proceed? (yes/no)"
+                    ),
+                    records=execution_records,
+                    stopped_reason="approval_requested",
                 )
 
             try:
@@ -651,6 +1034,23 @@ def handle_tool_calls(
                         }
                     )
                 tool_messages.append(ToolMessage(content=result_content, tool_call_id=tool_call_id))
+                execution_records.append(
+                    ToolExecutionRecord(
+                        tool_name=tool_name,
+                        requested_tool=original_name,
+                        args=tool_args,
+                        semantic_key=semantic_signature,
+                        success=True,
+                        result_excerpt=_trim_record_excerpt(result_content),
+                        summary=_summarize_tool_result(tool_name, result_content),
+                        capability=tool_intent.capability if tool_intent is not None else "",
+                        evidence_categories=_evidence_categories_for_call(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            intent=tool_intent,
+                        ),
+                    )
+                )
             except Exception as exc:
                 if tw and trace_id:
                     tw.emit(
@@ -663,9 +1063,53 @@ def handle_tool_calls(
                         }
                     )
                 tool_messages.append(ToolMessage(content=f"Error: {exc}", tool_call_id=tool_call_id))
+                execution_records.append(
+                    ToolExecutionRecord(
+                        tool_name=tool_name,
+                        requested_tool=original_name,
+                        args=tool_args,
+                        semantic_key=semantic_signature,
+                        success=False,
+                        result_excerpt=_trim_record_excerpt(str(exc)),
+                        summary=f"{tool_name} failed: {exc}",
+                        capability=tool_intent.capability if tool_intent is not None else "",
+                        evidence_categories=_evidence_categories_for_call(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            intent=tool_intent,
+                        ),
+                    )
+                )
 
         messages.append(AIMessage(content=current_response.content, tool_calls=current_response.tool_calls))
         messages.extend(tool_messages)
+
+        if turn_plan is not None and _plan_has_enough_evidence(turn_plan, execution_records):
+            if tw and trace_id:
+                tw.emit(
+                    {
+                        "trace_id": trace_id,
+                        "event": "tool_loop.plan_satisfied",
+                        "stage": turn_plan.stage if turn_plan is not None else "",
+                        "focus": turn_plan.focus if turn_plan is not None else "",
+                        "records": len(execution_records),
+                    }
+                )
+            messages.append(HumanMessage(content=_plan_synthesis_prompt(turn_plan, incident_state)))
+            forced = invoke_with_retries(
+                llm,
+                messages,
+                trace_writer=tw,
+                trace_id=trace_id,
+                event="llm.invoke.plan_satisfied",
+            )
+            forced_text = extract_response_text(forced)
+            if (forced_text or "").strip():
+                return ToolLoopOutcome(
+                    final_text=forced_text,
+                    records=execution_records,
+                    stopped_reason="plan_satisfied",
+                )
 
         current_response = invoke_with_retries(
             llm_with_tools,
@@ -712,15 +1156,24 @@ def handle_tool_calls(
 
         forced_text = extract_response_text(forced)
         if (forced_text or "").strip():
-            return forced_text
+            return ToolLoopOutcome(
+                final_text=forced_text,
+                records=execution_records,
+                max_iterations_hit=True,
+                stopped_reason="max_iterations_hit",
+            )
 
     final = extract_response_text(current_response)
     if not (final or "").strip():
         trace_hint = f" Trace ID: {trace_id}" if (tw and trace_id) else ""
-        return (
-            "I got an empty response from the model at the end of the tool loop. "
-            f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
-            + trace_hint
+        return ToolLoopOutcome(
+            final_text=(
+                "I got an empty response from the model at the end of the tool loop. "
+                f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
+                + trace_hint
+            ),
+            records=execution_records,
+            max_iterations_hit=bool(hasattr(current_response, "tool_calls") and current_response.tool_calls),
         )
 
-    return final
+    return ToolLoopOutcome(final_text=final, records=execution_records)
