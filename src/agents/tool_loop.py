@@ -58,8 +58,19 @@ def _resolve_tool_call(
 def _requires_explicit_approval(*, tool_name: str, intent: CommandIntent | None) -> bool:
     """Approval is determined by command mutability when available; else tool policy."""
     if intent is not None:
-        return intent.is_mutating
+        return intent.requires_approval
     return is_write_tool(tool_name)
+
+
+def _command_guard_message(*, requested_tool: str, intent: CommandIntent) -> str | None:
+    if intent.is_blocked:
+        return f"Command blocked for `{requested_tool}`: {intent.reason}"
+    if intent.is_sensitive_read:
+        return (
+            f"Sensitive command blocked for `{requested_tool}`: {intent.reason} "
+            "Use purpose-built diagnostic tools instead of generic command execution."
+        )
+    return None
 
 
 _VERBOSE_CONTEXT_TOOLS = {
@@ -355,6 +366,11 @@ def handle_tool_calls(
             tool_args = resolved["args"]
             tool_intent = resolved["intent"]
             requires_approval = bool(resolved["requires_approval"])
+            guard_message = (
+                _command_guard_message(requested_tool=original_name, intent=tool_intent)
+                if tool_intent is not None
+                else None
+            )
 
             total_tool_calls += 1
             if total_tool_calls > max_tool_calls:
@@ -422,6 +438,36 @@ def handle_tool_calls(
                         tool_call_id=tool_call_id,
                     )
                 )
+                continue
+
+            if tool_intent is not None and tool_intent.capability == "write":
+                target_name = target_tool_for_intent(tool_intent)
+                if target_name and target_name not in tool_lookup:
+                    tool_messages.append(
+                        ToolMessage(
+                            content=(
+                                f"Command requires `{target_name}`, but that tool is not available in this turn. "
+                                "Retry with the execute-capable tool set."
+                            ),
+                            tool_call_id=tool_call_id,
+                        )
+                    )
+                    continue
+
+            if guard_message:
+                if tw and trace_id:
+                    tw.emit(
+                        {
+                            "trace_id": trace_id,
+                            "event": "tool.command_blocked",
+                            "requested_tool": original_name,
+                            "tool": tool_name,
+                            "args": tool_args,
+                            "capability": tool_intent.capability if tool_intent is not None else "",
+                            "reason": tool_intent.reason if tool_intent is not None else "",
+                        }
+                    )
+                tool_messages.append(ToolMessage(content=guard_message, tool_call_id=tool_call_id))
                 continue
 
             if tw and trace_id:

@@ -74,6 +74,24 @@ def _command_result(command_args: list[str], *, reason: str = "") -> str:
     )
 
 
+def _intent_error(intent, *, readonly: bool) -> str | None:
+    if intent.is_blocked:
+        return f"❌ {intent.reason}"
+    if intent.is_sensitive_read:
+        return f"❌ {intent.reason}"
+    if readonly and intent.capability == "write":
+        return (
+            f"❌ helm verb `{intent.verb or 'unknown'}` appears mutating and is blocked in helm_readonly. "
+            "Use `helm_execute` (approval required)."
+        )
+    if not readonly and intent.capability == "safe_read":
+        return (
+            f"❌ helm verb `{intent.verb or 'unknown'}` is read-only. "
+            "Use `helm_readonly` instead."
+        )
+    return None
+
+
 @tool
 def helm_readonly(command: str) -> str:
     """Run a Helm read command.
@@ -92,18 +110,16 @@ def helm_readonly(command: str) -> str:
     assert tokens is not None
 
     intent = classify_command_intent("helm_readonly", shlex.join(tokens))
-    if intent.is_mutating:
-        return (
-            f"❌ helm verb `{intent.verb or 'unknown'}` appears mutating and is blocked in helm_readonly. "
-            "Use `helm_execute` (approval required)."
-        )
+    intent_err = _intent_error(intent, readonly=True)
+    if intent_err:
+        return intent_err
 
     return _command_result(["helm", *tokens])
 
 
 @tool
 def helm_execute(command: str, reason: str = "") -> str:
-    """Run any Helm command (mutating-capable)."""
+    """Run mutating Helm commands only."""
     if not _ensure_helm_installed():
         return _helm_not_found_msg()
 
@@ -115,6 +131,9 @@ def helm_execute(command: str, reason: str = "") -> str:
     command_args = ["helm", *tokens]
     command_text = shlex.join(command_args)
     intent = classify_command_intent("helm_execute", shlex.join(tokens))
+    intent_err = _intent_error(intent, readonly=False)
+    if intent_err:
+        return intent_err
 
     if Config.K8S_DRY_RUN and intent.is_mutating:
         return (

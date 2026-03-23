@@ -18,6 +18,7 @@ def display_sidebar() -> None:
         st.caption(f"Provider: {st.session_state.model_provider}")
         st.caption(f"Model: {st.session_state.model_name}")
         st.caption(f"Temperature: {Config.TEMPERATURE}")
+        st.caption(f"Command Safety Posture: {Config.COMMAND_SAFETY_POSTURE}")
 
         st.markdown("---")
         st.subheader("Kubernetes")
