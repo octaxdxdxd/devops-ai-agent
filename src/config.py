@@ -11,16 +11,21 @@ class Config:
     """Application configuration"""
 
     # LLM Provider
-    # Supported values: 'gemini', 'openrouter'
+    # Supported values: 'gemini', 'openrouter', 'openai'
     LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini').lower()
     
     # API Configuration
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
     GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 
-    # OpenRouter (aliases: OPENAI_API_KEY / OPENAI_MODEL for convenience)
-    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY') or os.getenv('OPENAI_API_KEY')
-    OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL') or os.getenv('OPENAI_MODEL') or 'arcee-ai/trinity-large-preview:free'
+    # Native OpenAI
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+    OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')
+    OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+
+    # OpenRouter
+    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+    OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'arcee-ai/trinity-large-preview:free')
     OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
     # Optional headers OpenRouter recommends
     OPENROUTER_SITE_URL = os.getenv('OPENROUTER_SITE_URL')
@@ -164,21 +169,29 @@ class Config:
                     "GEMINI_API_KEY not found. "
                     "Please set it in .env file or environment variables."
                 )
+        elif cls.LLM_PROVIDER == 'openai':
+            if not cls.OPENAI_API_KEY:
+                raise ValueError(
+                    "OPENAI_API_KEY not found. "
+                    "Please set it in .env file or environment variables."
+                )
         elif cls.LLM_PROVIDER == 'openrouter':
             if not cls.OPENROUTER_API_KEY:
                 raise ValueError(
                     "OpenRouter API key not found. "
-                    "Set OPENROUTER_API_KEY (or OPENAI_API_KEY) in .env or environment variables."
+                    "Set OPENROUTER_API_KEY in .env or environment variables."
                 )
         else:
             raise ValueError(
-                f"Unsupported LLM_PROVIDER: {cls.LLM_PROVIDER!r}. Use 'gemini' or 'openrouter'."
+                f"Unsupported LLM_PROVIDER: {cls.LLM_PROVIDER!r}. Use 'gemini', 'openai', or 'openrouter'."
             )
         
         # Local log directory is no longer required for normal operation.
 
     @classmethod
     def get_active_model_name(cls) -> str:
+        if cls.LLM_PROVIDER == 'openai':
+            return cls.OPENAI_MODEL
         if cls.LLM_PROVIDER == 'openrouter':
             return cls.OPENROUTER_MODEL
         return cls.GEMINI_MODEL
