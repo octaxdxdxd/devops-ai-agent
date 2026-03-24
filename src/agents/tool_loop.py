@@ -511,18 +511,173 @@ def _plan_has_enough_evidence(turn_plan: TurnPlan | None, records: list[ToolExec
             fresh_count += 1
             fresh_categories.update(record.evidence_categories)
 
+    objectives = tuple(getattr(turn_plan, "objectives", ()) or ())
+    if objectives:
+        return all(
+            _objective_has_enough_evidence(
+                turn_plan=turn_plan,
+                objective=objective,
+                successful_records=successful,
+            )
+            for objective in objectives
+        )
+
     required = set(turn_plan.required_categories)
+    requested_aspects = set(getattr(turn_plan, "requested_aspects", ()) or ())
+    minimum_calls = _minimum_successful_calls_for_plan(turn_plan)
     if turn_plan.prefer_fresh_reads and not fresh_count:
         return False
     if turn_plan.prefer_fresh_reads and required and required.issubset(fresh_categories):
-        return True
+        return fresh_count >= minimum_calls
     if required and required.issubset(categories):
-        minimum_calls = 1 if turn_plan.stage == "verify" else max(2, min(3, len(required)))
         return len(successful) >= minimum_calls
 
-    if turn_plan.continue_existing and len(categories) >= 2 and len(successful) >= 2:
+    if "inventory" in requested_aspects and "workload_health" in categories and len(successful) >= minimum_calls:
+        return True
+
+    if turn_plan.continue_existing and len(categories) >= 2 and len(successful) >= minimum_calls:
         return True
     return False
+
+
+def _objective_has_enough_evidence(
+    *,
+    turn_plan: TurnPlan,
+    objective: Any,
+    successful_records: list[ToolExecutionRecord],
+) -> bool:
+    required = set(getattr(objective, "required_categories", ()) or ())
+    relevant_records: list[ToolExecutionRecord] = []
+    relevant_categories: set[str] = set()
+    relevant_fresh_categories: set[str] = set()
+    fresh_count = 0
+
+    for record in successful_records:
+        record_categories = set(record.evidence_categories)
+        if required and not record_categories.intersection(required):
+            continue
+        relevant_records.append(record)
+        relevant_categories.update(record_categories)
+        if not record.from_cache:
+            fresh_count += 1
+            relevant_fresh_categories.update(record_categories)
+
+    if turn_plan.prefer_fresh_reads and not fresh_count:
+        return False
+    if required and not required.issubset(relevant_categories):
+        return False
+    if turn_plan.prefer_fresh_reads and required and not required.issubset(relevant_fresh_categories):
+        return False
+
+    minimum_calls = max(1, int(getattr(objective, "minimum_successful_calls", 1)))
+    return len(relevant_records) >= minimum_calls
+
+
+def _minimum_successful_calls_for_plan(turn_plan: TurnPlan) -> int:
+    objectives = tuple(getattr(turn_plan, "objectives", ()) or ())
+    if objectives:
+        return max(int(getattr(objective, "minimum_successful_calls", 1)) for objective in objectives)
+
+    aspects = set(getattr(turn_plan, "requested_aspects", ()) or ())
+    if turn_plan.stage == "verify":
+        return 1
+
+    minimum = 2
+    if turn_plan.focus == "workload" and aspects == {"inventory"}:
+        minimum = 1
+    if aspects.intersection({"capacity", "cost", "optimization", "explanation"}):
+        minimum = max(minimum, 3)
+    if len(aspects) >= 3:
+        minimum = max(minimum, 4)
+    return min(minimum, 4)
+
+
+def _response_requests_readonly_confirmation(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    asks_confirmation = any(
+        marker in lowered
+        for marker in (
+            "would you like me to proceed",
+            "do you want me to proceed",
+            "please confirm",
+            "yes/no",
+            "reply `yes`",
+            "reply yes",
+        )
+    )
+    if not asks_confirmation:
+        return False
+
+    readonly_markers = (
+        "read-only",
+        "diagnostic",
+        "diagnostics",
+        "investigat",
+        "inspect",
+        "check",
+        "describe",
+        "logs",
+        "list",
+        "show",
+        "get",
+        "review",
+        "trace",
+    )
+    write_markers = (
+        "restart",
+        "scale",
+        "patch",
+        "apply",
+        "delete",
+        "modify",
+        "update",
+        "create",
+        "write action",
+        "mutating",
+    )
+    return any(marker in lowered for marker in readonly_markers) and not any(marker in lowered for marker in write_markers)
+
+
+def _missing_requested_aspects(turn_plan: TurnPlan | None, final_text: str) -> tuple[str, ...]:
+    if turn_plan is None:
+        return ()
+    lowered = str(final_text or "").lower()
+    missing: list[str] = []
+    objectives = tuple(getattr(turn_plan, "objectives", ()) or ())
+    if objectives:
+        for objective in objectives:
+            markers = tuple(getattr(objective, "answer_markers", ()) or ())
+            if markers and not any(marker in lowered for marker in markers):
+                key = str(getattr(objective, "key", "") or "").strip() or "analysis"
+                if key not in missing:
+                    missing.append(key)
+        return tuple(missing)
+
+    aspects = tuple(getattr(turn_plan, "requested_aspects", ()) or ())
+    for aspect in aspects:
+        if aspect == "analysis":
+            continue
+        missing.append(aspect)
+    return tuple(missing)
+
+
+def _force_readonly_completion_prompt(turn_plan: TurnPlan | None, final_text: str, *, missing_aspects: tuple[str, ...], readonly_follow_up: bool) -> str:
+    reasons: list[str] = []
+    if readonly_follow_up:
+        reasons.append("Do not ask for confirmation to continue read-only investigation.")
+    if missing_aspects:
+        reasons.append(f"You have not fully answered these parts of the request yet: {', '.join(missing_aspects)}.")
+    stage = str(getattr(turn_plan, "stage", "") or "")
+    focus = str(getattr(turn_plan, "focus", "") or "")
+    return (
+        "Continue this turn now.\n"
+        f"Current stage={stage}, focus={focus}.\n"
+        + " ".join(reasons)
+        + " Use additional read-only tools if needed, then answer the user's full request directly. "
+        "Only stop and ask for approval if a mutating action is actually required."
+    )
 
 
 def _plan_synthesis_prompt(turn_plan: TurnPlan, incident_state: IncidentState | None) -> str:
@@ -538,9 +693,32 @@ def _plan_synthesis_prompt(turn_plan: TurnPlan, incident_state: IncidentState | 
             scope_lines.append(f"pods={', '.join(incident_state.pods[:3])}")
 
     scope_text = ", ".join(scope_lines) if scope_lines else "no locked scope"
+    aspects = set(getattr(turn_plan, "requested_aspects", ()) or ())
+    objectives = tuple(getattr(turn_plan, "objectives", ()) or ())
+    objectives_text = "; ".join(objective.description for objective in objectives[:5]) if objectives else ""
+    if aspects.intersection({"inventory", "capacity", "cost", "optimization", "explanation"}) and "diagnosis" not in aspects:
+        return (
+            "Stop calling tools now and answer the user's request directly.\n"
+            f"Current stage: {turn_plan.stage}. Focus: {turn_plan.focus}. Scope: {scope_text}.\n"
+            + (
+                f"Complete these objectives in the final answer: {objectives_text}.\n"
+                if objectives_text
+                else ""
+            )
+            + 
+            "Use only the evidence already collected in this turn plus the carried incident context. "
+            "Do not restart discovery. Answer every part of the question with concrete lists, totals, costs, explanations, or recommendations as requested. "
+            "Do not fall back to an incident summary unless the user actually asked for diagnosis."
+        )
     return (
         "Stop calling tools now and synthesize the current incident.\n"
         f"Current stage: {turn_plan.stage}. Focus: {turn_plan.focus}. Scope: {scope_text}.\n"
+        + (
+            f"Complete these objectives in the final answer: {objectives_text}.\n"
+            if objectives_text
+            else ""
+        )
+        +
         "Use only the evidence already collected in this turn plus the carried incident context. "
         "Do not restart discovery. Provide one consolidated diagnosis, confidence, and the next best action."
     )
@@ -586,13 +764,55 @@ def handle_tool_calls(
     execution_records: list[ToolExecutionRecord] = []
     current_response = response
     operator_intent_state = operator_intent_state or OperatorIntentState()
+    completeness_retries = 0
+    max_completeness_retries = max(0, int(getattr(Config, "MAX_COMPLETENESS_RETRIES", 2)))
 
     while iteration < max_iterations:
         iteration += 1
 
         if not (hasattr(current_response, "tool_calls") and current_response.tool_calls):
+            final_text = extract_response_text(current_response)
+            readonly_follow_up = _response_requests_readonly_confirmation(final_text)
+            missing_aspects = _missing_requested_aspects(turn_plan, final_text)
+            if (
+                completeness_retries < max_completeness_retries
+                and (readonly_follow_up or missing_aspects)
+                and iteration < max_iterations
+            ):
+                completeness_retries += 1
+                if tw and trace_id:
+                    tw.emit(
+                        {
+                            "trace_id": trace_id,
+                            "event": "tool_loop.force_readonly_continue",
+                            "reason": "readonly_confirmation" if readonly_follow_up else "missing_aspects",
+                            "missing_aspects": list(missing_aspects),
+                            "retry": completeness_retries,
+                        }
+                    )
+                _notify_status(status_callback, "Continuing read-only investigation to finish the answer...")
+                messages.append(AIMessage(content=current_response.content))
+                messages.append(
+                    HumanMessage(
+                        content=_force_readonly_completion_prompt(
+                            turn_plan,
+                            final_text,
+                            missing_aspects=missing_aspects,
+                            readonly_follow_up=readonly_follow_up,
+                        )
+                    )
+                )
+                current_response = invoke_with_retries(
+                    llm_with_tools,
+                    messages,
+                    trace_writer=tw,
+                    trace_id=trace_id,
+                    event="llm.invoke.force_completeness",
+                )
+                continue
+
             return ToolLoopOutcome(
-                final_text=extract_response_text(current_response),
+                final_text=final_text,
                 records=execution_records,
             )
 
@@ -1173,6 +1393,44 @@ def handle_tool_calls(
             )
             forced_text = extract_response_text(forced)
             if (forced_text or "").strip():
+                readonly_follow_up = _response_requests_readonly_confirmation(forced_text)
+                missing_aspects = _missing_requested_aspects(turn_plan, forced_text)
+                if (
+                    completeness_retries < max_completeness_retries
+                    and (readonly_follow_up or missing_aspects)
+                    and iteration < max_iterations
+                ):
+                    completeness_retries += 1
+                    if tw and trace_id:
+                        tw.emit(
+                            {
+                                "trace_id": trace_id,
+                                "event": "tool_loop.force_readonly_continue",
+                                "reason": "readonly_confirmation" if readonly_follow_up else "missing_aspects",
+                                "missing_aspects": list(missing_aspects),
+                                "retry": completeness_retries,
+                            }
+                        )
+                    _notify_status(status_callback, "Collecting a bit more evidence to finish the answer...")
+                    messages.append(AIMessage(content=forced.content))
+                    messages.append(
+                        HumanMessage(
+                            content=_force_readonly_completion_prompt(
+                                turn_plan,
+                                forced_text,
+                                missing_aspects=missing_aspects,
+                                readonly_follow_up=readonly_follow_up,
+                            )
+                        )
+                    )
+                    current_response = invoke_with_retries(
+                        llm_with_tools,
+                        messages,
+                        trace_writer=tw,
+                        trace_id=trace_id,
+                        event="llm.invoke.force_completeness",
+                    )
+                    continue
                 return ToolLoopOutcome(
                     final_text=forced_text,
                     records=execution_records,

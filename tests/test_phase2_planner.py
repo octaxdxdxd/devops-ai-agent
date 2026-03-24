@@ -6,11 +6,53 @@ import unittest
 
 from src.agents.planner import build_turn_plan, render_turn_plan_directive
 from src.agents.state import IncidentState, OperatorIntentState, ToolExecutionRecord, ToolLoopOutcome, apply_turn_outcome_to_state
-from src.agents.tool_loop import _plan_has_enough_evidence, _semantic_tool_signature
+from src.agents.tool_loop import (
+    _missing_requested_aspects,
+    _plan_has_enough_evidence,
+    _response_requests_readonly_confirmation,
+    _semantic_tool_signature,
+)
 from src.utils.query_intent import QueryIntent
 
 
 class PlannerTests(unittest.TestCase):
+    def test_workload_inventory_request_gets_workload_focus_and_collect_stage(self) -> None:
+        plan = build_turn_plan(
+            user_input="list all workloads in my cluster",
+            intent=QueryIntent(mode="general"),
+            chat_history=[],
+            incident_state=IncidentState(),
+            operator_intent_state=OperatorIntentState(),
+        )
+
+        self.assertEqual(plan.focus, "workload")
+        self.assertEqual(plan.stage, "collect")
+        self.assertIn("inventory", plan.requested_aspects)
+        self.assertIn("workload_health", plan.required_categories)
+        self.assertEqual(len(plan.objectives), 1)
+        self.assertEqual(plan.objectives[0].key, "inventory")
+        self.assertEqual(plan.objectives[0].focus, "workload")
+
+    def test_capacity_and_optimization_question_tracks_multiple_aspects(self) -> None:
+        plan = build_turn_plan(
+            user_input="what ec2 instances is my cluster running and how much cpu/ram do they have in total, and is this optimized for my workloads?",
+            intent=QueryIntent(mode="general"),
+            chat_history=[],
+            incident_state=IncidentState(),
+            operator_intent_state=OperatorIntentState(),
+        )
+
+        self.assertEqual(plan.focus, "node")
+        self.assertIn("capacity", plan.requested_aspects)
+        self.assertIn("optimization", plan.requested_aspects)
+        self.assertIn("node_health", plan.required_categories)
+        self.assertIn("pod_health", plan.required_categories)
+        objective_keys = [objective.key for objective in plan.objectives]
+        self.assertEqual(objective_keys, ["inventory", "capacity", "optimization"])
+        self.assertEqual(plan.objectives[0].focus, "aws")
+        self.assertEqual(plan.objectives[1].focus, "node")
+        self.assertEqual(plan.objectives[2].focus, "node")
+
     def test_follow_up_verification_continues_existing_incident(self) -> None:
         state = IncidentState(
             active=True,
@@ -106,6 +148,7 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("Known services: webservice", rendered)
         self.assertIn("Prior evidence", rendered)
         self.assertIn("Target evidence categories", rendered)
+        self.assertIn("Objective", rendered)
 
 
 class ToolLoopPlannerTests(unittest.TestCase):
@@ -174,6 +217,70 @@ class ToolLoopPlannerTests(unittest.TestCase):
             ),
         ]
         self.assertTrue(_plan_has_enough_evidence(plan, fresh_records))
+
+    def test_capacity_optimization_plan_needs_more_than_two_successful_reads(self) -> None:
+        plan = build_turn_plan(
+            user_input="what ec2 instances is my cluster running and how much cpu/ram do they have in total, and is this optimized for my workloads?",
+            intent=QueryIntent(mode="general"),
+            chat_history=[],
+            incident_state=IncidentState(),
+            operator_intent_state=OperatorIntentState(),
+        )
+
+        partial_records = [
+            ToolExecutionRecord(
+                tool_name="aws_cli_readonly",
+                requested_tool="aws_cli_readonly",
+                args={"command": "ec2 describe-instances"},
+                semantic_key="aws:instances",
+                success=True,
+                summary="Found instance types for worker nodes.",
+                evidence_categories=("aws", "node_health"),
+            ),
+            ToolExecutionRecord(
+                tool_name="k8s_list_nodes",
+                requested_tool="k8s_list_nodes",
+                args={},
+                semantic_key="k8s:nodes",
+                success=True,
+                summary="Listed cluster nodes and allocatable resources.",
+                evidence_categories=("node_health",),
+            ),
+        ]
+        self.assertFalse(_plan_has_enough_evidence(plan, partial_records))
+
+        complete_records = partial_records + [
+            ToolExecutionRecord(
+                tool_name="k8s_list_pods",
+                requested_tool="k8s_list_pods",
+                args={"namespace": "all"},
+                semantic_key="k8s:pods",
+                success=True,
+                summary="Listed running workloads and requests for optimization review.",
+                evidence_categories=("pod_health",),
+            ),
+        ]
+        self.assertTrue(_plan_has_enough_evidence(plan, complete_records))
+
+    def test_readonly_confirmation_prompt_is_detected(self) -> None:
+        text = "Would you like me to proceed with these read-only diagnostic checks? (yes/no)"
+        self.assertTrue(_response_requests_readonly_confirmation(text))
+
+    def test_missing_requested_aspects_flags_partial_capacity_answer(self) -> None:
+        plan = build_turn_plan(
+            user_input="what ec2 instances is my cluster running and how much cpu/ram do they have in total, and is this optimized for my workloads?",
+            intent=QueryIntent(mode="general"),
+            chat_history=[],
+            incident_state=IncidentState(),
+            operator_intent_state=OperatorIntentState(),
+        )
+
+        missing = _missing_requested_aspects(
+            plan,
+            "The cluster uses t3.large and t3.medium instances. I can list them for you.",
+        )
+        self.assertIn("capacity", missing)
+        self.assertIn("optimization", missing)
 
 
 class IncidentStateTests(unittest.TestCase):

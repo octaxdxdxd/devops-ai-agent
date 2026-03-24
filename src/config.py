@@ -112,7 +112,6 @@ class Config:
     AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '2500'))
     INCIDENT_STATE_MAX_EVIDENCE = int(os.getenv('INCIDENT_STATE_MAX_EVIDENCE', '8'))
     INCIDENT_STATE_MAX_CACHE_ENTRIES = int(os.getenv('INCIDENT_STATE_MAX_CACHE_ENTRIES', '24'))
-    AGENT_ENABLE_DIRECT_READ_ROUTER = os.getenv('AGENT_ENABLE_DIRECT_READ_ROUTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     AGENT_ENABLE_INTENT_TOOL_FILTER = os.getenv('AGENT_ENABLE_INTENT_TOOL_FILTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     COMMAND_SAFETY_POSTURE = os.getenv('COMMAND_SAFETY_POSTURE', 'powerful').strip().lower()
     DEEP_INITIAL_INVESTIGATION = os.getenv('DEEP_INITIAL_INVESTIGATION', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}

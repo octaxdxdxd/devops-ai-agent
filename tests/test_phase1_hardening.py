@@ -13,7 +13,7 @@ from src.tools.aws_cli import aws_cli_readonly
 from src.tools.k8s_cli import kubectl_readonly
 from src.utils.command_intent import Config
 from src.utils.command_intent import classify_command_intent, target_tool_for_intent
-from src.utils.query_intent import QueryIntent
+from src.utils.query_intent import QueryIntent, classify_query_intent
 from src.utils.tracing import _redact_text
 
 
@@ -162,6 +162,18 @@ class CommandToolTests(unittest.TestCase):
 
 
 class AgentSelectionTests(unittest.TestCase):
+    def test_chat_greeting_stays_general_not_chat_fast_path(self) -> None:
+        intent = classify_query_intent("hello")
+        self.assertEqual(intent.mode, "general")
+
+    def test_inventory_prompt_no_longer_uses_direct_read_mode(self) -> None:
+        intent = classify_query_intent("list all pvcs in my cluster")
+        self.assertEqual(intent.mode, "general")
+
+    def test_natural_language_restart_is_treated_as_command(self) -> None:
+        intent = classify_query_intent("restart gitlab webservice pod")
+        self.assertEqual(intent.mode, "command")
+
     def test_incident_tool_selection_prefers_read_diagnostics_by_default(self) -> None:
         dummy_agent = type(
             "DummyAgent",

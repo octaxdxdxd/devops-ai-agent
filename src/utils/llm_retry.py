@@ -42,6 +42,14 @@ def invoke_with_retries(
     for attempt in range(1, max_attempts + 1):
         t0 = time.perf_counter()
         try:
+            _emit(
+                trace_writer,
+                trace_id,
+                {
+                    "event": f"{event}.start",
+                    "attempt": attempt,
+                },
+            )
             response = llm.invoke(messages)
             _emit(
                 trace_writer,
@@ -84,4 +92,3 @@ def invoke_with_retries(
                 time.sleep(sleep_s)
 
     raise last_exc or RuntimeError("LLM invocation failed")
-
