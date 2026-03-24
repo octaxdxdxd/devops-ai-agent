@@ -120,6 +120,9 @@ class Config:
     LLM_RETRY_MAX_ATTEMPTS = int(os.getenv('LLM_RETRY_MAX_ATTEMPTS', '3'))
     LLM_RETRY_BASE_DELAY_SEC = float(os.getenv('LLM_RETRY_BASE_DELAY_SEC', '1.0'))
     LLM_RETRY_MAX_DELAY_SEC = float(os.getenv('LLM_RETRY_MAX_DELAY_SEC', '8.0'))
+    LLM_REQUEST_TIMEOUT_SEC = float(os.getenv('LLM_REQUEST_TIMEOUT_SEC', '90'))
+    LLM_MAX_OUTPUT_TOKENS = int(os.getenv('LLM_MAX_OUTPUT_TOKENS', '4096'))
+    LLM_MAX_RESPONSE_CHARS = int(os.getenv('LLM_MAX_RESPONSE_CHARS', '24000'))
     VERBOSE = True
 
     # Tracing (structured JSONL)

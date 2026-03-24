@@ -14,7 +14,9 @@ class GeminiModel:
         self.llm = ChatGoogleGenerativeAI(
             model=self.model_name,
             google_api_key=Config.GEMINI_API_KEY,
-            temperature=Config.TEMPERATURE
+            temperature=Config.TEMPERATURE,
+            max_output_tokens=Config.LLM_MAX_OUTPUT_TOKENS,
+            timeout=Config.LLM_REQUEST_TIMEOUT_SEC,
         )
     
     def get_llm(self):

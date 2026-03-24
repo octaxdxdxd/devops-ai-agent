@@ -15,6 +15,8 @@ class OpenAIModel:
         self.llm = ChatOpenAI(
             model=self.model_name,
             temperature=Config.TEMPERATURE,
+            max_tokens=Config.LLM_MAX_OUTPUT_TOKENS,
+            request_timeout=Config.LLM_REQUEST_TIMEOUT_SEC,
             openai_api_key=Config.OPENAI_API_KEY,
             openai_api_base=Config.OPENAI_BASE_URL,
         )

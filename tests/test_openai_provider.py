@@ -6,7 +6,11 @@ import unittest
 from unittest.mock import patch
 
 from src.config import Config
+from src.models.gemini import GeminiModel
+from src.models.openai import OpenAIModel
+from src.models.openrouter import OpenRouterModel
 from src.models import get_model
+from src.utils.response import extract_response_text
 
 
 class OpenAIProviderTests(unittest.TestCase):
@@ -83,6 +87,78 @@ class OpenAIProviderTests(unittest.TestCase):
             Config.LLM_PROVIDER = original_provider
             Config.OPENROUTER_API_KEY = original_openrouter_key
             Config.OPENAI_API_KEY = original_openai_key
+
+    @patch("src.models.openai.ChatOpenAI")
+    def test_openai_wrapper_sets_timeout_and_output_cap(self, mock_chat_openai) -> None:
+        original_timeout = Config.LLM_REQUEST_TIMEOUT_SEC
+        original_max_output = Config.LLM_MAX_OUTPUT_TOKENS
+        original_key = Config.OPENAI_API_KEY
+        try:
+            Config.LLM_REQUEST_TIMEOUT_SEC = 45
+            Config.LLM_MAX_OUTPUT_TOKENS = 2048
+            Config.OPENAI_API_KEY = "test-key"
+            OpenAIModel(model_name="gpt-4.1-mini")
+        finally:
+            Config.LLM_REQUEST_TIMEOUT_SEC = original_timeout
+            Config.LLM_MAX_OUTPUT_TOKENS = original_max_output
+            Config.OPENAI_API_KEY = original_key
+
+        mock_chat_openai.assert_called_once()
+        kwargs = mock_chat_openai.call_args.kwargs
+        self.assertEqual(kwargs["max_tokens"], 2048)
+        self.assertEqual(kwargs["request_timeout"], 45)
+
+    @patch("src.models.openrouter.ChatOpenAI")
+    def test_openrouter_wrapper_sets_timeout_and_output_cap(self, mock_chat_openai) -> None:
+        original_timeout = Config.LLM_REQUEST_TIMEOUT_SEC
+        original_max_output = Config.LLM_MAX_OUTPUT_TOKENS
+        original_key = Config.OPENROUTER_API_KEY
+        try:
+            Config.LLM_REQUEST_TIMEOUT_SEC = 60
+            Config.LLM_MAX_OUTPUT_TOKENS = 3072
+            Config.OPENROUTER_API_KEY = "test-key"
+            OpenRouterModel(model_name="google/gemini-2.5-flash")
+        finally:
+            Config.LLM_REQUEST_TIMEOUT_SEC = original_timeout
+            Config.LLM_MAX_OUTPUT_TOKENS = original_max_output
+            Config.OPENROUTER_API_KEY = original_key
+
+        mock_chat_openai.assert_called_once()
+        kwargs = mock_chat_openai.call_args.kwargs
+        self.assertEqual(kwargs["max_tokens"], 3072)
+        self.assertEqual(kwargs["request_timeout"], 60)
+
+    @patch("src.models.gemini.ChatGoogleGenerativeAI")
+    def test_gemini_wrapper_sets_timeout_and_output_cap(self, mock_gemini) -> None:
+        original_timeout = Config.LLM_REQUEST_TIMEOUT_SEC
+        original_max_output = Config.LLM_MAX_OUTPUT_TOKENS
+        original_key = Config.GEMINI_API_KEY
+        try:
+            Config.LLM_REQUEST_TIMEOUT_SEC = 75
+            Config.LLM_MAX_OUTPUT_TOKENS = 1024
+            Config.GEMINI_API_KEY = "test-key"
+            GeminiModel(model_name="gemini-2.5-flash")
+        finally:
+            Config.LLM_REQUEST_TIMEOUT_SEC = original_timeout
+            Config.LLM_MAX_OUTPUT_TOKENS = original_max_output
+            Config.GEMINI_API_KEY = original_key
+
+        mock_gemini.assert_called_once()
+        kwargs = mock_gemini.call_args.kwargs
+        self.assertEqual(kwargs["max_output_tokens"], 1024)
+        self.assertEqual(kwargs["timeout"], 75)
+
+    def test_extract_response_text_truncates_pathological_outputs(self) -> None:
+        original_limit = Config.LLM_MAX_RESPONSE_CHARS
+        try:
+            Config.LLM_MAX_RESPONSE_CHARS = 120
+            response = type("Resp", (), {"content": "x" * 500})()
+            text = extract_response_text(response)
+        finally:
+            Config.LLM_MAX_RESPONSE_CHARS = original_limit
+
+        self.assertLessEqual(len(text), 120)
+        self.assertIn("Response truncated in UI", text)
 
 
 if __name__ == "__main__":
