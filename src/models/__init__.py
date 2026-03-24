@@ -17,4 +17,4 @@ def get_model(provider: str | None = None, model_name: str | None = None):
         return OpenAIModel(model_name=model_name)
     if selected == 'openrouter':
         return OpenRouterModel(model_name=model_name)
-    return GeminiModel()
+    return GeminiModel(model_name=model_name)

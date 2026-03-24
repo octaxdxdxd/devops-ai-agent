@@ -5,14 +5,14 @@ from __future__ import annotations
 import streamlit as st
 
 from ..config import Config
-from .session import get_message_trace_id
+from .session import apply_runtime_model_selection, get_message_trace_id
 
 
 def display_sidebar() -> None:
-    """Display sidebar with runtime metadata only (no actions)."""
+    """Display sidebar with runtime metadata and model controls."""
     with st.sidebar:
         st.title("Runtime Status")
-        st.caption("Read-only status panel")
+        st.caption("Status panel and model controls")
         st.markdown("---")
 
         st.subheader("Model")
@@ -20,6 +20,56 @@ def display_sidebar() -> None:
         st.caption(f"Model: {st.session_state.model_name}")
         st.caption(f"Temperature: {Config.TEMPERATURE}")
         st.caption(f"Command Safety Posture: {Config.COMMAND_SAFETY_POSTURE}")
+        st.caption("Changes apply to new turns and health scans.")
+
+        provider_options = list(Config.SUPPORTED_LLM_PROVIDERS)
+        if st.session_state.get("model_provider_draft") not in provider_options:
+            st.session_state.model_provider_draft = st.session_state.model_provider
+        if not str(st.session_state.get("model_name_draft") or "").strip():
+            st.session_state.model_name_draft = st.session_state.model_name
+
+        with st.form("runtime_model_controls"):
+            st.selectbox(
+                "LLM provider",
+                provider_options,
+                key="model_provider_draft",
+            )
+            st.text_input(
+                "Model name",
+                key="model_name_draft",
+                help="Enter any provider-supported model id.",
+            )
+            st.caption(
+                "Suggested default: "
+                f"`{Config.get_model_name_for_provider(st.session_state.model_provider_draft)}`"
+            )
+            col_apply, col_default = st.columns(2)
+            apply_clicked = col_apply.form_submit_button("Apply", use_container_width=True)
+            default_clicked = col_default.form_submit_button("Use Default", use_container_width=True)
+
+        if default_clicked:
+            st.session_state.model_name_draft = Config.get_model_name_for_provider(
+                st.session_state.model_provider_draft
+            )
+            st.rerun()
+
+        if apply_clicked:
+            try:
+                selected_provider, selected_model = apply_runtime_model_selection(
+                    st.session_state.model_provider_draft,
+                    st.session_state.model_name_draft,
+                )
+                st.session_state.model_settings_notice = (
+                    f"Switched to {selected_provider}:{selected_model}"
+                )
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+        notice = str(st.session_state.get("model_settings_notice") or "").strip()
+        if notice:
+            st.success(notice)
+            st.session_state.model_settings_notice = None
 
         st.markdown("---")
         st.subheader("Kubernetes")

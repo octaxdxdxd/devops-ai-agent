@@ -10,6 +10,14 @@ from src.models import get_model
 
 
 class OpenAIProviderTests(unittest.TestCase):
+    def test_get_model_dispatches_to_gemini_wrapper_with_override(self) -> None:
+        with patch("src.models.GeminiModel") as mock_gemini:
+            sentinel = object()
+            mock_gemini.return_value = sentinel
+            selected = get_model(provider="gemini", model_name="gemini-2.5-pro")
+            mock_gemini.assert_called_once_with(model_name="gemini-2.5-pro")
+            self.assertIs(selected, sentinel)
+
     def test_get_model_dispatches_to_openai_wrapper(self) -> None:
         with patch("src.models.OpenAIModel") as mock_openai:
             sentinel = object()
@@ -17,6 +25,22 @@ class OpenAIProviderTests(unittest.TestCase):
             selected = get_model(provider="openai", model_name="gpt-4.1-mini")
             mock_openai.assert_called_once_with(model_name="gpt-4.1-mini")
             self.assertIs(selected, sentinel)
+
+    def test_get_model_name_for_provider_reads_selected_provider_slot(self) -> None:
+        original_gemini = Config.GEMINI_MODEL
+        original_openai = Config.OPENAI_MODEL
+        original_openrouter = Config.OPENROUTER_MODEL
+        try:
+            Config.GEMINI_MODEL = "gemini-2.5-flash"
+            Config.OPENAI_MODEL = "gpt-4.1-mini"
+            Config.OPENROUTER_MODEL = "openrouter/custom-model"
+            self.assertEqual(Config.get_model_name_for_provider("gemini"), "gemini-2.5-flash")
+            self.assertEqual(Config.get_model_name_for_provider("openai"), "gpt-4.1-mini")
+            self.assertEqual(Config.get_model_name_for_provider("openrouter"), "openrouter/custom-model")
+        finally:
+            Config.GEMINI_MODEL = original_gemini
+            Config.OPENAI_MODEL = original_openai
+            Config.OPENROUTER_MODEL = original_openrouter
 
     def test_get_active_model_name_uses_openai_model(self) -> None:
         original_provider = Config.LLM_PROVIDER

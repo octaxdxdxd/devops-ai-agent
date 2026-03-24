@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -58,6 +58,16 @@ def _operator_write_guard_message(operator_intent_state: OperatorIntentState, *,
             "The user asked to prepare commands/change plans only, not execute them."
         )
     return None
+
+
+def _notify_status(status_callback: Callable[[str], None] | None, text: str) -> None:
+    """Best-effort status updates for the UI layer."""
+    if not callable(status_callback):
+        return
+    try:
+        status_callback(text)
+    except Exception:
+        return
 
 
 def _resolve_tool_call(
@@ -552,6 +562,7 @@ def handle_tool_calls(
     operator_intent_state: OperatorIntentState | None = None,
     trace_writer: Any = None,
     trace_id: str | None = None,
+    status_callback: Callable[[str], None] | None = None,
 ) -> ToolLoopOutcome:
     """Execute iterative tool calls until the model produces a final response."""
     tw = trace_writer
@@ -624,6 +635,7 @@ def handle_tool_calls(
 
             total_tool_calls += 1
             if total_tool_calls > max_tool_calls:
+                _notify_status(status_callback, "Tool budget reached. Drafting the best answer from current evidence...")
                 if tw and trace_id:
                     tw.emit(
                         {
@@ -875,6 +887,7 @@ def handle_tool_calls(
                 requires_approval=requires_approval,
             )
             if cached_result:
+                _notify_status(status_callback, f"Reusing cached evidence from `{tool_name}`...")
                 if tw and trace_id:
                     tw.emit(
                         {
@@ -999,6 +1012,10 @@ def handle_tool_calls(
                     break
 
                 if len(pending_actions) > 1:
+                    _notify_status(
+                        status_callback,
+                        f"Prepared {len(pending_actions)} write actions. Waiting for approval...",
+                    )
                     approval.set_pending_actions(pending_actions)
                     preview_lines: list[str] = []
                     for action in pending_actions:
@@ -1038,6 +1055,7 @@ def handle_tool_calls(
 
                 cmd_preview = format_command_preview(single_name, single_args)
                 approval.set_pending_action(single.tool, single_args)
+                _notify_status(status_callback, f"Prepared `{single_name}`. Waiting for approval...")
 
                 if tw and trace_id:
                     tw.emit(
@@ -1067,6 +1085,7 @@ def handle_tool_calls(
                 )
 
             try:
+                _notify_status(status_callback, f"Running `{tool_name}`...")
                 result = tool_func.invoke(tool_args)
                 result_content, raw_result_len = _tool_result_to_message_content(result, tool_name=tool_name)
                 if tw and trace_id:
@@ -1143,6 +1162,7 @@ def handle_tool_calls(
                         "records": len(execution_records),
                     }
                 )
+            _notify_status(status_callback, "Enough evidence collected. Drafting the response...")
             messages.append(HumanMessage(content=_plan_synthesis_prompt(turn_plan, incident_state)))
             forced = invoke_with_retries(
                 llm,
@@ -1168,6 +1188,7 @@ def handle_tool_calls(
         )
 
     if hasattr(current_response, "tool_calls") and current_response.tool_calls:
+        _notify_status(status_callback, "Investigation took too many steps. Drafting a best-effort answer...")
         if tw and trace_id:
             tw.emit(
                 {

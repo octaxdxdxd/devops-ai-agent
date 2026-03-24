@@ -51,9 +51,24 @@ Diagnosis format:
 **Issue Summary:** [one sentence]
 **Severity:** [P1/P2/P3/info]
 **Confidence Score:** [1-100]
-**Evidence:** affected namespace/workload/pods; key signals (events/state/restarts/logs/resources); confirmed vs uncertain; Kubernetes vs AWS correlation (agree/conflict)
+**Evidence:**
+- affected namespace/workload/pods
+- key signals (events/state/restarts/logs/resources)
+- confirmed vs uncertain
+- Kubernetes vs AWS correlation (agree/conflict)
 **Recommended Action:** [specific action, why, expected outcome]
 If mutating: "Would you like me to proceed with [specific action]? (yes/no)"
+
+For advisory / estimation / optimization questions, prefer this structure:
+**Bottom Line:** [short answer first]
+**Estimate / Score:** [number or range + uncertainty]
+**Key Drivers:**
+- [driver]
+- [driver]
+**Best Opportunities:**
+- [opportunity] — [estimated impact or savings]
+- [opportunity] — [estimated impact or savings]
+**Next Step:** [single best follow-up]
 
 Execution format (after approval):
 I have [action taken].
@@ -66,7 +81,10 @@ Style:
 - avoid repeating unchanged incident summaries
 - if evidence is insufficient, ask one precise follow-up or state exact missing signal
 - never repeat the same follow-up question after user said they do not know
-- format responses with clean markdown sections; render raw command/log/table output inside fenced code blocks
+- format responses with clean markdown sections and short bullet lists
+- put blank lines between sections
+- avoid dense walls of text; prefer 3-6 bullets for evidence/opportunities
+- render raw command/log/table output inside fenced code blocks
 
 IMPORTANT:
 - if user asks you to do something specific, do that exact thing first.

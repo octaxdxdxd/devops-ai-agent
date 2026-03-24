@@ -10,6 +10,8 @@ load_dotenv()
 class Config:
     """Application configuration"""
 
+    SUPPORTED_LLM_PROVIDERS = ('gemini', 'openai', 'openrouter')
+
     # LLM Provider
     # Supported values: 'gemini', 'openrouter', 'openai'
     LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini').lower()
@@ -190,11 +192,38 @@ class Config:
 
     @classmethod
     def get_active_model_name(cls) -> str:
-        if cls.LLM_PROVIDER == 'openai':
+        return cls.get_model_name_for_provider(cls.LLM_PROVIDER)
+
+    @classmethod
+    def get_model_name_for_provider(cls, provider: str | None) -> str:
+        selected = str(provider or cls.LLM_PROVIDER or 'gemini').strip().lower()
+        if selected == 'openai':
             return cls.OPENAI_MODEL
-        if cls.LLM_PROVIDER == 'openrouter':
+        if selected == 'openrouter':
             return cls.OPENROUTER_MODEL
         return cls.GEMINI_MODEL
+
+    @classmethod
+    def set_runtime_model_selection(cls, provider: str, model_name: str | None = None) -> str:
+        """Apply an in-memory provider/model selection for the current app session."""
+        selected_provider = str(provider or cls.LLM_PROVIDER or 'gemini').strip().lower()
+        if selected_provider not in cls.SUPPORTED_LLM_PROVIDERS:
+            raise ValueError(
+                f"Unsupported LLM_PROVIDER: {selected_provider!r}. "
+                "Use 'gemini', 'openai', or 'openrouter'."
+            )
+
+        selected_model = str(model_name or '').strip() or cls.get_model_name_for_provider(selected_provider)
+
+        cls.LLM_PROVIDER = selected_provider
+        if selected_provider == 'openai':
+            cls.OPENAI_MODEL = selected_model
+        elif selected_provider == 'openrouter':
+            cls.OPENROUTER_MODEL = selected_model
+        else:
+            cls.GEMINI_MODEL = selected_model
+
+        return selected_model
     
     @classmethod
     def get_system_prompt(cls) -> str:

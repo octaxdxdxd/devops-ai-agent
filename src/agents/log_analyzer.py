@@ -118,6 +118,7 @@ class LogAnalyzerAgent:
             )
 
         try:
+            self._notify_status(status_callback, "Reviewing the request and current operating context...")
             update_operator_intent_state(
                 operator_intent_state=self._operator_intent_state,
                 user_input=user_input,
@@ -126,6 +127,8 @@ class LogAnalyzerAgent:
                 approval_pending=self._approval.has_pending(),
             )
 
+            if Config.AUTONOMY_ENABLED and Config.AUTONOMY_SCAN_ON_USER_TURN:
+                self._notify_status(status_callback, "Checking recent cluster health signals in the background...")
             alert_prefix = self._build_alert_prefix(self._operator_intent_state)
 
             approval_response = self._handle_pending_approval(
@@ -139,6 +142,7 @@ class LogAnalyzerAgent:
                 return approval_response
 
             intent = classify_query_intent(user_input)
+            self._notify_status(status_callback, "Planning the next step for this turn...")
             turn_plan = build_turn_plan(
                 user_input=user_input,
                 intent=intent,
@@ -178,6 +182,7 @@ class LogAnalyzerAgent:
                     incident_state=self._incident_state,
                 )
                 if direct is not None:
+                    self._notify_status(status_callback, "Preparing a direct answer from the current context...")
                     final_direct = alert_prefix + direct
                     self._incident_state = apply_turn_outcome_to_state(
                         incident_state=self._incident_state,
@@ -212,6 +217,7 @@ class LogAnalyzerAgent:
                 turn_plan=turn_plan,
                 operator_intent_state=self._operator_intent_state,
             )
+            self._notify_status(status_callback, "Selecting the most relevant tools for this step...")
             selected_tools_by_name = {tool.name: tool for tool in selected_tools}
             llm_with_tools = self.model.get_llm_with_tools(selected_tools)
             if tw:
@@ -227,6 +233,7 @@ class LogAnalyzerAgent:
 
             messages = self.prompt.format_messages(chat_history=chat_history, input=prompt_input)
 
+            self._notify_status(status_callback, "Asking the model to choose the next actions...")
             response = invoke_with_retries(
                 llm_with_tools,
                 messages,
@@ -236,6 +243,7 @@ class LogAnalyzerAgent:
             )
 
             if hasattr(response, "tool_calls") and response.tool_calls:
+                self._notify_status(status_callback, "Running diagnostics and gathering evidence...")
                 outcome = handle_tool_calls(
                     response=response,
                     user_input=prompt_input,
@@ -251,6 +259,7 @@ class LogAnalyzerAgent:
                     operator_intent_state=self._operator_intent_state,
                     trace_writer=tw,
                     trace_id=trace_id,
+                    status_callback=status_callback,
                 )
                 final = outcome.final_text
                 if not (final or "").strip():
@@ -279,6 +288,7 @@ class LogAnalyzerAgent:
                 end_turn(final)
                 return final
 
+            self._notify_status(status_callback, "Drafting the response...")
             final = extract_response_text(response)
             if not (final or "").strip():
                 trace_hint = f" Trace ID: {trace_id}" if (tw and trace_id) else ""
