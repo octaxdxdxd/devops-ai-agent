@@ -1,4 +1,4 @@
-"""Command-family routing and mutability classification helpers."""
+"""Command-family routing and safety classification helpers."""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ import shlex
 from dataclasses import dataclass
 from typing import Literal
 
+from ..config import Config
 
 CommandFamily = Literal["kubectl", "aws", "helm", "unknown"]
+CommandCapability = Literal["safe_read", "sensitive_read", "write", "blocked"]
 
 
 @dataclass(frozen=True)
@@ -16,6 +18,20 @@ class CommandIntent:
     verb: str
     is_mutating: bool
     normalized_command: str
+    capability: CommandCapability
+    reason: str = ""
+
+    @property
+    def requires_approval(self) -> bool:
+        return self.capability == "write"
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.capability == "blocked"
+
+    @property
+    def is_sensitive_read(self) -> bool:
+        return self.capability == "sensitive_read"
 
 
 _KUBECTL_OPTIONS_WITH_VALUE = {
@@ -58,9 +74,17 @@ _KUBECTL_MUTATING_VERBS = {
     "autoscale",
     "expose",
 }
+_KUBECTL_SENSITIVE_READ_VERBS = {
+    "attach",
+    "cp",
+    "debug",
+    "exec",
+    "port-forward",
+}
 _KUBECTL_READONLY_VERBS = {
     "api-resources",
     "api-versions",
+    "auth",
     "cluster-info",
     "describe",
     "diff",
@@ -79,11 +103,18 @@ _AWS_READONLY_OPERATION_EXCEPTIONS = {
     "filter-log-events",
     "generate-query",
 }
+_AWS_SENSITIVE_READ_OPERATIONS = {
+    "get-login-password",
+    "get-secret-value",
+    "batch-get-secret-value",
+    "decrypt",
+}
 _AWS_MUTATING_OPERATION_PREFIXES = (
     "add",
     "associate",
     "attach",
     "cancel",
+    "complete",
     "copy",
     "create",
     "delete",
@@ -174,6 +205,39 @@ _HELM_MUTATING_SUBVERBS = {
     "registry": {"login", "logout"},
     "dependency": {"build", "update"},
 }
+def _blocked_intent(
+    *,
+    family: CommandFamily,
+    verb: str,
+    normalized_command: str,
+    reason: str,
+) -> CommandIntent:
+    return CommandIntent(
+        family=family,
+        verb=verb,
+        is_mutating=False,
+        normalized_command=normalized_command,
+        capability="blocked",
+        reason=reason,
+    )
+
+
+def _intent(
+    *,
+    family: CommandFamily,
+    verb: str,
+    normalized_command: str,
+    capability: CommandCapability,
+    reason: str = "",
+) -> CommandIntent:
+    return CommandIntent(
+        family=family,
+        verb=verb,
+        is_mutating=(capability == "write"),
+        normalized_command=normalized_command,
+        capability=capability,
+        reason=reason,
+    )
 
 
 def _normalize_family_from_tool(tool_name: str) -> CommandFamily:
@@ -195,6 +259,10 @@ def _split_tokens(command: str) -> tuple[list[str], str | None]:
         return shlex.split(raw), None
     except ValueError as exc:
         return [], f"invalid syntax: {exc}"
+
+
+def _powerful_posture() -> bool:
+    return str(getattr(Config, "COMMAND_SAFETY_POSTURE", "powerful")).strip().lower() != "strict"
 
 
 def _extract_first_positional(tokens: list[str], *, options_with_value: set[str]) -> str:
@@ -219,69 +287,259 @@ def _extract_first_positional(tokens: list[str], *, options_with_value: set[str]
     return ""
 
 
+def _positional_tokens(tokens: list[str], *, options_with_value: set[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = str(tokens[i]).strip()
+        if not token:
+            i += 1
+            continue
+        if token == "--":
+            out.extend(str(item).strip() for item in tokens[i + 1 :])
+            break
+        if token.startswith("-"):
+            if token in options_with_value:
+                i += 2
+                continue
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    return out
+
+
+def _kubectl_targets_secret(tokens: list[str]) -> bool:
+    positionals = _positional_tokens(tokens, options_with_value=_KUBECTL_OPTIONS_WITH_VALUE)
+    if len(positionals) < 2:
+        return False
+
+    target = positionals[1].strip().lower()
+    if target.startswith("secret/") or target.startswith("secrets/"):
+        return True
+    return target in {"secret", "secrets"}
+
+
+def _kubectl_output_flag_value(tokens: list[str]) -> str:
+    for i, raw in enumerate(tokens):
+        token = str(raw).strip()
+        if token in {"-o", "--output"} and i + 1 < len(tokens):
+            return str(tokens[i + 1]).strip().lower()
+        if token.startswith("-o="):
+            return token.split("=", 1)[1].strip().lower()
+        if token.startswith("--output="):
+            return token.split("=", 1)[1].strip().lower()
+    return ""
+
+
+def _kubectl_secret_reads_sensitive(tokens: list[str], normalized_command: str) -> bool:
+    if not _kubectl_targets_secret(tokens):
+        return False
+
+    output_value = _kubectl_output_flag_value(tokens)
+    if output_value in {"json", "yaml"}:
+        return True
+    if output_value.startswith("jsonpath") or output_value.startswith("go-template"):
+        return True
+
+    lowered = normalized_command.lower()
+    return ".data" in lowered or "base64" in lowered or "--template" in lowered
+
+
+def _aws_sensitive_read(service: str, operation: str, tokens: list[str]) -> bool:
+    if operation in _AWS_SENSITIVE_READ_OPERATIONS:
+        return True
+    if service == "ssm" and operation in {"get-parameter", "get-parameters"}:
+        lowered = [str(token).strip().lower() for token in tokens]
+        return "--with-decryption" in lowered
+    return False
+
+
 def _classify_kubectl(tokens: list[str]) -> CommandIntent:
     verb = _extract_first_positional(tokens, options_with_value=_KUBECTL_OPTIONS_WITH_VALUE)
+    normalized = shlex.join(tokens)
     if not verb:
-        is_mutating = True
-    elif verb in _KUBECTL_MUTATING_VERBS:
-        is_mutating = True
-    elif verb in _KUBECTL_READONLY_VERBS:
-        is_mutating = False
-    else:
-        # Conservative default: unknown kubectl verbs are treated as mutating.
-        is_mutating = True
-    return CommandIntent(
+        return _blocked_intent(
+            family="kubectl",
+            verb=verb,
+            normalized_command=normalized,
+            reason="could not determine kubectl verb.",
+        )
+    if verb in _KUBECTL_SENSITIVE_READ_VERBS:
+        if _powerful_posture():
+            return _intent(
+                family="kubectl",
+                verb=verb,
+                normalized_command=normalized,
+                capability="write",
+                reason=f"kubectl verb `{verb}` is treated as execute-capable in powerful posture.",
+            )
+        return _intent(
+            family="kubectl",
+            verb=verb,
+            normalized_command=normalized,
+            capability="sensitive_read",
+            reason=(
+                f"kubectl verb `{verb}` is a privileged/sensitive read operation and is blocked in generic command tools."
+            ),
+        )
+    if verb in _KUBECTL_MUTATING_VERBS:
+        return _intent(
+            family="kubectl",
+            verb=verb,
+            normalized_command=normalized,
+            capability="write",
+        )
+    if verb in _KUBECTL_READONLY_VERBS:
+        if _kubectl_secret_reads_sensitive(tokens, normalized):
+            if _powerful_posture():
+                return _intent(
+                    family="kubectl",
+                    verb=verb,
+                    normalized_command=normalized,
+                    capability="safe_read",
+                    reason="secret extraction is allowed in powerful posture.",
+                )
+            return _intent(
+                family="kubectl",
+                verb=verb,
+                normalized_command=normalized,
+                capability="sensitive_read",
+                reason="secret value extraction is blocked in generic kubectl command tools.",
+            )
+        return _intent(
+            family="kubectl",
+            verb=verb,
+            normalized_command=normalized,
+            capability="safe_read",
+        )
+    if _powerful_posture():
+        return _intent(
+            family="kubectl",
+            verb=verb,
+            normalized_command=normalized,
+            capability="write",
+            reason=f"kubectl verb `{verb}` is treated as execute-capable in powerful posture.",
+        )
+    return _blocked_intent(
         family="kubectl",
         verb=verb,
-        is_mutating=is_mutating,
-        normalized_command=shlex.join(tokens),
+        normalized_command=normalized,
+        reason=f"kubectl verb `{verb}` is not supported in generic command tools.",
     )
 
 
 def _classify_aws(tokens: list[str]) -> CommandIntent:
     service = str(tokens[0]).strip().lower() if len(tokens) >= 1 else ""
     operation = str(tokens[1]).strip().lower() if len(tokens) >= 2 else ""
-    if not operation:
-        is_mutating = True
-    elif operation in _AWS_READONLY_OPERATION_EXCEPTIONS:
-        is_mutating = False
-    else:
-        is_mutating = operation.startswith(_AWS_MUTATING_OPERATION_PREFIXES)
-    return CommandIntent(
+    normalized = shlex.join(tokens)
+    verb = f"{service}:{operation}".strip(":")
+    if not service or not operation:
+        return _blocked_intent(
+            family="aws",
+            verb=verb,
+            normalized_command=normalized,
+            reason="AWS command must include both service and operation.",
+        )
+    if _aws_sensitive_read(service, operation, tokens):
+        if _powerful_posture():
+            return _intent(
+                family="aws",
+                verb=verb,
+                normalized_command=normalized,
+                capability="safe_read",
+                reason="sensitive AWS reads are allowed in powerful posture.",
+            )
+        return _intent(
+            family="aws",
+            verb=verb,
+            normalized_command=normalized,
+            capability="sensitive_read",
+            reason="sensitive AWS secret/decryption reads are blocked in generic command tools.",
+        )
+    if operation in _AWS_READONLY_OPERATION_EXCEPTIONS:
+        return _intent(
+            family="aws",
+            verb=verb,
+            normalized_command=normalized,
+            capability="safe_read",
+        )
+    if operation.startswith(_AWS_MUTATING_OPERATION_PREFIXES):
+        return _intent(
+            family="aws",
+            verb=verb,
+            normalized_command=normalized,
+            capability="write",
+        )
+    return _intent(
         family="aws",
-        verb=f"{service}:{operation}".strip(":"),
-        is_mutating=is_mutating,
-        normalized_command=shlex.join(tokens),
+        verb=verb,
+        normalized_command=normalized,
+        capability="safe_read",
     )
 
 
 def _classify_helm(tokens: list[str]) -> CommandIntent:
     verb = _extract_first_positional(tokens, options_with_value=_HELM_OPTIONS_WITH_VALUE)
+    normalized = shlex.join(tokens)
+    if _contains_shell_syntax(tokens, normalized):
+        return _blocked_intent(
+            family="helm",
+            verb=verb,
+            normalized_command=normalized,
+            reason="shell-style operators are blocked in Helm command tools.",
+        )
     if not verb:
-        is_mutating = True
-    elif verb in _HELM_READONLY_VERBS:
-        is_mutating = False
-    elif verb in _HELM_MUTATING_VERBS:
+        return _blocked_intent(
+            family="helm",
+            verb=verb,
+            normalized_command=normalized,
+            reason="could not determine Helm verb.",
+        )
+    if verb in _HELM_READONLY_VERBS:
+        return _intent(
+            family="helm",
+            verb=verb,
+            normalized_command=normalized,
+            capability="safe_read",
+        )
+    if verb in _HELM_MUTATING_VERBS:
         subverb = _extract_first_positional(tokens[1:], options_with_value=_HELM_OPTIONS_WITH_VALUE)
         readonly_subverbs = _HELM_READONLY_SUBVERBS.get(verb, set())
         mutating_subverbs = _HELM_MUTATING_SUBVERBS.get(verb, set())
         if subverb and subverb in readonly_subverbs:
-            is_mutating = False
-        elif subverb and subverb in mutating_subverbs:
-            is_mutating = True
-        elif verb in {"repo", "plugin", "dependency", "registry"}:
-            # Default these grouped verbs to mutating unless we can prove read-only.
-            is_mutating = True
-        else:
-            is_mutating = True
-    else:
-        # Conservative: unknown verbs are treated as mutating.
-        is_mutating = True
-    return CommandIntent(
+            return _intent(
+                family="helm",
+                verb=verb,
+                normalized_command=normalized,
+                capability="safe_read",
+            )
+        if subverb and subverb in mutating_subverbs:
+            return _intent(
+                family="helm",
+                verb=verb,
+                normalized_command=normalized,
+                capability="write",
+            )
+        return _intent(
+            family="helm",
+            verb=verb,
+            normalized_command=normalized,
+            capability="write",
+        )
+    if _powerful_posture():
+        return _intent(
+            family="helm",
+            verb=verb,
+            normalized_command=normalized,
+            capability="write",
+            reason=f"Helm verb `{verb}` is treated as execute-capable in powerful posture.",
+        )
+    return _blocked_intent(
         family="helm",
         verb=verb,
-        is_mutating=is_mutating,
-        normalized_command=shlex.join(tokens),
+        normalized_command=normalized,
+        reason=f"Helm verb `{verb}` is not supported in generic command tools.",
     )
 
 
@@ -293,8 +551,10 @@ def classify_command_intent(tool_name: str, command: str) -> CommandIntent:
         return CommandIntent(
             family=default_family,
             verb="",
-            is_mutating=(default_family != "unknown"),
+            is_mutating=False,
             normalized_command=(command or "").strip(),
+            capability="blocked",
+            reason="command is empty or invalid.",
         )
 
     first = str(tokens[0]).strip().lower()
@@ -313,16 +573,30 @@ def classify_command_intent(tool_name: str, command: str) -> CommandIntent:
     return CommandIntent(
         family="unknown",
         verb="",
-        is_mutating=True,
+        is_mutating=False,
         normalized_command=(command or "").strip(),
+        capability="blocked",
+        reason="could not determine command family.",
     )
 
 
 def target_tool_for_intent(intent: CommandIntent) -> str | None:
     if intent.family == "kubectl":
-        return "kubectl_execute" if intent.is_mutating else "kubectl_readonly"
+        if intent.capability == "safe_read":
+            return "kubectl_readonly"
+        if intent.capability == "write":
+            return "kubectl_execute"
+        return None
     if intent.family == "aws":
-        return "aws_cli_execute" if intent.is_mutating else "aws_cli_readonly"
+        if intent.capability == "safe_read":
+            return "aws_cli_readonly"
+        if intent.capability == "write":
+            return "aws_cli_execute"
+        return None
     if intent.family == "helm":
-        return "helm_execute" if intent.is_mutating else "helm_readonly"
+        if intent.capability == "safe_read":
+            return "helm_readonly"
+        if intent.capability == "write":
+            return "helm_execute"
+        return None
     return None

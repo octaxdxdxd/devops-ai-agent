@@ -22,6 +22,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from ..config import Config
+from ..utils.command_intent import classify_command_intent
 from .k8s_common import truncate_text
 
 
@@ -308,6 +309,24 @@ def _audit(
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
+def _intent_error(intent, *, readonly: bool) -> str | None:
+    if intent.is_blocked:
+        return f"❌ {intent.reason}"
+    if intent.is_sensitive_read:
+        return f"❌ {intent.reason}"
+    if readonly and intent.capability == "write":
+        return (
+            f"❌ Action `{intent.verb or 'unknown'}` looks mutating and is blocked in `aws_cli_readonly`. "
+            "Use `aws_cli_execute` (approval required)."
+        )
+    if not readonly and intent.capability == "safe_read":
+        return (
+            f"❌ Action `{intent.verb or 'unknown'}` is read-only. "
+            "Use `aws_cli_readonly` instead."
+        )
+    return None
+
+
 def _execute(tokens: list[str], *, mode: str, reason: str = "") -> str:
     service = tokens[0].lower()
     operation = tokens[1].lower()
@@ -536,7 +555,7 @@ def aws_cli_readonly(command: str) -> str:
     - sts get-caller-identity
     - ec2 describe-instances --region us-east-1
 
-    When AWS_CLI_ALLOW_ALL_READ=1, readonly allowlist checks are bypassed.
+    In the default powerful posture, secret/decryption reads are allowed here.
     """
     if not Config.AWS_CLI_ENABLED:
         return "❌ AWS CLI tools are disabled. Set AWS_CLI_ENABLED=1 to enable."
@@ -546,6 +565,10 @@ def aws_cli_readonly(command: str) -> str:
     tokens, err = _normalize_command(command)
     if err:
         return err
+    intent = classify_command_intent("aws_cli_readonly", shlex.join(tokens))
+    intent_err = _intent_error(intent, readonly=True)
+    if intent_err:
+        return intent_err
     return _execute(tokens, mode="readonly")
 
 
@@ -554,7 +577,9 @@ def aws_cli_execute(command: str, reason: str = "") -> str:
     """Run an AWS CLI mutating-capable command.
 
     IMPORTANT: This is a mutating-capable tool and should require explicit user approval.
-    When AWS_CLI_ALLOW_ALL_WRITE=1, write allowlist checks are bypassed.
+    Read-only and sensitive-read commands are rejected here to keep generic execute
+    focused on explicit write operations. When AWS_CLI_ALLOW_ALL_WRITE=1, write
+    allowlist checks are bypassed.
     """
     if not Config.AWS_CLI_ENABLED:
         return "❌ AWS CLI tools are disabled. Set AWS_CLI_ENABLED=1 to enable."
@@ -564,6 +589,10 @@ def aws_cli_execute(command: str, reason: str = "") -> str:
     tokens, err = _normalize_command(command)
     if err:
         return err
+    intent = classify_command_intent("aws_cli_execute", shlex.join(tokens))
+    intent_err = _intent_error(intent, readonly=False)
+    if intent_err:
+        return intent_err
 
     reason = (reason or "").strip()
     return _execute(tokens, mode="write", reason=reason)

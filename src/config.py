@@ -10,17 +10,24 @@ load_dotenv()
 class Config:
     """Application configuration"""
 
+    SUPPORTED_LLM_PROVIDERS = ('gemini', 'openai', 'openrouter')
+
     # LLM Provider
-    # Supported values: 'gemini', 'openrouter'
+    # Supported values: 'gemini', 'openrouter', 'openai'
     LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini').lower()
     
     # API Configuration
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
     GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 
-    # OpenRouter (aliases: OPENAI_API_KEY / OPENAI_MODEL for convenience)
-    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY') or os.getenv('OPENAI_API_KEY')
-    OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL') or os.getenv('OPENAI_MODEL') or 'arcee-ai/trinity-large-preview:free'
+    # Native OpenAI
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+    OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')
+    OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+
+    # OpenRouter
+    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+    OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'arcee-ai/trinity-large-preview:free')
     OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
     # Optional headers OpenRouter recommends
     OPENROUTER_SITE_URL = os.getenv('OPENROUTER_SITE_URL')
@@ -100,13 +107,21 @@ class Config:
     MAX_ITERATIONS = int(os.getenv('MAX_ITERATIONS', '8'))
     MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '24'))
     MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '3'))
-    MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '14'))
-    AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '5000'))
+    MAX_SEMANTIC_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_SEMANTIC_DUPLICATE_TOOL_CALLS', '2'))
+    MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '10'))
+    AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '2500'))
+    INCIDENT_STATE_MAX_EVIDENCE = int(os.getenv('INCIDENT_STATE_MAX_EVIDENCE', '8'))
+    INCIDENT_STATE_MAX_CACHE_ENTRIES = int(os.getenv('INCIDENT_STATE_MAX_CACHE_ENTRIES', '24'))
+    AGENT_ENABLE_INTENT_TOOL_FILTER = os.getenv('AGENT_ENABLE_INTENT_TOOL_FILTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    COMMAND_SAFETY_POSTURE = os.getenv('COMMAND_SAFETY_POSTURE', 'powerful').strip().lower()
     DEEP_INITIAL_INVESTIGATION = os.getenv('DEEP_INITIAL_INVESTIGATION', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     LLM_RETRY_ON_RATE_LIMIT = os.getenv('LLM_RETRY_ON_RATE_LIMIT', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     LLM_RETRY_MAX_ATTEMPTS = int(os.getenv('LLM_RETRY_MAX_ATTEMPTS', '3'))
     LLM_RETRY_BASE_DELAY_SEC = float(os.getenv('LLM_RETRY_BASE_DELAY_SEC', '1.0'))
     LLM_RETRY_MAX_DELAY_SEC = float(os.getenv('LLM_RETRY_MAX_DELAY_SEC', '8.0'))
+    LLM_REQUEST_TIMEOUT_SEC = float(os.getenv('LLM_REQUEST_TIMEOUT_SEC', '90'))
+    LLM_MAX_OUTPUT_TOKENS = int(os.getenv('LLM_MAX_OUTPUT_TOKENS', '4096'))
+    LLM_MAX_RESPONSE_CHARS = int(os.getenv('LLM_MAX_RESPONSE_CHARS', '24000'))
     VERBOSE = True
 
     # Tracing (structured JSONL)
@@ -158,24 +173,59 @@ class Config:
                     "GEMINI_API_KEY not found. "
                     "Please set it in .env file or environment variables."
                 )
+        elif cls.LLM_PROVIDER == 'openai':
+            if not cls.OPENAI_API_KEY:
+                raise ValueError(
+                    "OPENAI_API_KEY not found. "
+                    "Please set it in .env file or environment variables."
+                )
         elif cls.LLM_PROVIDER == 'openrouter':
             if not cls.OPENROUTER_API_KEY:
                 raise ValueError(
                     "OpenRouter API key not found. "
-                    "Set OPENROUTER_API_KEY (or OPENAI_API_KEY) in .env or environment variables."
+                    "Set OPENROUTER_API_KEY in .env or environment variables."
                 )
         else:
             raise ValueError(
-                f"Unsupported LLM_PROVIDER: {cls.LLM_PROVIDER!r}. Use 'gemini' or 'openrouter'."
+                f"Unsupported LLM_PROVIDER: {cls.LLM_PROVIDER!r}. Use 'gemini', 'openai', or 'openrouter'."
             )
         
         # Local log directory is no longer required for normal operation.
 
     @classmethod
     def get_active_model_name(cls) -> str:
-        if cls.LLM_PROVIDER == 'openrouter':
+        return cls.get_model_name_for_provider(cls.LLM_PROVIDER)
+
+    @classmethod
+    def get_model_name_for_provider(cls, provider: str | None) -> str:
+        selected = str(provider or cls.LLM_PROVIDER or 'gemini').strip().lower()
+        if selected == 'openai':
+            return cls.OPENAI_MODEL
+        if selected == 'openrouter':
             return cls.OPENROUTER_MODEL
         return cls.GEMINI_MODEL
+
+    @classmethod
+    def set_runtime_model_selection(cls, provider: str, model_name: str | None = None) -> str:
+        """Apply an in-memory provider/model selection for the current app session."""
+        selected_provider = str(provider or cls.LLM_PROVIDER or 'gemini').strip().lower()
+        if selected_provider not in cls.SUPPORTED_LLM_PROVIDERS:
+            raise ValueError(
+                f"Unsupported LLM_PROVIDER: {selected_provider!r}. "
+                "Use 'gemini', 'openai', or 'openrouter'."
+            )
+
+        selected_model = str(model_name or '').strip() or cls.get_model_name_for_provider(selected_provider)
+
+        cls.LLM_PROVIDER = selected_provider
+        if selected_provider == 'openai':
+            cls.OPENAI_MODEL = selected_model
+        elif selected_provider == 'openrouter':
+            cls.OPENROUTER_MODEL = selected_model
+        else:
+            cls.GEMINI_MODEL = selected_model
+
+        return selected_model
     
     @classmethod
     def get_system_prompt(cls) -> str:
