@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
@@ -15,9 +15,24 @@ from ..utils.query_intent import QueryIntent, classify_query_intent
 from ..utils.response import extract_response_text
 from ..utils.tracing import JsonlTraceWriter, TraceSpan, new_trace_id, trace_config_from_env
 from .planner import build_turn_plan, render_turn_plan_directive
-from .approval import ApprovalCoordinator, commands_code_block, format_command_preview
+from .approval import (
+    ApprovalCoordinator,
+    attempt_known_command_repair,
+    commands_code_block,
+    format_command_preview,
+    is_repairable_command_tool,
+    normalize_command_for_tool,
+    parse_command_repair_response,
+    tool_result_indicates_failure,
+)
 from .autonomy_helpers import format_autonomous_scan, notification_was_sent
-from .state import IncidentState, apply_turn_outcome_to_state
+from .state import (
+    IncidentState,
+    OperatorIntentState,
+    apply_turn_outcome_to_state,
+    register_operator_follow_up,
+    update_operator_intent_state,
+)
 from .tool_loop import handle_tool_calls
 
 
@@ -42,6 +57,7 @@ class LogAnalyzerAgent:
         self._approval = ApprovalCoordinator()
         self._last_announced_incident_fingerprint: str | None = None
         self._incident_state = IncidentState()
+        self._operator_intent_state = OperatorIntentState()
         self._turn_index = 0
 
         self._autonomy = SimpleAutonomyEngine() if Config.AUTONOMY_ENABLED else None
@@ -64,7 +80,12 @@ class LogAnalyzerAgent:
             ]
         )
 
-    def process_query(self, user_input: str, chat_history: list | None = None) -> str:
+    def process_query(
+        self,
+        user_input: str,
+        chat_history: list | None = None,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> str:
         """Process one user query and return the assistant response."""
         if chat_history is None:
             chat_history = []
@@ -97,9 +118,22 @@ class LogAnalyzerAgent:
             )
 
         try:
-            alert_prefix = self._build_alert_prefix()
+            update_operator_intent_state(
+                operator_intent_state=self._operator_intent_state,
+                user_input=user_input,
+                turn_index=turn_index,
+                incident_state=self._incident_state,
+                approval_pending=self._approval.has_pending(),
+            )
 
-            approval_response = self._handle_pending_approval(user_input, alert_prefix, trace_id)
+            alert_prefix = self._build_alert_prefix(self._operator_intent_state)
+
+            approval_response = self._handle_pending_approval(
+                user_input,
+                alert_prefix,
+                trace_id,
+                status_callback=status_callback,
+            )
             if approval_response is not None:
                 end_turn(approval_response)
                 return approval_response
@@ -110,6 +144,7 @@ class LogAnalyzerAgent:
                 intent=intent,
                 chat_history=chat_history,
                 incident_state=self._incident_state,
+                operator_intent_state=self._operator_intent_state,
                 approval_pending=self._approval.has_pending(),
             )
             if turn_plan.reset_existing_context:
@@ -126,6 +161,8 @@ class LogAnalyzerAgent:
                         "allow_broad_discovery": turn_plan.allow_broad_discovery,
                         "prefer_cached_reads": turn_plan.prefer_cached_reads,
                         "prefer_fresh_reads": turn_plan.prefer_fresh_reads,
+                        "operator_mode": self._operator_intent_state.mode,
+                        "execution_policy": self._operator_intent_state.execution_policy,
                     }
                 )
             if Config.AGENT_ENABLE_DIRECT_READ_ROUTER and intent.mode == "chat":
@@ -151,6 +188,12 @@ class LogAnalyzerAgent:
                         final_text=direct,
                         turn_index=turn_index,
                     )
+                    register_operator_follow_up(
+                        operator_intent_state=self._operator_intent_state,
+                        final_text=direct,
+                        turn_plan=turn_plan,
+                        approval_pending=self._approval.has_pending(),
+                    )
                     end_turn(final_direct)
                     return final_direct
 
@@ -160,9 +203,15 @@ class LogAnalyzerAgent:
                 intent_mode=intent.mode,
                 turn_plan=turn_plan,
                 incident_state=self._incident_state,
+                operator_intent_state=self._operator_intent_state,
             )
 
-            selected_tools = self._select_tools_for_turn(intent=intent, user_input=user_input)
+            selected_tools = self._select_tools_for_turn(
+                intent=intent,
+                user_input=user_input,
+                turn_plan=turn_plan,
+                operator_intent_state=self._operator_intent_state,
+            )
             selected_tools_by_name = {tool.name: tool for tool in selected_tools}
             llm_with_tools = self.model.get_llm_with_tools(selected_tools)
             if tw:
@@ -199,6 +248,7 @@ class LogAnalyzerAgent:
                     approval=self._approval,
                     turn_plan=turn_plan,
                     incident_state=self._incident_state,
+                    operator_intent_state=self._operator_intent_state,
                     trace_writer=tw,
                     trace_id=trace_id,
                 )
@@ -218,6 +268,12 @@ class LogAnalyzerAgent:
                     outcome=outcome,
                     final_text=final,
                     turn_index=turn_index,
+                )
+                register_operator_follow_up(
+                    operator_intent_state=self._operator_intent_state,
+                    final_text=final,
+                    turn_plan=turn_plan,
+                    approval_pending=self._approval.has_pending(),
                 )
                 final = alert_prefix + final
                 end_turn(final)
@@ -240,6 +296,12 @@ class LogAnalyzerAgent:
                 final_text=final,
                 turn_index=turn_index,
             )
+            register_operator_follow_up(
+                operator_intent_state=self._operator_intent_state,
+                final_text=final,
+                turn_plan=turn_plan,
+                approval_pending=self._approval.has_pending(),
+            )
             final = alert_prefix + final
             end_turn(final)
             return final
@@ -261,6 +323,7 @@ class LogAnalyzerAgent:
         intent_mode: str,
         turn_plan: Any,
         incident_state: IncidentState,
+        operator_intent_state: OperatorIntentState,
     ) -> str:
         """Augment prompt input with execution behavior hints when useful."""
         directives: list[str] = []
@@ -338,7 +401,33 @@ class LogAnalyzerAgent:
                 "Do not ask clarifying questions in this turn unless there is an absolute hard blocker after exhausting all read-only evidence paths."
             )
 
-        plan_block = render_turn_plan_directive(turn_plan=turn_plan, incident_state=incident_state)
+        if operator_intent_state.is_following_proposed_plan():
+            pending_kind = str(getattr(operator_intent_state, "pending_step_kind", "") or "")
+            directives.append(
+                "The user asked you to continue with the previously proposed next step. "
+                "Do not restate the issue summary unless new evidence changes it."
+            )
+            if operator_intent_state.pending_step_summary:
+                directives.append(f"Continue this next step: {operator_intent_state.pending_step_summary}")
+            if pending_kind == "implementation":
+                directives.append(
+                    "This follow-up is an implementation step. Use the minimum necessary read-only checks to construct exact changes, "
+                    "then propose or queue the concrete write action for approval instead of repeating diagnosis."
+                )
+            elif pending_kind == "prepare":
+                directives.append(
+                    "This follow-up is a preparation step. Turn the proposed fix into concrete commands, patches, or an approval-ready plan."
+                )
+            elif pending_kind == "investigate":
+                directives.append(
+                    "This follow-up is an approved investigation step. Run the requested diagnostic reads now and summarize only the new findings."
+                )
+
+        plan_block = render_turn_plan_directive(
+            turn_plan=turn_plan,
+            incident_state=incident_state,
+            operator_intent_state=operator_intent_state,
+        )
         extra_blocks: list[str] = []
         if directives:
             extra_blocks.append("[Agent directive]\n" + "\n".join(f"- {item}" for item in directives))
@@ -349,57 +438,71 @@ class LogAnalyzerAgent:
             return user_input
         return f"{user_input}\n\n" + "\n\n".join(extra_blocks)
 
-    def _select_tools_for_turn(self, *, intent: QueryIntent, user_input: str) -> list[Any]:
+    @staticmethod
+    def _user_requested_execution(user_input: str) -> bool:
+        lowered = str(user_input or "").strip().lower()
+        if not lowered:
+            return False
+        if lowered.startswith(("aws ", "kubectl ", "helm ")):
+            return True
+        action_prefixes = ("restart ", "scale ", "rollout ", "delete ", "patch ", "apply ")
+        return any(lowered.startswith(prefix) for prefix in action_prefixes)
+
+    def _select_tools_for_turn(
+        self,
+        *,
+        intent: QueryIntent,
+        user_input: str,
+        turn_plan: Any,
+        operator_intent_state: OperatorIntentState,
+    ) -> list[Any]:
         """Choose a tool subset to reduce prompt cost and off-target tool drift."""
         if not Config.AGENT_ENABLE_INTENT_TOOL_FILTER:
             return self.tools
 
-        # Keep command tools available when user explicitly asks for command execution.
-        if intent.mode == "command":
-            return self.tools
+        selected_names = set(getattr(turn_plan, "preferred_tools", ()) or ())
+        selected_names.update({"kubectl_readonly", "helm_readonly", "aws_cli_readonly"})
 
-        incident_core = {
-            "k8s_list_namespaces",
-            "k8s_list_nodes",
-            "k8s_top_nodes",
-            "k8s_list_pods",
-            "k8s_find_pods",
-            "k8s_describe_pod",
-            "k8s_get_pod_logs",
-            "k8s_top_pods",
-            "k8s_list_deployments",
-            "k8s_describe_deployment",
-            "k8s_list_statefulsets",
-            "k8s_list_daemonsets",
-            "k8s_list_services",
-            "k8s_list_secrets",
-            "k8s_list_ingresses",
-            "k8s_get_events",
-            "k8s_get_pvcs",
-            "k8s_list_pvs",
-            "k8s_describe_pvc",
-            "k8s_describe_pv",
-            "k8s_describe_node",
-            "k8s_get_resource_yaml",
-            "k8s_get_pod_scheduling_report",
-            "k8s_get_crashloop_pods",
-            "kubectl_readonly",
-            "kubectl_execute",
-            "helm_readonly",
-            "helm_execute",
-            "aws_cli_readonly",
-            "aws_cli_execute",
-            "restart_kubernetes_pod",
-            "restart_kubernetes_pods_batch",
-            "scale_kubernetes_deployment",
-            "scale_kubernetes_statefulset",
-            "scale_kubernetes_workloads_batch",
-            "rollout_restart_kubernetes_deployment",
-            "rollout_restart_kubernetes_statefulset",
-            "rollout_restart_kubernetes_daemonset",
-            "rollout_restart_kubernetes_workloads_batch",
-        }
-        selected = [tool for tool in self.tools if tool.name in incident_core]
+        if getattr(turn_plan, "stage", "") == "scope":
+            selected_names.update({"k8s_list_namespaces", "k8s_get_events"})
+        if getattr(turn_plan, "allow_broad_discovery", False):
+            selected_names.update({"k8s_list_pods", "k8s_get_events"})
+        if getattr(turn_plan, "focus", "") == "service":
+            selected_names.update({"k8s_list_services", "k8s_list_ingresses"})
+        elif getattr(turn_plan, "focus", "") == "node":
+            selected_names.update({"k8s_list_nodes", "k8s_top_nodes", "k8s_describe_node"})
+        elif getattr(turn_plan, "focus", "") == "storage":
+            selected_names.update({"k8s_get_pvcs", "k8s_list_pvs"})
+        elif getattr(turn_plan, "focus", "") == "aws":
+            selected_names.update({"aws_cli_readonly", "k8s_list_nodes"})
+
+        if (
+            intent.mode == "command"
+            or getattr(turn_plan, "stage", "") == "execute"
+            or (
+                operator_intent_state.is_following_proposed_plan()
+                and getattr(turn_plan, "stage", "") in {"command", "execute"}
+            )
+            or LogAnalyzerAgent._user_requested_execution(user_input)
+        ):
+            selected_names.update(
+                {
+                    "kubectl_execute",
+                    "helm_execute",
+                    "aws_cli_execute",
+                    "restart_kubernetes_pod",
+                    "restart_kubernetes_pods_batch",
+                    "scale_kubernetes_deployment",
+                    "scale_kubernetes_statefulset",
+                    "scale_kubernetes_workloads_batch",
+                    "rollout_restart_kubernetes_deployment",
+                    "rollout_restart_kubernetes_statefulset",
+                    "rollout_restart_kubernetes_daemonset",
+                    "rollout_restart_kubernetes_workloads_batch",
+                }
+            )
+
+        selected = [tool for tool in self.tools if tool.name in selected_names]
         return selected or self.tools
 
     def _handle_direct_read_request(
@@ -450,7 +553,7 @@ class LogAnalyzerAgent:
         title = f"Requested Data: {intent.resource or 'result'}"
         return f"### {title}\n```text\n{raw}\n```"
 
-    def _build_alert_prefix(self) -> str:
+    def _build_alert_prefix(self, operator_intent_state: OperatorIntentState) -> str:
         if self._autonomy is None or not Config.AUTONOMY_SCAN_ON_USER_TURN or self._approval.has_pending():
             return ""
 
@@ -465,14 +568,24 @@ class LogAnalyzerAgent:
 
         should_show_banner = notification_was_sent(notifications)
         if should_show_banner and fingerprint and fingerprint != self._last_announced_incident_fingerprint:
-            prefix = (
-                "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
-                f"Severity: {incident.get('severity', 'unknown')} | "
-                f"Confidence: {incident.get('confidence_score', 0)}/100 | "
-                f"Impact: {incident.get('impact_score', 0)}/100\n"
-                f"Summary: {incident.get('issue_summary', '')}\n"
-                f"Notification result: {notifications}\n\n"
-            )
+            if operator_intent_state.is_following_proposed_plan():
+                prefix = (
+                    "Background context: autonomous monitoring still sees an active incident.\n"
+                    f"Severity: {incident.get('severity', 'unknown')} | "
+                    f"Confidence: {incident.get('confidence_score', 0)}/100 | "
+                    f"Impact: {incident.get('impact_score', 0)}/100\n"
+                    f"Summary: {incident.get('issue_summary', '')}\n"
+                    "Use this as context only. Prioritize continuing the user's requested next step over repeating the diagnosis.\n\n"
+                )
+            else:
+                prefix = (
+                    "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
+                    f"Severity: {incident.get('severity', 'unknown')} | "
+                    f"Confidence: {incident.get('confidence_score', 0)}/100 | "
+                    f"Impact: {incident.get('impact_score', 0)}/100\n"
+                    f"Summary: {incident.get('issue_summary', '')}\n"
+                    f"Notification result: {notifications}\n\n"
+                )
         else:
             prefix = ""
 
@@ -480,7 +593,109 @@ class LogAnalyzerAgent:
             self._last_announced_incident_fingerprint = fingerprint
         return prefix
 
-    def _handle_pending_approval(self, user_input: str, alert_prefix: str, trace_id: str) -> str | None:
+    @staticmethod
+    def _notify_status(status_callback: Callable[[str], None] | None, text: str) -> None:
+        """Best-effort UI status updates without coupling the agent to Streamlit."""
+        if not callable(status_callback):
+            return
+        try:
+            status_callback(text)
+        except Exception:
+            return
+
+    def _propose_repaired_command(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        failure_text: str,
+        trace_id: str,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Generate a corrected command body for a failed approved execute tool."""
+        if not is_repairable_command_tool(tool_name):
+            return None, ""
+
+        original_command = str(tool_args.get("command") or "").strip()
+        if not original_command:
+            return None, ""
+
+        self._notify_status(
+            status_callback,
+            "Approved command failed. Analyzing the error and drafting a corrected command...",
+        )
+
+        repaired = attempt_known_command_repair(tool_name, original_command, failure_text)
+        if repaired and repaired != original_command:
+            return (
+                {**tool_args, "command": repaired},
+                "I corrected the command structure to match the API schema reported in the error.",
+            )
+
+        command_prefix = {
+            "aws_cli_execute": "aws",
+            "kubectl_execute": "kubectl",
+            "helm_execute": "helm",
+        }.get(tool_name, "command")
+        reason = str(tool_args.get("reason") or "").strip()
+
+        repair_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    (
+                        "You repair failed infrastructure CLI commands after an approved write action.\n"
+                        "Only fix mistakes directly evidenced by the failure output.\n"
+                        "Do not broaden scope, change the target resource, or add extra operations.\n"
+                        f"For `{tool_name}`, return only the command body after `{command_prefix} `, not the binary itself.\n"
+                        "If you cannot confidently repair it, say so.\n"
+                        "Return exactly four lines:\n"
+                        "STATUS: repair|cannot_repair\n"
+                        "SUMMARY: <one short sentence>\n"
+                        "COMMAND: <single-line corrected command body or blank>\n"
+                        "REASON: <short explanation>\n"
+                    ),
+                ),
+                (
+                    "user",
+                    (
+                        f"Tool: {tool_name}\n"
+                        f"Command prefix: {command_prefix}\n"
+                        f"Original command body: {original_command}\n"
+                        f"Operator reason: {reason or '(none provided)'}\n"
+                        f"Failure output:\n{failure_text}"
+                    ),
+                ),
+            ]
+        )
+
+        repair_messages = repair_prompt.format_messages()
+        repair_response = invoke_with_retries(
+            self.llm,
+            repair_messages,
+            trace_writer=self._trace_writer,
+            trace_id=trace_id,
+            event="llm.invoke.command_repair",
+        )
+        parsed = parse_command_repair_response(extract_response_text(repair_response))
+        if not parsed or parsed.get("status") != "repair":
+            return None, ""
+
+        repaired_command = normalize_command_for_tool(tool_name, parsed.get("command", ""))
+        if not repaired_command or repaired_command == original_command:
+            return None, ""
+
+        summary = parsed.get("summary") or parsed.get("reason") or "I found a likely correction."
+        return {**tool_args, "command": repaired_command}, summary
+
+    def _handle_pending_approval(
+        self,
+        user_input: str,
+        alert_prefix: str,
+        trace_id: str,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> str | None:
         pending_batch = list(self._approval.pending_actions)
         pending = self._approval.pending_action
         if not pending_batch and pending is None:
@@ -499,6 +714,7 @@ class LogAnalyzerAgent:
             cmd_block = commands_code_block(cmd_preview)
 
             if decision in {"yes", "y", "approve", "proceed", "do it", "run it", "ok"} or decision.startswith("approve "):
+                self._notify_status(status_callback, f"Executing {len(pending_batch)} approved write action(s)...")
                 actions = list(pending_batch)
                 self._approval.pending_actions = []
                 sections: list[str] = []
@@ -511,6 +727,18 @@ class LogAnalyzerAgent:
                             tw.emit({"trace_id": trace_id, "event": "approval.accept", "tool": tool.name, "args": args, "batch_index": idx, "batch_size": len(actions)})
                         with TraceSpan(tw, trace_id, "tool.invoke", {"tool": getattr(tool, "name", "<unknown>"), "args": args, "batch_index": idx, "batch_size": len(actions)}) if tw else _NullContext():
                             result = tool.invoke(args)
+                        if tool_result_indicates_failure(result):
+                            failures += 1
+                            if tw:
+                                tw.emit(
+                                    {
+                                        "trace_id": trace_id,
+                                        "event": "approval.exec_result_failure",
+                                        "tool": tool.name,
+                                        "batch_index": idx,
+                                        "batch_size": len(actions),
+                                    }
+                                )
                         sections.append(f"[{idx}/{len(actions)}] `{tool.name}`\n{result}")
                     except Exception as exc:
                         failures += 1
@@ -566,10 +794,45 @@ class LogAnalyzerAgent:
             cmd_block = commands_code_block(cmd_preview)
             self._approval.pending_action = None
             try:
+                self._notify_status(status_callback, f"Executing approved command via `{tool.name}`...")
                 if tw:
                     tw.emit({"trace_id": trace_id, "event": "approval.accept", "tool": tool.name, "args": args})
                 with TraceSpan(tw, trace_id, "tool.invoke", {"tool": getattr(tool, "name", "<unknown>"), "args": args}) if tw else _NullContext():
                     result = tool.invoke(args)
+                if tool_result_indicates_failure(result):
+                    if tw:
+                        tw.emit({"trace_id": trace_id, "event": "approval.exec_result_failure", "tool": tool.name, "args": args})
+                    repaired_args, repair_summary = self._propose_repaired_command(
+                        tool_name=tool.name,
+                        tool_args=args,
+                        failure_text=str(result),
+                        trace_id=trace_id,
+                        status_callback=status_callback,
+                    )
+                    if repaired_args is not None:
+                        self._approval.set_pending_action(tool, repaired_args)
+                        repaired_preview = commands_code_block(format_command_preview(tool.name, repaired_args))
+                        self._notify_status(status_callback, "Corrected command prepared. Waiting for fresh approval.")
+                        if tw:
+                            tw.emit(
+                                {
+                                    "trace_id": trace_id,
+                                    "event": "approval.repair_proposed",
+                                    "tool": tool.name,
+                                    "original_args": args,
+                                    "repaired_args": repaired_args,
+                                }
+                            )
+                        return (
+                            alert_prefix
+                            + "The approved command failed, so I analyzed the error and prepared a corrected command.\n\n"
+                            + f"Original command(s):\n{cmd_block}\n\n"
+                            + f"Failure details:\n```text\n{str(result).strip()}\n```\n\n"
+                            + (f"Likely fix: {repair_summary}\n\n" if repair_summary else "")
+                            + "Corrected command(s):\n"
+                            + f"{repaired_preview}\n\n"
+                            + "This still requires fresh approval. Reply `yes` to approve or `no` to cancel."
+                        )
                 return (
                     alert_prefix
                     + "Write command(s) requested:\n"
@@ -580,6 +843,38 @@ class LogAnalyzerAgent:
             except Exception as exc:
                 if tw:
                     tw.emit({"trace_id": trace_id, "event": "approval.exec_error", "tool": tool.name, "error": str(exc)})
+                repaired_args, repair_summary = self._propose_repaired_command(
+                    tool_name=tool.name,
+                    tool_args=args,
+                    failure_text=str(exc),
+                    trace_id=trace_id,
+                    status_callback=status_callback,
+                )
+                if repaired_args is not None:
+                    self._approval.set_pending_action(tool, repaired_args)
+                    repaired_preview = commands_code_block(format_command_preview(tool.name, repaired_args))
+                    self._notify_status(status_callback, "Corrected command prepared. Waiting for fresh approval.")
+                    if tw:
+                        tw.emit(
+                            {
+                                "trace_id": trace_id,
+                                "event": "approval.repair_proposed",
+                                "tool": tool.name,
+                                "original_args": args,
+                                "repaired_args": repaired_args,
+                                "source": "exception",
+                            }
+                        )
+                    return (
+                        alert_prefix
+                        + "The approved command failed, so I analyzed the error and prepared a corrected command.\n\n"
+                        + f"Original command(s):\n{cmd_block}\n\n"
+                        + f"Failure details:\n```text\n{exc}\n```\n\n"
+                        + (f"Likely fix: {repair_summary}\n\n" if repair_summary else "")
+                        + "Corrected command(s):\n"
+                        + f"{repaired_preview}\n\n"
+                        + "This still requires fresh approval. Reply `yes` to approve or `no` to cancel."
+                    )
                 return f"Approved, but execution failed: {exc}"
 
         if decision in {"no", "n", "cancel", "stop"}:
@@ -622,3 +917,11 @@ class LogAnalyzerAgent:
     def clear_history(self) -> None:
         """Clear any pending action state."""
         self._approval.clear()
+        self._incident_state.clear()
+        self._operator_intent_state.clear()
+        self._last_announced_incident_fingerprint = None
+        self.last_trace_id = None
+
+    @property
+    def operator_intent_state(self) -> OperatorIntentState:
+        return self._operator_intent_state

@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from src.agents.planner import build_turn_plan, render_turn_plan_directive
-from src.agents.state import IncidentState, ToolExecutionRecord, ToolLoopOutcome, apply_turn_outcome_to_state
+from src.agents.state import IncidentState, OperatorIntentState, ToolExecutionRecord, ToolLoopOutcome, apply_turn_outcome_to_state
 from src.agents.tool_loop import _plan_has_enough_evidence, _semantic_tool_signature
 from src.utils.query_intent import QueryIntent
 
@@ -26,6 +26,7 @@ class PlannerTests(unittest.TestCase):
             intent=QueryIntent(mode="general"),
             chat_history=[],
             incident_state=state,
+            operator_intent_state=OperatorIntentState(),
         )
 
         self.assertTrue(plan.continue_existing)
@@ -49,6 +50,7 @@ class PlannerTests(unittest.TestCase):
             intent=QueryIntent(mode="general"),
             chat_history=[],
             incident_state=state,
+            operator_intent_state=OperatorIntentState(),
         )
 
         self.assertTrue(plan.continue_existing)
@@ -71,6 +73,7 @@ class PlannerTests(unittest.TestCase):
             intent=QueryIntent(mode="incident_rca"),
             chat_history=[],
             incident_state=state,
+            operator_intent_state=OperatorIntentState(),
         )
 
         self.assertFalse(plan.continue_existing)
@@ -91,9 +94,14 @@ class PlannerTests(unittest.TestCase):
             intent=QueryIntent(mode="general"),
             chat_history=[],
             incident_state=state,
+            operator_intent_state=OperatorIntentState(),
         )
 
-        rendered = render_turn_plan_directive(turn_plan=plan, incident_state=state)
+        rendered = render_turn_plan_directive(
+            turn_plan=plan,
+            incident_state=state,
+            operator_intent_state=OperatorIntentState(),
+        )
         self.assertIn("Known namespace: gitlab", rendered)
         self.assertIn("Known services: webservice", rendered)
         self.assertIn("Prior evidence", rendered)
@@ -118,6 +126,7 @@ class ToolLoopPlannerTests(unittest.TestCase):
             intent=QueryIntent(mode="general"),
             chat_history=[],
             incident_state=state,
+            operator_intent_state=OperatorIntentState(),
         )
 
         cached_only_records = [
@@ -175,6 +184,7 @@ class IncidentStateTests(unittest.TestCase):
             intent=QueryIntent(mode="incident_rca", namespace="gitlab"),
             chat_history=[],
             incident_state=state,
+            operator_intent_state=OperatorIntentState(),
         )
 
         records = [

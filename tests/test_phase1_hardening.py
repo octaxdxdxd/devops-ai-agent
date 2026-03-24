@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from src.agents.log_analyzer import LogAnalyzerAgent
 from src.agents.tool_loop import _command_guard_message, _resolve_tool_call
+from src.agents.planner import TurnPlan
+from src.agents.state import OperatorIntentState
 from src.tools.aws_cli import aws_cli_readonly
 from src.tools.k8s_cli import kubectl_readonly
 from src.utils.command_intent import Config
@@ -160,7 +162,7 @@ class CommandToolTests(unittest.TestCase):
 
 
 class AgentSelectionTests(unittest.TestCase):
-    def test_incident_tool_selection_includes_execute_tools(self) -> None:
+    def test_incident_tool_selection_prefers_read_diagnostics_by_default(self) -> None:
         dummy_agent = type(
             "DummyAgent",
             (),
@@ -180,10 +182,25 @@ class AgentSelectionTests(unittest.TestCase):
             dummy_agent,
             intent=QueryIntent(mode="incident_rca"),
             user_input="diagnose why the service is down",
+            turn_plan=TurnPlan(
+                mode="incident_rca",
+                stage="collect",
+                focus="service",
+                continue_existing=False,
+                reset_existing_context=False,
+                prefer_cached_reads=False,
+                prefer_fresh_reads=False,
+                allow_broad_discovery=True,
+                required_categories=("service_network", "pod_health"),
+                preferred_tools=("k8s_list_services", "k8s_list_ingresses", "aws_cli_readonly"),
+                notes=(),
+            ),
+            operator_intent_state=OperatorIntentState(),
         )
         selected_names = {tool.name for tool in selected}
-        self.assertIn("kubectl_execute", selected_names)
-        self.assertIn("helm_execute", selected_names)
+        self.assertIn("aws_cli_readonly", selected_names)
+        self.assertNotIn("kubectl_execute", selected_names)
+        self.assertNotIn("helm_execute", selected_names)
 
 
 class TraceRedactionTests(unittest.TestCase):

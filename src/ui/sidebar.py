@@ -5,6 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from ..config import Config
+from .session import get_message_trace_id
 
 
 def display_sidebar() -> None:
@@ -36,6 +37,29 @@ def display_sidebar() -> None:
         st.caption(f"AWS Region: {Config.AWS_CLI_DEFAULT_REGION or '(from aws config/env)'}")
 
         st.markdown("---")
+        st.subheader("Operator Intent")
+        operator_intent = getattr(st.session_state.get("agent", None), "operator_intent_state", None)
+        if operator_intent is None:
+            st.caption("Mode: incident_response")
+            st.caption("Execution: approval_required")
+        else:
+            st.caption(f"Mode: {getattr(operator_intent, 'mode', 'incident_response')}")
+            st.caption(f"Execution: {getattr(operator_intent, 'execution_policy', 'approval_required')}")
+            constraints = list(getattr(operator_intent, "pinned_constraints", []) or [])
+            if constraints:
+                for item in constraints[:4]:
+                    st.caption(f"- {item}")
+            last_instruction = str(getattr(operator_intent, "last_user_instruction", "") or "").strip()
+            if last_instruction:
+                st.caption(f"Latest: {last_instruction}")
+            pending_summary = str(getattr(operator_intent, "pending_step_summary", "") or "").strip()
+            pending_kind = str(getattr(operator_intent, "pending_step_kind", "") or "").strip()
+            if pending_summary:
+                st.caption(f"Pending Step: {pending_summary}")
+            if pending_kind:
+                st.caption(f"Pending Kind: {pending_kind}")
+
+        st.markdown("---")
         st.subheader("Tracing")
         st.caption(f"Enabled: {Config.TRACE_ENABLED}")
         st.caption(f"Dir: {Config.TRACE_DIR}")
@@ -47,7 +71,22 @@ def display_sidebar() -> None:
             last_trace_id = None
 
         if last_trace_id:
+            st.caption("Current")
             st.code(last_trace_id)
+
+        recent_trace_ids: list[str] = []
+        seen: set[str] = set()
+        for message in reversed(st.session_state.get("messages", [])):
+            trace_id = get_message_trace_id(message)
+            if not trace_id or trace_id in seen:
+                continue
+            seen.add(trace_id)
+            recent_trace_ids.append(trace_id)
+
+        if recent_trace_ids:
+            st.caption("Recent")
+            for trace_id in recent_trace_ids[:12]:
+                st.code(trace_id)
 
         st.markdown("---")
         st.subheader("Autonomy")

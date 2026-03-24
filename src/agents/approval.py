@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
+
+
+REPAIRABLE_COMMAND_TOOLS = {
+    "aws_cli_execute": "aws",
+    "kubectl_execute": "kubectl",
+    "helm_execute": "helm",
+}
+
 
 @dataclass
 class PendingAction:
@@ -119,6 +128,99 @@ def is_batch_intent(decision: str) -> bool:
     """Heuristic to detect user intent to restart all suggested pods at once."""
     text = (decision or "").lower()
     return ("all" in text and ("restart" in text or "do" in text)) or "at once" in text or "batch" in text
+
+
+def is_repairable_command_tool(tool_name: str) -> bool:
+    """Return True when a failed approved command can be syntax-repaired and re-approved."""
+    return tool_name in REPAIRABLE_COMMAND_TOOLS
+
+
+def tool_result_indicates_failure(result: Any) -> bool:
+    """Detect failure-style tool results returned as strings instead of exceptions."""
+    text = str(result or "").strip()
+    if not text:
+        return False
+    return text.startswith("❌") or "\n❌ " in text or " failed (exit=" in text.lower()
+
+
+def normalize_command_for_tool(tool_name: str, command: str) -> str:
+    """Strip any repeated tool binary prefix from a repaired command body."""
+    text = str(command or "").strip()
+    if not text:
+        return ""
+    prefix = REPAIRABLE_COMMAND_TOOLS.get(tool_name)
+    if prefix and text.lower().startswith(prefix + " "):
+        return text[len(prefix) + 1 :].strip()
+    return text
+
+
+def parse_command_repair_response(text: str) -> dict[str, str] | None:
+    """Parse the compact command-repair format emitted by the LLM."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    parsed: dict[str, str] = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parsed[key.strip().lower()] = value.strip()
+
+    status = parsed.get("status", "").lower()
+    if status not in {"repair", "cannot_repair"}:
+        return None
+    return {
+        "status": status,
+        "summary": parsed.get("summary", ""),
+        "command": parsed.get("command", ""),
+        "reason": parsed.get("reason", ""),
+    }
+
+
+def attempt_known_command_repair(tool_name: str, command: str, failure_text: str) -> str | None:
+    """Apply deterministic repairs for common command-shape mistakes before using the LLM."""
+    if tool_name != "aws_cli_execute":
+        return None
+
+    failure = str(failure_text or "")
+    if (
+        "MixedInstancesPolicy.LaunchTemplate" not in failure
+        or "LaunchTemplateId" not in failure
+        or "Version" not in failure
+    ):
+        return None
+
+    match = re.search(r"--mixed-instances-policy\s+'(?P<payload>\{.*\})'", command)
+    if not match:
+        return None
+
+    payload_text = match.group("payload")
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return None
+
+    launch_template = payload.get("LaunchTemplate")
+    if not isinstance(launch_template, dict):
+        return None
+    if "LaunchTemplateSpecification" in launch_template:
+        return None
+    if "LaunchTemplateId" not in launch_template and "Version" not in launch_template:
+        return None
+
+    repaired_launch_template: dict[str, Any] = {
+        "LaunchTemplateSpecification": {
+            "LaunchTemplateId": launch_template.get("LaunchTemplateId"),
+            "Version": launch_template.get("Version", "$Default"),
+        }
+    }
+    if isinstance(launch_template.get("Overrides"), list):
+        repaired_launch_template["Overrides"] = launch_template["Overrides"]
+
+    payload["LaunchTemplate"] = repaired_launch_template
+    repaired_payload = json.dumps(payload, separators=(",", ":"))
+    return command.replace(payload_text, repaired_payload, 1)
 
 
 def format_command_preview(tool_name: str, tool_args: dict) -> str:

@@ -7,7 +7,7 @@ import re
 import streamlit as st
 
 from ..config import Config
-from .session import convert_to_langchain_messages
+from .session import convert_to_langchain_messages, get_message_content, get_message_trace_id
 
 
 def display_chat_messages() -> None:
@@ -22,10 +22,14 @@ def display_chat_messages() -> None:
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
+            content = get_message_content(message)
             if message["role"] == "assistant":
-                _render_message_content(message["content"])
+                _render_message_content(content)
             else:
-                st.markdown(message["content"])
+                st.markdown(content)
+            trace_id = get_message_trace_id(message)
+            if trace_id and Config.TRACE_ENABLED:
+                st.caption(f"Trace ID: `{trace_id}`")
 
 
 _MARKDOWN_STRUCTURED_RE = re.compile(r"(?m)^\s*(#{1,6}\s|[-*]\s|\d+\.\s|>\s|\|.+\|)")
@@ -94,22 +98,37 @@ def _render_message_content(content: str) -> None:
 def process_chat_turn() -> None:
     """Read user prompt, run the agent, and append the assistant response."""
     if prompt := st.chat_input("Ask about cluster health, pods, events, or remediation..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        user_message = {"role": "user", "content": prompt, "trace_id": None}
+        st.session_state.messages.append(user_message)
 
         with st.chat_message("user"):
             st.markdown(prompt)
 
         response = ""
         with st.chat_message("assistant"):
-            with st.spinner("Inspecting cluster state and diagnostics..."):
+            with st.status("Inspecting cluster state and diagnostics...", expanded=False) as status:
+                def update_status(label: str) -> None:
+                    clean_label = str(label or "").strip() or "Inspecting cluster state and diagnostics..."
+                    st.session_state.agent_status_text = clean_label
+                    try:
+                        status.update(label=clean_label, state="running")
+                    except Exception:
+                        pass
+
                 chat_history = convert_to_langchain_messages(st.session_state.messages[:-1])
                 try:
                     response = st.session_state.agent.process_query(
                         user_input=prompt,
                         chat_history=chat_history,
+                        status_callback=update_status,
                     )
                 except Exception as exc:  # noqa: BLE001
                     response = f"Error processing query: {exc}"
+                    update_status("Agent hit an error while processing the request.")
+                try:
+                    status.update(label="Request completed.", state="complete")
+                except Exception:
+                    pass
 
             assistant_content = (response or "").strip()
             if not assistant_content:
@@ -117,10 +136,11 @@ def process_chat_turn() -> None:
             assistant_content = _format_for_markdown(assistant_content)
 
             trace_id = getattr(st.session_state.agent, "last_trace_id", None)
-            if trace_id and Config.TRACE_ENABLED:
-                assistant_content += f"\n\nTrace ID: `{trace_id}`"
+            user_message["trace_id"] = trace_id
 
             _render_message_content(assistant_content)
+            if trace_id and Config.TRACE_ENABLED:
+                st.caption(f"Trace ID: `{trace_id}`")
 
-        st.session_state.messages.append({"role": "assistant", "content": assistant_content})
+        st.session_state.messages.append({"role": "assistant", "content": assistant_content, "trace_id": trace_id})
         st.rerun()

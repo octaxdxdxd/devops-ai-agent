@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..utils.query_intent import QueryIntent
-from .state import IncidentState
+from .state import IncidentState, OperatorIntentState
 
 
 _FOLLOW_UP_MARKERS = (
@@ -215,6 +215,7 @@ def build_turn_plan(
     intent: QueryIntent,
     chat_history: list[Any] | None,
     incident_state: IncidentState,
+    operator_intent_state: OperatorIntentState,
     approval_pending: bool = False,
 ) -> TurnPlan:
     """Derive one structured plan for the current turn."""
@@ -222,9 +223,12 @@ def build_turn_plan(
 
     mode = intent.mode
     focus = _detect_focus(user_input, incident_state)
+    follow_up_action = operator_intent_state.is_following_proposed_plan()
+    if follow_up_action and operator_intent_state.pending_step_focus:
+        focus = operator_intent_state.pending_step_focus
     follow_up = _looks_like_follow_up(user_input)
     mentions_scope = _mentions_existing_scope(user_input, incident_state)
-    continue_existing = bool(incident_state.active and (follow_up or mentions_scope))
+    continue_existing = bool(follow_up_action or (incident_state.active and (follow_up or mentions_scope)))
     reset_existing_context = bool(
         incident_state.active
         and not continue_existing
@@ -244,6 +248,8 @@ def build_turn_plan(
 
     if approval_pending:
         stage = "execute"
+    elif follow_up_action:
+        stage = operator_intent_state.pending_step_stage or "collect"
     elif mode == "direct_read":
         stage = "direct_read"
     elif mode == "command":
@@ -258,8 +264,8 @@ def build_turn_plan(
         stage = "scope"
 
     prefer_fresh_reads = stage == "verify"
-    prefer_cached_reads = continue_existing and not prefer_fresh_reads and mode in {"incident_rca", "general"}
-    allow_broad_discovery = stage == "scope"
+    prefer_cached_reads = (follow_up_action or continue_existing) and not prefer_fresh_reads and mode in {"incident_rca", "general", "command"}
+    allow_broad_discovery = stage == "scope" and not follow_up_action
 
     required_categories = _required_categories_for_focus(
         focus=focus,
@@ -271,6 +277,12 @@ def build_turn_plan(
     notes: list[str] = []
     if continue_existing:
         notes.append("Continue the existing incident instead of restarting cluster-wide discovery.")
+    if follow_up_action:
+        notes.append("Continue with the previously proposed next step instead of restating the issue.")
+        if operator_intent_state.pending_step_kind == "implementation":
+            notes.append("Move from proposal into implementation planning/execution using the minimum required reads.")
+        elif operator_intent_state.pending_step_kind == "prepare":
+            notes.append("Turn the approved next step into concrete commands or patches without re-diagnosing.")
     if known_scope_available and stage != "scope":
         notes.append("Reuse the known namespace/resource scope before calling broad inventory tools.")
     if prefer_cached_reads:
@@ -281,7 +293,6 @@ def build_turn_plan(
         notes.append("Avoid re-listing namespaces/nodes/all pods unless the scope changed or evidence is stale.")
     if required_categories:
         notes.append("Stop and summarize once the required evidence categories are covered.")
-
     return TurnPlan(
         mode=mode,
         stage=stage,
@@ -297,7 +308,12 @@ def build_turn_plan(
     )
 
 
-def render_turn_plan_directive(*, turn_plan: TurnPlan, incident_state: IncidentState) -> str:
+def render_turn_plan_directive(
+    *,
+    turn_plan: TurnPlan,
+    incident_state: IncidentState,
+    operator_intent_state: OperatorIntentState,
+) -> str:
     """Render the plan and prior state into a prompt block."""
     lines = [
         "[Execution plan]",
@@ -314,4 +330,7 @@ def render_turn_plan_directive(*, turn_plan: TurnPlan, incident_state: IncidentS
     state_block = incident_state.render_context_block()
     if state_block:
         lines.append(state_block)
+    operator_block = operator_intent_state.render_context_block()
+    if operator_block:
+        lines.append(operator_block)
     return "\n".join(lines)

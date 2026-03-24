@@ -16,7 +16,7 @@ from ..utils.llm_retry import invoke_with_retries
 from ..utils.response import extract_response_text
 from .approval import ApprovalCoordinator, PendingAction, commands_code_block, format_command_preview
 from .planner import TurnPlan
-from .state import IncidentState, ToolExecutionRecord, ToolLoopOutcome
+from .state import IncidentState, OperatorIntentState, ToolExecutionRecord, ToolLoopOutcome
 
 
 _AWS_ARN_RE = re.compile(r"\barn:aws[a-z-]*:[^\s'\"]+\b", re.IGNORECASE)
@@ -43,6 +43,21 @@ _BROAD_DISCOVERY_TOOLS = {
     "k8s_get_events",
     "k8s_get_crashloop_pods",
 }
+
+
+def _operator_write_guard_message(operator_intent_state: OperatorIntentState, *, tool_name: str) -> str | None:
+    """Block write actions when the operator has explicitly asked for planning-only behavior."""
+    if operator_intent_state.execution_policy == "no_write":
+        return (
+            f"Write action `{tool_name}` blocked by operator intent. "
+            "The user asked for planning/explanation only with no execution."
+        )
+    if operator_intent_state.execution_policy == "prepare_only":
+        return (
+            f"Write action `{tool_name}` blocked by operator intent. "
+            "The user asked to prepare commands/change plans only, not execute them."
+        )
+    return None
 
 
 def _resolve_tool_call(
@@ -534,6 +549,7 @@ def handle_tool_calls(
     approval: ApprovalCoordinator,
     turn_plan: TurnPlan | None = None,
     incident_state: IncidentState | None = None,
+    operator_intent_state: OperatorIntentState | None = None,
     trace_writer: Any = None,
     trace_id: str | None = None,
 ) -> ToolLoopOutcome:
@@ -558,6 +574,7 @@ def handle_tool_calls(
     semantic_signature_counts: dict[str, int] = {}
     execution_records: list[ToolExecutionRecord] = []
     current_response = response
+    operator_intent_state = operator_intent_state or OperatorIntentState()
 
     while iteration < max_iterations:
         iteration += 1
@@ -890,6 +907,37 @@ def handle_tool_calls(
                 continue
 
             if requires_approval:
+                operator_guard = _operator_write_guard_message(operator_intent_state, tool_name=tool_name)
+                if operator_guard is not None:
+                    if tw and trace_id:
+                        tw.emit(
+                            {
+                                "trace_id": trace_id,
+                                "event": "tool.write_blocked_operator_intent",
+                                "tool": tool_name,
+                                "requested_tool": original_name,
+                                "policy": operator_intent_state.execution_policy,
+                            }
+                        )
+                    tool_messages.append(ToolMessage(content=operator_guard, tool_call_id=tool_call_id))
+                    execution_records.append(
+                        ToolExecutionRecord(
+                            tool_name=tool_name,
+                            requested_tool=original_name,
+                            args=tool_args,
+                            semantic_key=semantic_signature,
+                            success=False,
+                            summary=operator_guard,
+                            capability=tool_intent.capability if tool_intent is not None else "",
+                            evidence_categories=_evidence_categories_for_call(
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                intent=tool_intent,
+                            ),
+                        )
+                    )
+                    continue
+
                 evidence_corpus = _build_evidence_corpus(messages)
                 pending_actions: list[PendingAction] = []
                 blocked_messages: list[ToolMessage] = []
