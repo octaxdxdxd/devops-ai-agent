@@ -477,6 +477,21 @@ def k8s_list_services(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
 
 
 @tool
+def k8s_list_secrets(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
+    """List Kubernetes secrets in a namespace (names/types only)."""
+    namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
+    if namespace.lower() != "all":
+        err = _validate_namespace(namespace)
+        if err:
+            return err
+    return _run_readonly(
+        ["get", "secrets", "-A" if namespace.lower() == "all" else "-n", namespace, "-o", "wide"]
+        if namespace.lower() != "all"
+        else ["get", "secrets", "-A", "-o", "wide"]
+    )
+
+
+@tool
 def k8s_list_ingresses(namespace: str = Config.K8S_DEFAULT_NAMESPACE) -> str:
     """List ingress resources."""
     namespace = (namespace or Config.K8S_DEFAULT_NAMESPACE).strip() or Config.K8S_DEFAULT_NAMESPACE
@@ -843,6 +858,7 @@ def get_k8s_read_tools() -> list:
         k8s_list_statefulsets,
         k8s_list_daemonsets,
         k8s_list_services,
+        k8s_list_secrets,
         k8s_list_ingresses,
         k8s_list_hpa,
         k8s_get_events,

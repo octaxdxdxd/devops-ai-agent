@@ -11,6 +11,7 @@ import shlex
 from langchain_core.tools import tool
 
 from ..config import Config
+from ..utils.command_intent import classify_command_intent
 from .k8s_common import (
     ensure_kubectl_installed,
     is_cluster_scoped_kind,
@@ -44,25 +45,6 @@ _OPTIONS_WITH_VALUE = {
 }
 _ALL_NAMESPACE_FLAGS = {"-A", "--all-namespaces"}
 
-_MUTATING_KUBECTL_VERBS = {
-    "apply",
-    "create",
-    "delete",
-    "edit",
-    "patch",
-    "replace",
-    "scale",
-    "rollout",
-    "set",
-    "cordon",
-    "uncordon",
-    "drain",
-    "taint",
-    "label",
-    "annotate",
-    "autoscale",
-    "expose",
-}
 _TARGET_ONLY_VERBS = {"exec", "logs", "attach", "port-forward"}
 _SKIP_AUTONAMESPACE_VERBS = {
     "cp",
@@ -108,34 +90,6 @@ def _normalize_kubectl_command(command: str) -> tuple[list[str] | None, str | No
         return None, "❌ Invalid kubectl command: this looks like an AWS CLI command. Use `aws_cli_readonly` or `aws_cli_execute`."
 
     return tokens, None
-
-
-def _extract_verb(tokens: list[str]) -> str:
-    i = 0
-    while i < len(tokens):
-        token = str(tokens[i]).strip()
-        if not token:
-            i += 1
-            continue
-
-        if token == "--":
-            if i + 1 < len(tokens):
-                return str(tokens[i + 1]).strip().lower()
-            return ""
-
-        if token.startswith("-"):
-            if token in _OPTIONS_WITH_VALUE:
-                i += 2
-                continue
-            if "=" in token:
-                i += 1
-                continue
-            i += 1
-            continue
-
-        return token.lower()
-
-    return ""
 
 
 def _next_positional_index(tokens: list[str], start: int = 0) -> int | None:
@@ -273,6 +227,24 @@ def _build_kubectl_args(tokens: list[str]) -> list[str]:
     return [*kubectl_base_args(), *tokens]
 
 
+def _intent_message(intent, *, readonly: bool) -> str | None:
+    if intent.is_blocked:
+        return f"❌ {intent.reason}"
+    if intent.is_sensitive_read:
+        return f"❌ {intent.reason}"
+    if readonly and intent.capability == "write":
+        return (
+            f"❌ kubectl verb `{intent.verb or 'unknown'}` is mutating and is blocked in kubectl_readonly. "
+            "Use `kubectl_execute` (approval required)."
+        )
+    if not readonly and intent.capability == "safe_read":
+        return (
+            f"❌ kubectl verb `{intent.verb or 'unknown'}` is read-only. "
+            "Use `kubectl_readonly` instead."
+        )
+    return None
+
+
 def _command_result(command_args: list[str], *, reason: str = "") -> str:
     command_text = shlex.join(command_args)
     code, out, err = run_kubectl(command_args)
@@ -300,7 +272,8 @@ def kubectl_readonly(command: str) -> str:
     - describe pod my-pod -n prod
     - logs my-pod -n prod --tail 200
 
-    When K8S_CLI_ALLOW_ALL_READ=1, non-mutating verb allowlist checks are bypassed.
+    In the default powerful posture, secret extraction reads are allowed here and
+    exec-class operations are expected to route to `kubectl_execute`.
     """
     if not ensure_kubectl_installed():
         return kubectl_not_found_msg()
@@ -310,13 +283,12 @@ def kubectl_readonly(command: str) -> str:
         return err
 
     assert tokens is not None
-    verb = _extract_verb(tokens)
-    if verb in _MUTATING_KUBECTL_VERBS:
-        return (
-            f"❌ kubectl verb `{verb}` is mutating and is blocked in kubectl_readonly. "
-            "Use `kubectl_execute` (approval required)."
-        )
+    intent = classify_command_intent("kubectl_readonly", shlex.join(tokens))
+    intent_err = _intent_message(intent, readonly=True)
+    if intent_err:
+        return intent_err
 
+    verb = intent.verb
     readonly_verbs = _csv_to_set(Config.K8S_CLI_READONLY_VERBS)
     if not Config.K8S_CLI_ALLOW_ALL_READ and verb not in readonly_verbs:
         return (
@@ -333,6 +305,8 @@ def kubectl_execute(command: str, reason: str = "") -> str:
     """Run any kubectl command (mutating-capable).
 
     IMPORTANT: This tool can change cluster state and should require explicit approval.
+    Read-only and sensitive-read commands are rejected here to keep generic execute
+    limited to known mutating operations.
 
     Examples:
     - apply -f deployment.yaml
@@ -349,7 +323,12 @@ def kubectl_execute(command: str, reason: str = "") -> str:
         return err
 
     assert tokens is not None
-    verb = _extract_verb(tokens)
+    intent = classify_command_intent("kubectl_execute", shlex.join(tokens))
+    intent_err = _intent_message(intent, readonly=False)
+    if intent_err:
+        return intent_err
+
+    verb = intent.verb
     write_verbs = _csv_to_set(Config.K8S_CLI_WRITE_ALLOWLIST_VERBS)
     if not Config.K8S_CLI_ALLOW_ALL_WRITE and verb not in write_verbs:
         return (

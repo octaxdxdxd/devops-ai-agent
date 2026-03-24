@@ -22,6 +22,8 @@ class OpenRouterModel:
         self.llm = ChatOpenAI(
             model=self.model_name,
             temperature=Config.TEMPERATURE,
+            max_tokens=Config.LLM_MAX_OUTPUT_TOKENS,
+            request_timeout=Config.LLM_REQUEST_TIMEOUT_SEC,
             openai_api_key=Config.OPENROUTER_API_KEY,
             openai_api_base=Config.OPENROUTER_BASE_URL,
             default_headers=default_headers or None,

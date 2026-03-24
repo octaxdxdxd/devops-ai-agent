@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from ..autonomy import SimpleAutonomyEngine
@@ -9,10 +11,28 @@ from ..config import Config
 from ..models import get_model
 from ..tools import get_all_tools
 from ..utils.llm_retry import invoke_with_retries
+from ..utils.query_intent import QueryIntent, classify_query_intent
 from ..utils.response import extract_response_text
 from ..utils.tracing import JsonlTraceWriter, TraceSpan, new_trace_id, trace_config_from_env
-from .approval import ApprovalCoordinator, commands_code_block, format_command_preview
+from .planner import build_turn_plan, render_turn_plan_directive
+from .approval import (
+    ApprovalCoordinator,
+    attempt_known_command_repair,
+    commands_code_block,
+    format_command_preview,
+    is_repairable_command_tool,
+    normalize_command_for_tool,
+    parse_command_repair_response,
+    tool_result_indicates_failure,
+)
 from .autonomy_helpers import format_autonomous_scan, notification_was_sent
+from .state import (
+    IncidentState,
+    OperatorIntentState,
+    apply_turn_outcome_to_state,
+    register_operator_follow_up,
+    update_operator_intent_state,
+)
 from .tool_loop import handle_tool_calls
 
 
@@ -33,10 +53,12 @@ class LogAnalyzerAgent:
 
         self.tools = get_all_tools()
         self.tools_by_name = {tool.name: tool for tool in self.tools}
-        self.llm_with_tools = self.model.get_llm_with_tools(self.tools)
 
         self._approval = ApprovalCoordinator()
         self._last_announced_incident_fingerprint: str | None = None
+        self._incident_state = IncidentState()
+        self._operator_intent_state = OperatorIntentState()
+        self._turn_index = 0
 
         self._autonomy = SimpleAutonomyEngine() if Config.AUTONOMY_ENABLED else None
         self.last_autonomous_scan: dict | None = None
@@ -58,15 +80,30 @@ class LogAnalyzerAgent:
             ]
         )
 
-    def process_query(self, user_input: str, chat_history: list | None = None) -> str:
+    def process_query(
+        self,
+        user_input: str,
+        chat_history: list | None = None,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> str:
         """Process one user query and return the assistant response."""
         if chat_history is None:
             chat_history = []
-        prompt_input = self._prepare_prompt_input(user_input=user_input, chat_history=chat_history)
+
+        self._turn_index += 1
+        turn_index = self._turn_index
 
         trace_id = new_trace_id()
         self.last_trace_id = trace_id
         tw = self._trace_writer
+        turn_ended = False
+
+        def end_turn(final_text: str) -> None:
+            nonlocal turn_ended
+            if not tw or turn_ended:
+                return
+            tw.emit({"trace_id": trace_id, "event": "turn.end", "final_len": len(final_text or "")})
+            turn_ended = True
 
         if tw:
             tw.emit(
@@ -81,16 +118,99 @@ class LogAnalyzerAgent:
             )
 
         try:
-            alert_prefix = self._build_alert_prefix()
+            self._notify_status(status_callback, "Reviewing the request and current operating context...")
+            update_operator_intent_state(
+                operator_intent_state=self._operator_intent_state,
+                user_input=user_input,
+                turn_index=turn_index,
+                incident_state=self._incident_state,
+                approval_pending=self._approval.has_pending(),
+            )
 
-            approval_response = self._handle_pending_approval(user_input, alert_prefix, trace_id)
+            if Config.AUTONOMY_ENABLED and Config.AUTONOMY_SCAN_ON_USER_TURN:
+                self._notify_status(status_callback, "Checking recent cluster health signals in the background...")
+            alert_prefix = self._build_alert_prefix(self._operator_intent_state)
+
+            approval_response = self._handle_pending_approval(
+                user_input,
+                alert_prefix,
+                trace_id,
+                status_callback=status_callback,
+            )
             if approval_response is not None:
+                end_turn(approval_response)
                 return approval_response
+
+            intent = classify_query_intent(user_input)
+            self._notify_status(status_callback, "Planning the next step for this turn...")
+            turn_plan = build_turn_plan(
+                user_input=user_input,
+                intent=intent,
+                chat_history=chat_history,
+                incident_state=self._incident_state,
+                operator_intent_state=self._operator_intent_state,
+                approval_pending=self._approval.has_pending(),
+            )
+            if turn_plan.reset_existing_context:
+                self._incident_state.clear()
+            if tw:
+                tw.emit(
+                    {
+                        "trace_id": trace_id,
+                        "event": "turn.plan",
+                        "mode": turn_plan.mode,
+                        "stage": turn_plan.stage,
+                        "focus": turn_plan.focus,
+                        "continue_existing": turn_plan.continue_existing,
+                        "allow_broad_discovery": turn_plan.allow_broad_discovery,
+                        "prefer_cached_reads": turn_plan.prefer_cached_reads,
+                        "prefer_fresh_reads": turn_plan.prefer_fresh_reads,
+                        "objectives": [
+                            {
+                                "key": objective.key,
+                                "focus": objective.focus,
+                                "required_categories": list(objective.required_categories),
+                            }
+                            for objective in getattr(turn_plan, "objectives", ())[:6]
+                        ],
+                        "operator_mode": self._operator_intent_state.mode,
+                        "execution_policy": self._operator_intent_state.execution_policy,
+                    }
+                )
+            prompt_input = self._prepare_prompt_input(
+                user_input=user_input,
+                chat_history=chat_history,
+                intent_mode=intent.mode,
+                turn_plan=turn_plan,
+                incident_state=self._incident_state,
+                operator_intent_state=self._operator_intent_state,
+            )
+
+            selected_tools = self._select_tools_for_turn(
+                intent=intent,
+                user_input=user_input,
+                turn_plan=turn_plan,
+                operator_intent_state=self._operator_intent_state,
+            )
+            self._notify_status(status_callback, "Selecting the most relevant tools for this step...")
+            selected_tools_by_name = {tool.name: tool for tool in selected_tools}
+            llm_with_tools = self.model.get_llm_with_tools(selected_tools)
+            if tw:
+                tw.emit(
+                    {
+                        "trace_id": trace_id,
+                        "event": "turn.tools_selected",
+                        "count": len(selected_tools),
+                        "mode": intent.mode,
+                        "tools": [tool.name for tool in selected_tools],
+                    }
+                )
 
             messages = self.prompt.format_messages(chat_history=chat_history, input=prompt_input)
 
+            self._notify_status(status_callback, "Asking the model to choose the next actions...")
             response = invoke_with_retries(
-                self.llm_with_tools,
+                llm_with_tools,
                 messages,
                 trace_writer=tw,
                 trace_id=trace_id,
@@ -98,55 +218,116 @@ class LogAnalyzerAgent:
             )
 
             if hasattr(response, "tool_calls") and response.tool_calls:
-                final = handle_tool_calls(
+                self._notify_status(status_callback, "Running diagnostics and gathering evidence...")
+                outcome = handle_tool_calls(
                     response=response,
                     user_input=prompt_input,
                     chat_history=chat_history,
                     prompt=self.prompt,
                     llm=self.llm,
-                    llm_with_tools=self.llm_with_tools,
-                    tools=self.tools,
-                    tools_by_name=self.tools_by_name,
+                    llm_with_tools=llm_with_tools,
+                    tools=selected_tools,
+                    tools_by_name=selected_tools_by_name,
                     approval=self._approval,
+                    turn_plan=turn_plan,
+                    incident_state=self._incident_state,
+                    operator_intent_state=self._operator_intent_state,
                     trace_writer=tw,
                     trace_id=trace_id,
+                    status_callback=status_callback,
                 )
-                if tw:
-                    tw.emit({"trace_id": trace_id, "event": "turn.end", "final_len": len(final)})
+                final = outcome.final_text
                 if not (final or "").strip():
                     trace_hint = f" Trace ID: {trace_id}" if (tw and trace_id) else ""
-                    return (
+                    final = (
                         "I got an empty response from the model after tool execution. "
                         f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
                         + trace_hint
                     )
-                return alert_prefix + final
+                self._incident_state = apply_turn_outcome_to_state(
+                    incident_state=self._incident_state,
+                    user_input=user_input,
+                    intent_mode=intent.mode,
+                    turn_plan=turn_plan,
+                    outcome=outcome,
+                    final_text=final,
+                    turn_index=turn_index,
+                )
+                register_operator_follow_up(
+                    operator_intent_state=self._operator_intent_state,
+                    final_text=final,
+                    turn_plan=turn_plan,
+                    approval_pending=self._approval.has_pending(),
+                )
+                final = alert_prefix + final
+                end_turn(final)
+                return final
 
+            self._notify_status(status_callback, "Drafting the response...")
             final = extract_response_text(response)
-            if tw:
-                tw.emit({"trace_id": trace_id, "event": "turn.end", "final_len": len(final)})
             if not (final or "").strip():
                 trace_hint = f" Trace ID: {trace_id}" if (tw and trace_id) else ""
-                return (
+                final = (
                     "I got an empty response from the model (no text content). "
                     f"Provider={Config.LLM_PROVIDER}, Model={Config.get_active_model_name()}."
                     + trace_hint
                 )
-            return alert_prefix + final
+            self._incident_state = apply_turn_outcome_to_state(
+                incident_state=self._incident_state,
+                user_input=user_input,
+                intent_mode=intent.mode,
+                turn_plan=turn_plan,
+                outcome=None,
+                final_text=final,
+                turn_index=turn_index,
+            )
+            register_operator_follow_up(
+                operator_intent_state=self._operator_intent_state,
+                final_text=final,
+                turn_plan=turn_plan,
+                approval_pending=self._approval.has_pending(),
+            )
+            final = alert_prefix + final
+            end_turn(final)
+            return final
         except Exception as exc:
             if tw:
                 tw.emit({"trace_id": trace_id, "event": "turn.error", "error": str(exc)})
-            return f"Error processing query: {exc}"
+            error_text = f"Error processing query: {exc}"
+            end_turn(error_text)
+            return error_text
+        finally:
+            if not turn_ended:
+                end_turn("")
 
     @staticmethod
-    def _prepare_prompt_input(*, user_input: str, chat_history: list) -> str:
+    def _prepare_prompt_input(
+        *,
+        user_input: str,
+        chat_history: list,
+        intent_mode: str,
+        turn_plan: Any,
+        incident_state: IncidentState,
+        operator_intent_state: OperatorIntentState,
+    ) -> str:
         """Augment prompt input with execution behavior hints when useful."""
         directives: list[str] = []
-        if Config.DEEP_INITIAL_INVESTIGATION and not chat_history:
+        if Config.DEEP_INITIAL_INVESTIGATION and not chat_history and intent_mode == "incident_rca":
             directives.append(
                 "Perform a comprehensive read-only investigation before answering. "
                 "Use multiple relevant diagnostic tools in this turn, avoid shallow interim summaries, "
                 "and provide one consolidated diagnosis with clear remediation steps."
+            )
+        elif any(aspect in set(getattr(turn_plan, "requested_aspects", ()) or ()) for aspect in {"inventory", "capacity", "cost", "optimization", "explanation"}):
+            directives.append(
+                "This is a direct analytical or inventory question. Continue read-only investigation in this turn until you can answer the user's request directly."
+            )
+            directives.append(
+                "Do not ask for permission to perform additional read-only checks. Only ask for approval when a mutating action is ready."
+            )
+        if len(tuple(getattr(turn_plan, "objectives", ()) or ())) > 1:
+            directives.append(
+                "This request has multiple linked objectives. Complete all of them in this same turn before you stop."
             )
 
         decision = (user_input or "").strip().lower()
@@ -178,11 +359,150 @@ class LogAnalyzerAgent:
                     "If multiple write steps are required, emit all required write tool calls in this single response."
                 )
 
-        if not directives:
-            return user_input
-        return f"{user_input}\n\n[Agent directive: {' '.join(directives)}]"
+        # If user already said they don't know/missing details, do not keep asking the same question.
+        combined_user_text = " ".join(
+            [user_input]
+            + [
+                str(getattr(msg, "content", ""))
+                for msg in chat_history
+                if str(getattr(msg, "type", "")).lower() == "human"
+            ]
+        ).lower()
+        user_unknown_markers = (
+            "i don't know",
+            "i dont know",
+            "no idea",
+            "not sure",
+            "i'm not sure",
+            "im not sure",
+            "stop asking",
+            "i have no values",
+            "i have no values.yaml",
+            "i dont have the secret",
+            "i don't have the secret",
+            "no backup",
+        )
+        if any(marker in combined_user_text for marker in user_unknown_markers):
+            directives.append(
+                "The user already said they do not know the missing details. "
+                "Do NOT repeat the same clarifying question. Continue autonomous investigation using read-only tools and derive/recover evidence directly where possible."
+            )
+            directives.append(
+                "Prioritize alternative evidence paths before asking anything else: "
+                "k8s_list_secrets, k8s_get_resource_yaml, k8s_describe_pod, k8s_get_pod_logs, kubectl_readonly, helm_readonly, aws_cli_readonly."
+            )
 
-    def _build_alert_prefix(self) -> str:
+        if "stop asking" in combined_user_text:
+            directives.append(
+                "Do not ask clarifying questions in this turn unless there is an absolute hard blocker after exhausting all read-only evidence paths."
+            )
+
+        if operator_intent_state.is_following_proposed_plan():
+            pending_kind = str(getattr(operator_intent_state, "pending_step_kind", "") or "")
+            directives.append(
+                "The user asked you to continue with the previously proposed next step. "
+                "Do not restate the issue summary unless new evidence changes it."
+            )
+            if operator_intent_state.pending_step_summary:
+                directives.append(f"Continue this next step: {operator_intent_state.pending_step_summary}")
+            if pending_kind == "implementation":
+                directives.append(
+                    "This follow-up is an implementation step. Use the minimum necessary read-only checks to construct exact changes, "
+                    "then propose or queue the concrete write action for approval instead of repeating diagnosis."
+                )
+            elif pending_kind == "prepare":
+                directives.append(
+                    "This follow-up is a preparation step. Turn the proposed fix into concrete commands, patches, or an approval-ready plan."
+                )
+            elif pending_kind == "investigate":
+                directives.append(
+                    "This follow-up is an approved investigation step. Run the requested diagnostic reads now and summarize only the new findings."
+                )
+                directives.append(
+                    "Do not stop to ask permission for more read-only investigation if it is still needed to fully answer the request."
+                )
+
+        plan_block = render_turn_plan_directive(
+            turn_plan=turn_plan,
+            incident_state=incident_state,
+            operator_intent_state=operator_intent_state,
+        )
+        extra_blocks: list[str] = []
+        if directives:
+            extra_blocks.append("[Agent directive]\n" + "\n".join(f"- {item}" for item in directives))
+        if plan_block:
+            extra_blocks.append(plan_block)
+
+        if not extra_blocks:
+            return user_input
+        return f"{user_input}\n\n" + "\n\n".join(extra_blocks)
+
+    def _select_tools_for_turn(
+        self,
+        *,
+        intent: QueryIntent,
+        user_input: str,
+        turn_plan: Any,
+        operator_intent_state: OperatorIntentState,
+    ) -> list[Any]:
+        """Choose a tool subset to reduce prompt cost and off-target tool drift."""
+        if not Config.AGENT_ENABLE_INTENT_TOOL_FILTER:
+            return self.tools
+
+        selected_names = set(getattr(turn_plan, "preferred_tools", ()) or ())
+        selected_names.update({"kubectl_readonly", "helm_readonly", "aws_cli_readonly"})
+
+        if getattr(turn_plan, "stage", "") == "scope":
+            selected_names.update({"k8s_list_namespaces", "k8s_get_events"})
+        if getattr(turn_plan, "allow_broad_discovery", False):
+            selected_names.update({"k8s_list_pods", "k8s_get_events"})
+        if getattr(turn_plan, "focus", "") == "service":
+            selected_names.update({"k8s_list_services", "k8s_list_ingresses"})
+        elif getattr(turn_plan, "focus", "") == "node":
+            selected_names.update({"k8s_list_nodes", "k8s_top_nodes", "k8s_describe_node"})
+        elif getattr(turn_plan, "focus", "") == "workload":
+            selected_names.update(
+                {
+                    "k8s_list_deployments",
+                    "k8s_list_statefulsets",
+                    "k8s_list_daemonsets",
+                    "k8s_list_pods",
+                }
+            )
+        elif getattr(turn_plan, "focus", "") == "storage":
+            selected_names.update({"k8s_get_pvcs", "k8s_list_pvs"})
+        elif getattr(turn_plan, "focus", "") == "aws":
+            selected_names.update({"aws_cli_readonly", "k8s_list_nodes"})
+
+        if (
+            intent.mode == "command"
+            or getattr(turn_plan, "stage", "") == "execute"
+            or (
+                operator_intent_state.is_following_proposed_plan()
+                and getattr(turn_plan, "stage", "") in {"command", "execute"}
+            )
+        ):
+            selected_names.update(
+                {
+                    "kubectl_execute",
+                    "helm_execute",
+                    "aws_cli_execute",
+                    "restart_kubernetes_pod",
+                    "restart_kubernetes_pods_batch",
+                    "scale_kubernetes_deployment",
+                    "scale_kubernetes_statefulset",
+                    "scale_kubernetes_workloads_batch",
+                    "rollout_restart_kubernetes_deployment",
+                    "rollout_restart_kubernetes_statefulset",
+                    "rollout_restart_kubernetes_daemonset",
+                    "rollout_restart_kubernetes_workloads_batch",
+                }
+            )
+
+        selected = [tool for tool in self.tools if tool.name in selected_names]
+        return selected or self.tools
+
+    def _build_alert_prefix(self, operator_intent_state: OperatorIntentState) -> str:
         if self._autonomy is None or not Config.AUTONOMY_SCAN_ON_USER_TURN or self._approval.has_pending():
             return ""
 
@@ -197,14 +517,24 @@ class LogAnalyzerAgent:
 
         should_show_banner = notification_was_sent(notifications)
         if should_show_banner and fingerprint and fingerprint != self._last_announced_incident_fingerprint:
-            prefix = (
-                "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
-                f"Severity: {incident.get('severity', 'unknown')} | "
-                f"Confidence: {incident.get('confidence_score', 0)}/100 | "
-                f"Impact: {incident.get('impact_score', 0)}/100\n"
-                f"Summary: {incident.get('issue_summary', '')}\n"
-                f"Notification result: {notifications}\n\n"
-            )
+            if operator_intent_state.is_following_proposed_plan():
+                prefix = (
+                    "Background context: autonomous monitoring still sees an active incident.\n"
+                    f"Severity: {incident.get('severity', 'unknown')} | "
+                    f"Confidence: {incident.get('confidence_score', 0)}/100 | "
+                    f"Impact: {incident.get('impact_score', 0)}/100\n"
+                    f"Summary: {incident.get('issue_summary', '')}\n"
+                    "Use this as context only. Prioritize continuing the user's requested next step over repeating the diagnosis.\n\n"
+                )
+            else:
+                prefix = (
+                    "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
+                    f"Severity: {incident.get('severity', 'unknown')} | "
+                    f"Confidence: {incident.get('confidence_score', 0)}/100 | "
+                    f"Impact: {incident.get('impact_score', 0)}/100\n"
+                    f"Summary: {incident.get('issue_summary', '')}\n"
+                    f"Notification result: {notifications}\n\n"
+                )
         else:
             prefix = ""
 
@@ -212,7 +542,109 @@ class LogAnalyzerAgent:
             self._last_announced_incident_fingerprint = fingerprint
         return prefix
 
-    def _handle_pending_approval(self, user_input: str, alert_prefix: str, trace_id: str) -> str | None:
+    @staticmethod
+    def _notify_status(status_callback: Callable[[str], None] | None, text: str) -> None:
+        """Best-effort UI status updates without coupling the agent to Streamlit."""
+        if not callable(status_callback):
+            return
+        try:
+            status_callback(text)
+        except Exception:
+            return
+
+    def _propose_repaired_command(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        failure_text: str,
+        trace_id: str,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Generate a corrected command body for a failed approved execute tool."""
+        if not is_repairable_command_tool(tool_name):
+            return None, ""
+
+        original_command = str(tool_args.get("command") or "").strip()
+        if not original_command:
+            return None, ""
+
+        self._notify_status(
+            status_callback,
+            "Approved command failed. Analyzing the error and drafting a corrected command...",
+        )
+
+        repaired = attempt_known_command_repair(tool_name, original_command, failure_text)
+        if repaired and repaired != original_command:
+            return (
+                {**tool_args, "command": repaired},
+                "I corrected the command structure to match the API schema reported in the error.",
+            )
+
+        command_prefix = {
+            "aws_cli_execute": "aws",
+            "kubectl_execute": "kubectl",
+            "helm_execute": "helm",
+        }.get(tool_name, "command")
+        reason = str(tool_args.get("reason") or "").strip()
+
+        repair_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    (
+                        "You repair failed infrastructure CLI commands after an approved write action.\n"
+                        "Only fix mistakes directly evidenced by the failure output.\n"
+                        "Do not broaden scope, change the target resource, or add extra operations.\n"
+                        f"For `{tool_name}`, return only the command body after `{command_prefix} `, not the binary itself.\n"
+                        "If you cannot confidently repair it, say so.\n"
+                        "Return exactly four lines:\n"
+                        "STATUS: repair|cannot_repair\n"
+                        "SUMMARY: <one short sentence>\n"
+                        "COMMAND: <single-line corrected command body or blank>\n"
+                        "REASON: <short explanation>\n"
+                    ),
+                ),
+                (
+                    "user",
+                    (
+                        f"Tool: {tool_name}\n"
+                        f"Command prefix: {command_prefix}\n"
+                        f"Original command body: {original_command}\n"
+                        f"Operator reason: {reason or '(none provided)'}\n"
+                        f"Failure output:\n{failure_text}"
+                    ),
+                ),
+            ]
+        )
+
+        repair_messages = repair_prompt.format_messages()
+        repair_response = invoke_with_retries(
+            self.llm,
+            repair_messages,
+            trace_writer=self._trace_writer,
+            trace_id=trace_id,
+            event="llm.invoke.command_repair",
+        )
+        parsed = parse_command_repair_response(extract_response_text(repair_response))
+        if not parsed or parsed.get("status") != "repair":
+            return None, ""
+
+        repaired_command = normalize_command_for_tool(tool_name, parsed.get("command", ""))
+        if not repaired_command or repaired_command == original_command:
+            return None, ""
+
+        summary = parsed.get("summary") or parsed.get("reason") or "I found a likely correction."
+        return {**tool_args, "command": repaired_command}, summary
+
+    def _handle_pending_approval(
+        self,
+        user_input: str,
+        alert_prefix: str,
+        trace_id: str,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> str | None:
         pending_batch = list(self._approval.pending_actions)
         pending = self._approval.pending_action
         if not pending_batch and pending is None:
@@ -231,6 +663,7 @@ class LogAnalyzerAgent:
             cmd_block = commands_code_block(cmd_preview)
 
             if decision in {"yes", "y", "approve", "proceed", "do it", "run it", "ok"} or decision.startswith("approve "):
+                self._notify_status(status_callback, f"Executing {len(pending_batch)} approved write action(s)...")
                 actions = list(pending_batch)
                 self._approval.pending_actions = []
                 sections: list[str] = []
@@ -243,6 +676,18 @@ class LogAnalyzerAgent:
                             tw.emit({"trace_id": trace_id, "event": "approval.accept", "tool": tool.name, "args": args, "batch_index": idx, "batch_size": len(actions)})
                         with TraceSpan(tw, trace_id, "tool.invoke", {"tool": getattr(tool, "name", "<unknown>"), "args": args, "batch_index": idx, "batch_size": len(actions)}) if tw else _NullContext():
                             result = tool.invoke(args)
+                        if tool_result_indicates_failure(result):
+                            failures += 1
+                            if tw:
+                                tw.emit(
+                                    {
+                                        "trace_id": trace_id,
+                                        "event": "approval.exec_result_failure",
+                                        "tool": tool.name,
+                                        "batch_index": idx,
+                                        "batch_size": len(actions),
+                                    }
+                                )
                         sections.append(f"[{idx}/{len(actions)}] `{tool.name}`\n{result}")
                     except Exception as exc:
                         failures += 1
@@ -298,10 +743,45 @@ class LogAnalyzerAgent:
             cmd_block = commands_code_block(cmd_preview)
             self._approval.pending_action = None
             try:
+                self._notify_status(status_callback, f"Executing approved command via `{tool.name}`...")
                 if tw:
                     tw.emit({"trace_id": trace_id, "event": "approval.accept", "tool": tool.name, "args": args})
                 with TraceSpan(tw, trace_id, "tool.invoke", {"tool": getattr(tool, "name", "<unknown>"), "args": args}) if tw else _NullContext():
                     result = tool.invoke(args)
+                if tool_result_indicates_failure(result):
+                    if tw:
+                        tw.emit({"trace_id": trace_id, "event": "approval.exec_result_failure", "tool": tool.name, "args": args})
+                    repaired_args, repair_summary = self._propose_repaired_command(
+                        tool_name=tool.name,
+                        tool_args=args,
+                        failure_text=str(result),
+                        trace_id=trace_id,
+                        status_callback=status_callback,
+                    )
+                    if repaired_args is not None:
+                        self._approval.set_pending_action(tool, repaired_args)
+                        repaired_preview = commands_code_block(format_command_preview(tool.name, repaired_args))
+                        self._notify_status(status_callback, "Corrected command prepared. Waiting for fresh approval.")
+                        if tw:
+                            tw.emit(
+                                {
+                                    "trace_id": trace_id,
+                                    "event": "approval.repair_proposed",
+                                    "tool": tool.name,
+                                    "original_args": args,
+                                    "repaired_args": repaired_args,
+                                }
+                            )
+                        return (
+                            alert_prefix
+                            + "The approved command failed, so I analyzed the error and prepared a corrected command.\n\n"
+                            + f"Original command(s):\n{cmd_block}\n\n"
+                            + f"Failure details:\n```text\n{str(result).strip()}\n```\n\n"
+                            + (f"Likely fix: {repair_summary}\n\n" if repair_summary else "")
+                            + "Corrected command(s):\n"
+                            + f"{repaired_preview}\n\n"
+                            + "This still requires fresh approval. Reply `yes` to approve or `no` to cancel."
+                        )
                 return (
                     alert_prefix
                     + "Write command(s) requested:\n"
@@ -312,6 +792,38 @@ class LogAnalyzerAgent:
             except Exception as exc:
                 if tw:
                     tw.emit({"trace_id": trace_id, "event": "approval.exec_error", "tool": tool.name, "error": str(exc)})
+                repaired_args, repair_summary = self._propose_repaired_command(
+                    tool_name=tool.name,
+                    tool_args=args,
+                    failure_text=str(exc),
+                    trace_id=trace_id,
+                    status_callback=status_callback,
+                )
+                if repaired_args is not None:
+                    self._approval.set_pending_action(tool, repaired_args)
+                    repaired_preview = commands_code_block(format_command_preview(tool.name, repaired_args))
+                    self._notify_status(status_callback, "Corrected command prepared. Waiting for fresh approval.")
+                    if tw:
+                        tw.emit(
+                            {
+                                "trace_id": trace_id,
+                                "event": "approval.repair_proposed",
+                                "tool": tool.name,
+                                "original_args": args,
+                                "repaired_args": repaired_args,
+                                "source": "exception",
+                            }
+                        )
+                    return (
+                        alert_prefix
+                        + "The approved command failed, so I analyzed the error and prepared a corrected command.\n\n"
+                        + f"Original command(s):\n{cmd_block}\n\n"
+                        + f"Failure details:\n```text\n{exc}\n```\n\n"
+                        + (f"Likely fix: {repair_summary}\n\n" if repair_summary else "")
+                        + "Corrected command(s):\n"
+                        + f"{repaired_preview}\n\n"
+                        + "This still requires fresh approval. Reply `yes` to approve or `no` to cancel."
+                    )
                 return f"Approved, but execution failed: {exc}"
 
         if decision in {"no", "n", "cancel", "stop"}:
@@ -354,3 +866,11 @@ class LogAnalyzerAgent:
     def clear_history(self) -> None:
         """Clear any pending action state."""
         self._approval.clear()
+        self._incident_state.clear()
+        self._operator_intent_state.clear()
+        self._last_announced_incident_fingerprint = None
+        self.last_trace_id = None
+
+    @property
+    def operator_intent_state(self) -> OperatorIntentState:
+        return self._operator_intent_state
