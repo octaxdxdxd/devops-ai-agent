@@ -170,9 +170,9 @@ class AgentSelectionTests(unittest.TestCase):
         intent = classify_query_intent("list all pvcs in my cluster")
         self.assertEqual(intent.mode, "general")
 
-    def test_natural_language_restart_is_treated_as_command(self) -> None:
+    def test_natural_language_restart_no_longer_forces_command_mode(self) -> None:
         intent = classify_query_intent("restart gitlab webservice pod")
-        self.assertEqual(intent.mode, "command")
+        self.assertEqual(intent.mode, "general")
 
     def test_incident_tool_selection_prefers_read_diagnostics_by_default(self) -> None:
         dummy_agent = type(

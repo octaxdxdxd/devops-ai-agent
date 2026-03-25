@@ -9,8 +9,9 @@ from src.agents.state import IncidentState, OperatorIntentState, ToolExecutionRe
 from src.agents.tool_loop import (
     _missing_requested_aspects,
     _plan_has_enough_evidence,
-    _response_requests_readonly_confirmation,
     _semantic_tool_signature,
+    _single_target_read_fanout_signature,
+    _tool_result_to_message_content,
 )
 from src.utils.query_intent import QueryIntent
 
@@ -53,7 +54,26 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan.objectives[1].focus, "node")
         self.assertEqual(plan.objectives[2].focus, "node")
 
-    def test_follow_up_verification_continues_existing_incident(self) -> None:
+    def test_per_pod_capacity_table_request_stays_in_pod_scope(self) -> None:
+        plan = build_turn_plan(
+            user_input="make a table with requests/limits and current consumption of cpu/memory for every single pod",
+            intent=QueryIntent(mode="general"),
+            chat_history=[],
+            incident_state=IncidentState(),
+            operator_intent_state=OperatorIntentState(),
+        )
+
+        self.assertEqual(plan.focus, "pod")
+        self.assertIn("inventory", plan.requested_aspects)
+        self.assertIn("capacity", plan.requested_aspects)
+        self.assertIn("pod_health", plan.required_categories)
+        self.assertNotIn("node_health", plan.required_categories)
+        objective_keys = [objective.key for objective in plan.objectives]
+        self.assertEqual(objective_keys, ["inventory", "capacity"])
+        self.assertEqual(plan.objectives[0].focus, "pod")
+        self.assertEqual(plan.objectives[1].focus, "pod")
+
+    def test_scope_reuse_continues_existing_incident(self) -> None:
         state = IncidentState(
             active=True,
             namespace="gitlab",
@@ -64,7 +84,7 @@ class PlannerTests(unittest.TestCase):
         )
 
         plan = build_turn_plan(
-            user_input="is it healthy now?",
+            user_input="check webservice in gitlab",
             intent=QueryIntent(mode="general"),
             chat_history=[],
             incident_state=state,
@@ -72,8 +92,9 @@ class PlannerTests(unittest.TestCase):
         )
 
         self.assertTrue(plan.continue_existing)
-        self.assertEqual(plan.stage, "verify")
-        self.assertTrue(plan.prefer_fresh_reads)
+        self.assertEqual(plan.stage, "collect")
+        self.assertTrue(plan.prefer_cached_reads)
+        self.assertFalse(plan.prefer_fresh_reads)
         self.assertFalse(plan.allow_broad_discovery)
         self.assertEqual(plan.focus, "service")
         self.assertIn("service_network", plan.required_categories)
@@ -157,7 +178,19 @@ class ToolLoopPlannerTests(unittest.TestCase):
         sig_b = _semantic_tool_signature("k8s_list_pods", {"namespace": "all", "limit": 250})
         self.assertEqual(sig_a, sig_b)
 
-    def test_plan_completion_requires_fresh_verification_evidence(self) -> None:
+    def test_single_target_read_fanout_signature_collapses_per_pod_reads(self) -> None:
+        get_sig = _single_target_read_fanout_signature(
+            "kubectl_readonly",
+            {"command": "get pod pod-a -n gitlab -o json"},
+        )
+        top_sig = _single_target_read_fanout_signature(
+            "kubectl_readonly",
+            {"command": "top pod pod-b -n gitlab --containers"},
+        )
+        self.assertEqual(get_sig, "kubectl_readonly:single-target-read:pod")
+        self.assertEqual(top_sig, "kubectl_readonly:single-target-read:pod")
+
+    def test_plan_completion_can_reuse_cached_scope_evidence(self) -> None:
         state = IncidentState(
             active=True,
             namespace="gitlab",
@@ -165,14 +198,14 @@ class ToolLoopPlannerTests(unittest.TestCase):
             last_focus="service",
         )
         plan = build_turn_plan(
-            user_input="is it healthy now?",
+            user_input="check webservice in gitlab",
             intent=QueryIntent(mode="general"),
             chat_history=[],
             incident_state=state,
             operator_intent_state=OperatorIntentState(),
         )
 
-        cached_only_records = [
+        cached_records = [
             ToolExecutionRecord(
                 tool_name="k8s_list_services",
                 requested_tool="k8s_list_services",
@@ -194,29 +227,7 @@ class ToolLoopPlannerTests(unittest.TestCase):
                 evidence_categories=("pod_health",),
             ),
         ]
-        self.assertFalse(_plan_has_enough_evidence(plan, cached_only_records))
-
-        fresh_records = [
-            ToolExecutionRecord(
-                tool_name="k8s_list_services",
-                requested_tool="k8s_list_services",
-                args={"namespace": "gitlab"},
-                semantic_key="svc:list",
-                success=True,
-                summary="Service still points at ready endpoints.",
-                evidence_categories=("service_network",),
-            ),
-            ToolExecutionRecord(
-                tool_name="k8s_describe_pod",
-                requested_tool="k8s_describe_pod",
-                args={"namespace": "gitlab", "pod_name": "gitlab-webservice-7cdb9f"},
-                semantic_key="pod:describe",
-                success=True,
-                summary="Pod is Ready with no recent restarts.",
-                evidence_categories=("pod_health",),
-            ),
-        ]
-        self.assertTrue(_plan_has_enough_evidence(plan, fresh_records))
+        self.assertTrue(_plan_has_enough_evidence(plan, cached_records))
 
     def test_capacity_optimization_plan_needs_more_than_two_successful_reads(self) -> None:
         plan = build_turn_plan(
@@ -262,9 +273,38 @@ class ToolLoopPlannerTests(unittest.TestCase):
         ]
         self.assertTrue(_plan_has_enough_evidence(plan, complete_records))
 
-    def test_readonly_confirmation_prompt_is_detected(self) -> None:
-        text = "Would you like me to proceed with these read-only diagnostic checks? (yes/no)"
-        self.assertTrue(_response_requests_readonly_confirmation(text))
+    def test_per_pod_capacity_table_is_satisfied_by_pod_inventory_and_top_reads(self) -> None:
+        plan = build_turn_plan(
+            user_input="make a table with requests/limits and current consumption of cpu/memory for every single pod",
+            intent=QueryIntent(mode="general"),
+            chat_history=[],
+            incident_state=IncidentState(),
+            operator_intent_state=OperatorIntentState(),
+        )
+
+        records = [
+            ToolExecutionRecord(
+                tool_name="kubectl_readonly",
+                requested_tool="kubectl_readonly",
+                args={"command": "get pods -A -o json"},
+                semantic_key="kubectl:get-pods-json",
+                success=True,
+                summary="Listed all pods with resource requests and limits.",
+                evidence_categories=("pod_health", "discovery_cluster"),
+            ),
+            ToolExecutionRecord(
+                tool_name="k8s_top_pods",
+                requested_tool="k8s_top_pods",
+                args={"namespace": "all"},
+                semantic_key="k8s:top-pods",
+                success=True,
+                summary="Collected current CPU and memory usage for pods.",
+                evidence_categories=("pod_health",),
+            ),
+        ]
+
+        self.assertTrue(_plan_has_enough_evidence(plan, records))
+        self.assertEqual(_missing_requested_aspects(plan, records), ())
 
     def test_missing_requested_aspects_flags_partial_capacity_answer(self) -> None:
         plan = build_turn_plan(
@@ -275,9 +315,20 @@ class ToolLoopPlannerTests(unittest.TestCase):
             operator_intent_state=OperatorIntentState(),
         )
 
+        partial_records = [
+            ToolExecutionRecord(
+                tool_name="aws_cli_readonly",
+                requested_tool="aws_cli_readonly",
+                args={"command": "ec2 describe-instances"},
+                semantic_key="aws:instances",
+                success=True,
+                summary="Found instance types for worker nodes.",
+                evidence_categories=("aws",),
+            ),
+        ]
         missing = _missing_requested_aspects(
             plan,
-            "The cluster uses t3.large and t3.medium instances. I can list them for you.",
+            partial_records,
         )
         self.assertIn("capacity", missing)
         self.assertIn("optimization", missing)
@@ -345,6 +396,122 @@ class IncidentStateTests(unittest.TestCase):
         self.assertIn("find:webservice", updated.cached_tool_results)
         self.assertIn("describe:webservice-abc123", updated.cached_tool_results)
         self.assertTrue(updated.evidence_notes)
+
+    def test_state_cache_preserves_large_structured_tool_results(self) -> None:
+        state = IncidentState()
+        plan = build_turn_plan(
+            user_input="show pod resource consumption",
+            intent=QueryIntent(mode="general"),
+            chat_history=[],
+            incident_state=state,
+            operator_intent_state=OperatorIntentState(),
+        )
+
+        header = "NAMESPACE   NAME                           CPU(cores)   MEMORY(bytes)"
+        rows = [
+            f"gitlab      pod-{index:03d}                    {index % 9 + 1}m           {128 + index}Mi"
+            for index in range(1, 80)
+        ]
+        wrapped = (
+            "Planned command:\n```bash\nkubectl top pod -A --containers\n```\n"
+            "✅ kubectl command executed successfully.\n"
+            f"Output:\n{header}\n" + "\n".join(rows)
+        )
+
+        outcome = ToolLoopOutcome(
+            final_text="Collected pod resource usage.",
+            records=[
+                ToolExecutionRecord(
+                    tool_name="kubectl_readonly",
+                    requested_tool="kubectl_readonly",
+                    args={"command": "top pod -A --containers"},
+                    semantic_key="k8s:top-pods",
+                    success=True,
+                    result_excerpt=wrapped,
+                    summary="Collected pod resource usage.",
+                    evidence_categories=("pod_health",),
+                )
+            ],
+        )
+
+        updated = apply_turn_outcome_to_state(
+            incident_state=state,
+            user_input="show pod resource consumption",
+            intent_mode="general",
+            turn_plan=plan,
+            outcome=outcome,
+            final_text=outcome.final_text,
+            turn_index=1,
+        )
+
+        cached = updated.cached_tool_results["k8s:top-pods"].content
+        self.assertEqual(cached, wrapped)
+
+
+class ToolResultInjectionTests(unittest.TestCase):
+    def test_structured_kubectl_tsv_result_is_not_cropped_to_old_budget(self) -> None:
+        header = "namespace\tpod\tcontainer\tcpu_request\tcpu_limit\tmem_request\tmem_limit"
+        rows = [
+            f"gitlab\tpod-{index:03d}\tcontainer-{index:03d}\t100m\t500m\t256Mi\t1Gi"
+            for index in range(1, 55)
+        ]
+        raw = "\n".join([header, *rows])
+
+        injected, raw_len = _tool_result_to_message_content(raw, tool_name="kubectl_readonly")
+
+        self.assertEqual(raw_len, len(raw))
+        self.assertEqual(injected, raw)
+        self.assertGreater(len(injected), 1800)
+
+    def test_wrapped_kubectl_output_is_detected_as_structured(self) -> None:
+        header = "namespace\tpod\tcontainer\tcpu_request\tcpu_limit\tmem_request\tmem_limit"
+        rows = [
+            f"gitlab\tpod-{index:03d}\tcontainer-{index:03d}\t100m\t500m\t256Mi\t1Gi"
+            for index in range(1, 55)
+        ]
+        wrapped = (
+            "Planned command:\n```bash\nkubectl get pods -A ...\n```\n"
+            "✅ kubectl command executed successfully.\n"
+            f"Output:\n{header}\n" + "\n".join(rows)
+        )
+
+        injected, raw_len = _tool_result_to_message_content(wrapped, tool_name="kubectl_readonly")
+
+        self.assertEqual(raw_len, len(wrapped))
+        self.assertEqual(injected, wrapped)
+        self.assertGreater(len(injected), 1800)
+
+    def test_structured_kubectl_top_output_prefers_full_table_over_head_tail_truncation(self) -> None:
+        header = "NAMESPACE   NAME                           CPU(cores)   MEMORY(bytes)"
+        rows = [
+            f"gitlab      pod-{index:03d}                    {index % 9 + 1}m           {128 + index}Mi"
+            for index in range(1, 80)
+        ]
+        raw = "\n".join([header, *rows])
+
+        injected, raw_len = _tool_result_to_message_content(raw, tool_name="kubectl_readonly")
+
+        self.assertEqual(raw_len, len(raw))
+        self.assertEqual(injected, raw)
+        self.assertGreater(len(injected), 1800)
+
+    def test_wrapped_aws_json_output_is_detected_as_structured(self) -> None:
+        groups = [
+            f'{{"Service":"svc-{index:03d}","Amount":"{index}.123"}}'
+            for index in range(1, 180)
+        ]
+        payload = "[\n" + ",\n".join(groups) + "\n]"
+        wrapped = (
+            "Planned command:\n```bash\naws ce get-cost-and-usage ...\n```\n"
+            "✅ AWS CLI command executed successfully.\n"
+            f"Output:\n{payload}"
+        )
+
+        injected, raw_len = _tool_result_to_message_content(wrapped, tool_name="aws_cli_readonly")
+
+        self.assertEqual(raw_len, len(wrapped))
+        self.assertEqual(injected, wrapped)
+        self.assertGreater(len(injected), 2200)
 
 
 if __name__ == "__main__":

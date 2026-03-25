@@ -9,6 +9,7 @@ import subprocess
 from typing import Tuple
 
 from ..config import Config
+from ..utils.payload_shape import looks_like_structured_payload
 
 
 _DNS_1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
@@ -70,6 +71,8 @@ def run_kubectl(args: list[str]) -> Tuple[int, str, str]:
 
 def truncate_text(value: str, max_chars: int | None = None) -> str:
     limit = max_chars if max_chars is not None else getattr(Config, "K8S_OUTPUT_MAX_CHARS", 12000)
+    if looks_like_structured_payload(value):
+        limit = max(limit, int(getattr(Config, "TOOL_STRUCTURED_OUTPUT_MAX_CHARS", 40000)))
     if limit <= 0 or len(value) <= limit:
         return value
     return value[:limit] + "\n... [truncated]"

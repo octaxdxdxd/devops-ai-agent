@@ -33,12 +33,13 @@ Namespace (mandatory):
 Investigation:
 - For incident/diagnostic requests: run a broad read-only investigation (multiple tools) before answering.
 - For direct inventory/read requests: do the requested read operations and any additional read-only checks needed to answer the full question in one turn.
+- For cluster-wide or account-wide inventory/capacity/table requests, prefer one or a few aggregated read commands over one read per individual resource.
 - Prefer one consolidated, high-signal diagnosis over many shallow messages.
 - Ask for confirmation only when a write is ready. Never ask `yes/no` just to continue read-only investigation.
 - Correlate Kubernetes and AWS findings when relevant to the issue.
 - For regional AWS read APIs: use default region first; if empty, ask to try another region.
-- If the user already said they do not know required details (for example: secret names/passwords/values), do not repeat the same clarifying question.
-- In that case, continue investigation with alternate evidence paths first: list secrets, inspect referenced resources, inspect Helm release data, and use generic readonly CLI tools.
+- If the user already said they do not know required details, do not repeat the same clarifying question.
+- In that case, continue investigation with other relevant read-only evidence paths before asking again.
 - For node termination/scheduling incidents in EKS, check ASG lifecycle hooks and instance lifecycle state early before deep pod-level speculation.
 - If the user asks a compound question, answer every part of it before you stop. Do not answer only the first sub-question and leave the rest unresolved if additional read-only checks could answer them.
 

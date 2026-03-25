@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from ..autonomy import SimpleAutonomyEngine
@@ -17,7 +18,6 @@ from ..utils.tracing import JsonlTraceWriter, TraceSpan, new_trace_id, trace_con
 from .planner import build_turn_plan, render_turn_plan_directive
 from .approval import (
     ApprovalCoordinator,
-    attempt_known_command_repair,
     commands_code_block,
     format_command_preview,
     is_repairable_command_tool,
@@ -325,102 +325,13 @@ class LogAnalyzerAgent:
             directives.append(
                 "Do not ask for permission to perform additional read-only checks. Only ask for approval when a mutating action is ready."
             )
+            directives.append(
+                "Prefer one or a few aggregated read commands that cover the full requested scope. Avoid one-read-per-resource fanout when a cluster-wide or account-wide query can produce the table or totals directly."
+            )
         if len(tuple(getattr(turn_plan, "objectives", ()) or ())) > 1:
             directives.append(
                 "This request has multiple linked objectives. Complete all of them in this same turn before you stop."
             )
-
-        decision = (user_input or "").strip().lower()
-        approval_words = {"yes", "y", "approve", "proceed", "do it", "run it", "ok"}
-        if decision in approval_words or decision.startswith("approve "):
-            last_ai_text = ""
-            for msg in reversed(chat_history):
-                msg_type = str(getattr(msg, "type", "")).lower()
-                if msg_type != "ai":
-                    continue
-                content = getattr(msg, "content", "")
-                if isinstance(content, str):
-                    last_ai_text = content
-                elif isinstance(content, list):
-                    last_ai_text = " ".join(str(x) for x in content)
-                else:
-                    last_ai_text = str(content or "")
-                break
-
-            marker_text = last_ai_text.lower()
-            if (
-                "would you like me to proceed" in marker_text
-                or "please confirm: yes/no" in marker_text
-                or "reply `yes` to approve" in marker_text
-                or "reply `yes` to proceed" in marker_text
-            ):
-                directives.append(
-                    "User approved the previously proposed remediation. Execute the full approved plan now. "
-                    "If multiple write steps are required, emit all required write tool calls in this single response."
-                )
-
-        # If user already said they don't know/missing details, do not keep asking the same question.
-        combined_user_text = " ".join(
-            [user_input]
-            + [
-                str(getattr(msg, "content", ""))
-                for msg in chat_history
-                if str(getattr(msg, "type", "")).lower() == "human"
-            ]
-        ).lower()
-        user_unknown_markers = (
-            "i don't know",
-            "i dont know",
-            "no idea",
-            "not sure",
-            "i'm not sure",
-            "im not sure",
-            "stop asking",
-            "i have no values",
-            "i have no values.yaml",
-            "i dont have the secret",
-            "i don't have the secret",
-            "no backup",
-        )
-        if any(marker in combined_user_text for marker in user_unknown_markers):
-            directives.append(
-                "The user already said they do not know the missing details. "
-                "Do NOT repeat the same clarifying question. Continue autonomous investigation using read-only tools and derive/recover evidence directly where possible."
-            )
-            directives.append(
-                "Prioritize alternative evidence paths before asking anything else: "
-                "k8s_list_secrets, k8s_get_resource_yaml, k8s_describe_pod, k8s_get_pod_logs, kubectl_readonly, helm_readonly, aws_cli_readonly."
-            )
-
-        if "stop asking" in combined_user_text:
-            directives.append(
-                "Do not ask clarifying questions in this turn unless there is an absolute hard blocker after exhausting all read-only evidence paths."
-            )
-
-        if operator_intent_state.is_following_proposed_plan():
-            pending_kind = str(getattr(operator_intent_state, "pending_step_kind", "") or "")
-            directives.append(
-                "The user asked you to continue with the previously proposed next step. "
-                "Do not restate the issue summary unless new evidence changes it."
-            )
-            if operator_intent_state.pending_step_summary:
-                directives.append(f"Continue this next step: {operator_intent_state.pending_step_summary}")
-            if pending_kind == "implementation":
-                directives.append(
-                    "This follow-up is an implementation step. Use the minimum necessary read-only checks to construct exact changes, "
-                    "then propose or queue the concrete write action for approval instead of repeating diagnosis."
-                )
-            elif pending_kind == "prepare":
-                directives.append(
-                    "This follow-up is a preparation step. Turn the proposed fix into concrete commands, patches, or an approval-ready plan."
-                )
-            elif pending_kind == "investigate":
-                directives.append(
-                    "This follow-up is an approved investigation step. Run the requested diagnostic reads now and summarize only the new findings."
-                )
-                directives.append(
-                    "Do not stop to ask permission for more read-only investigation if it is still needed to fully answer the request."
-                )
 
         plan_block = render_turn_plan_directive(
             turn_plan=turn_plan,
@@ -474,28 +385,26 @@ class LogAnalyzerAgent:
         elif getattr(turn_plan, "focus", "") == "aws":
             selected_names.update({"aws_cli_readonly", "k8s_list_nodes"})
 
-        if (
-            intent.mode == "command"
-            or getattr(turn_plan, "stage", "") == "execute"
-            or (
-                operator_intent_state.is_following_proposed_plan()
-                and getattr(turn_plan, "stage", "") in {"command", "execute"}
-            )
-        ):
+        selected_names.update(
+            {
+                "restart_kubernetes_pod",
+                "restart_kubernetes_pods_batch",
+                "scale_kubernetes_deployment",
+                "scale_kubernetes_statefulset",
+                "scale_kubernetes_workloads_batch",
+                "rollout_restart_kubernetes_deployment",
+                "rollout_restart_kubernetes_statefulset",
+                "rollout_restart_kubernetes_daemonset",
+                "rollout_restart_kubernetes_workloads_batch",
+            }
+        )
+
+        if intent.mode == "command" or getattr(turn_plan, "stage", "") == "execute":
             selected_names.update(
                 {
                     "kubectl_execute",
                     "helm_execute",
                     "aws_cli_execute",
-                    "restart_kubernetes_pod",
-                    "restart_kubernetes_pods_batch",
-                    "scale_kubernetes_deployment",
-                    "scale_kubernetes_statefulset",
-                    "scale_kubernetes_workloads_batch",
-                    "rollout_restart_kubernetes_deployment",
-                    "rollout_restart_kubernetes_statefulset",
-                    "rollout_restart_kubernetes_daemonset",
-                    "rollout_restart_kubernetes_workloads_batch",
                 }
             )
 
@@ -517,24 +426,14 @@ class LogAnalyzerAgent:
 
         should_show_banner = notification_was_sent(notifications)
         if should_show_banner and fingerprint and fingerprint != self._last_announced_incident_fingerprint:
-            if operator_intent_state.is_following_proposed_plan():
-                prefix = (
-                    "Background context: autonomous monitoring still sees an active incident.\n"
-                    f"Severity: {incident.get('severity', 'unknown')} | "
-                    f"Confidence: {incident.get('confidence_score', 0)}/100 | "
-                    f"Impact: {incident.get('impact_score', 0)}/100\n"
-                    f"Summary: {incident.get('issue_summary', '')}\n"
-                    "Use this as context only. Prioritize continuing the user's requested next step over repeating the diagnosis.\n\n"
-                )
-            else:
-                prefix = (
-                    "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
-                    f"Severity: {incident.get('severity', 'unknown')} | "
-                    f"Confidence: {incident.get('confidence_score', 0)}/100 | "
-                    f"Impact: {incident.get('impact_score', 0)}/100\n"
-                    f"Summary: {incident.get('issue_summary', '')}\n"
-                    f"Notification result: {notifications}\n\n"
-                )
+            prefix = (
+                "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
+                f"Severity: {incident.get('severity', 'unknown')} | "
+                f"Confidence: {incident.get('confidence_score', 0)}/100 | "
+                f"Impact: {incident.get('impact_score', 0)}/100\n"
+                f"Summary: {incident.get('issue_summary', '')}\n"
+                f"Notification result: {notifications}\n\n"
+            )
         else:
             prefix = ""
 
@@ -574,13 +473,6 @@ class LogAnalyzerAgent:
             "Approved command failed. Analyzing the error and drafting a corrected command...",
         )
 
-        repaired = attempt_known_command_repair(tool_name, original_command, failure_text)
-        if repaired and repaired != original_command:
-            return (
-                {**tool_args, "command": repaired},
-                "I corrected the command structure to match the API schema reported in the error.",
-            )
-
         command_prefix = {
             "aws_cli_execute": "aws",
             "kubectl_execute": "kubectl",
@@ -588,37 +480,32 @@ class LogAnalyzerAgent:
         }.get(tool_name, "command")
         reason = str(tool_args.get("reason") or "").strip()
 
-        repair_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    (
-                        "You repair failed infrastructure CLI commands after an approved write action.\n"
-                        "Only fix mistakes directly evidenced by the failure output.\n"
-                        "Do not broaden scope, change the target resource, or add extra operations.\n"
-                        f"For `{tool_name}`, return only the command body after `{command_prefix} `, not the binary itself.\n"
-                        "If you cannot confidently repair it, say so.\n"
-                        "Return exactly four lines:\n"
-                        "STATUS: repair|cannot_repair\n"
-                        "SUMMARY: <one short sentence>\n"
-                        "COMMAND: <single-line corrected command body or blank>\n"
-                        "REASON: <short explanation>\n"
-                    ),
-                ),
-                (
-                    "user",
-                    (
-                        f"Tool: {tool_name}\n"
-                        f"Command prefix: {command_prefix}\n"
-                        f"Original command body: {original_command}\n"
-                        f"Operator reason: {reason or '(none provided)'}\n"
-                        f"Failure output:\n{failure_text}"
-                    ),
-                ),
-            ]
-        )
+        repair_messages = [
+            SystemMessage(
+                content=(
+                    "You repair failed infrastructure CLI commands after an approved write action.\n"
+                    "Only fix mistakes directly evidenced by the failure output.\n"
+                    "Do not broaden scope, change the target resource, or add extra operations.\n"
+                    f"For `{tool_name}`, return only the command body after `{command_prefix} `, not the binary itself.\n"
+                    "If you cannot confidently repair it, say so.\n"
+                    "Return exactly four lines:\n"
+                    "STATUS: repair|cannot_repair\n"
+                    "SUMMARY: <one short sentence>\n"
+                    "COMMAND: <single-line corrected command body or blank>\n"
+                    "REASON: <short explanation>\n"
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"Tool: {tool_name}\n"
+                    f"Command prefix: {command_prefix}\n"
+                    f"Original command body: {original_command}\n"
+                    f"Operator reason: {reason or '(none provided)'}\n"
+                    f"Failure output:\n{failure_text}"
+                )
+            ),
+        ]
 
-        repair_messages = repair_prompt.format_messages()
         repair_response = invoke_with_retries(
             self.llm,
             repair_messages,
@@ -720,21 +607,6 @@ class LogAnalyzerAgent:
                 + f"{cmd_block}\n"
                 + "Reply `yes` to approve all or `no` to cancel."
             )
-
-        if self._approval.should_promote_to_batch(decision):
-            promoted = self._approval.promote_pending_to_batch(self.tools)
-            if promoted and self._approval.pending_action is not None:
-                pending = self._approval.pending_action
-                cmd_preview = format_command_preview(pending.tool.name, pending.args)
-                cmd_block = commands_code_block(cmd_preview)
-                return (
-                    alert_prefix
-                    + "I switched this to a batch restart as requested.\n"
-                    + f"Approval required before I can run `{pending.tool.name}` with args {pending.args}.\n"
-                    + "Planned command(s):\n"
-                    + cmd_block
-                    + "\nReply `yes` to approve or `no` to cancel."
-                )
 
         if decision in {"yes", "y", "approve", "proceed", "do it", "run it", "ok"} or decision.startswith("approve "):
             tool = pending.tool

@@ -44,6 +44,7 @@ class Config:
     K8S_DRY_RUN = os.getenv('K8S_DRY_RUN', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     K8S_REQUEST_TIMEOUT_SEC = int(os.getenv('K8S_REQUEST_TIMEOUT_SEC', '20'))
     K8S_OUTPUT_MAX_CHARS = int(os.getenv('K8S_OUTPUT_MAX_CHARS', '12000'))
+    TOOL_STRUCTURED_OUTPUT_MAX_CHARS = int(os.getenv('TOOL_STRUCTURED_OUTPUT_MAX_CHARS', '40000'))
     K8S_CLI_ALLOW_ALL_READ = os.getenv('K8S_CLI_ALLOW_ALL_READ', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     K8S_CLI_ALLOW_ALL_WRITE = os.getenv('K8S_CLI_ALLOW_ALL_WRITE', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     K8S_CLI_READONLY_VERBS = os.getenv(
@@ -108,8 +109,10 @@ class Config:
     MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '24'))
     MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '3'))
     MAX_SEMANTIC_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_SEMANTIC_DUPLICATE_TOOL_CALLS', '2'))
+    MAX_SINGLE_TARGET_READ_FANOUT_CALLS = int(os.getenv('MAX_SINGLE_TARGET_READ_FANOUT_CALLS', '4'))
     MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '10'))
     AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '2500'))
+    AGENT_STRUCTURED_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_STRUCTURED_TOOL_RESULT_MAX_CHARS', '12000'))
     INCIDENT_STATE_MAX_EVIDENCE = int(os.getenv('INCIDENT_STATE_MAX_EVIDENCE', '8'))
     INCIDENT_STATE_MAX_CACHE_ENTRIES = int(os.getenv('INCIDENT_STATE_MAX_CACHE_ENTRIES', '24'))
     AGENT_ENABLE_INTENT_TOOL_FILTER = os.getenv('AGENT_ENABLE_INTENT_TOOL_FILTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}

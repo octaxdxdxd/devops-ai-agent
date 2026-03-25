@@ -13,6 +13,7 @@ from ..config import Config
 from ..tools import is_write_tool
 from ..utils.command_intent import CommandIntent, classify_command_intent, target_tool_for_intent
 from ..utils.llm_retry import invoke_with_retries
+from ..utils.payload_shape import looks_like_structured_payload
 from ..utils.response import extract_response_text
 from .approval import ApprovalCoordinator, PendingAction, commands_code_block, format_command_preview
 from .planner import TurnPlan
@@ -136,8 +137,13 @@ _SIGNAL_LINE_RE = re.compile(
 )
 
 
-def _tool_context_budget(tool_name: str, default_max: int) -> int:
+def _tool_context_budget(tool_name: str, default_max: int, *, structured_payload: bool = False) -> int:
     """Return a per-tool context budget for prompt injection."""
+    if structured_payload:
+        return max(
+            default_max,
+            int(getattr(Config, "AGENT_STRUCTURED_TOOL_RESULT_MAX_CHARS", 12000)),
+        )
     if tool_name in {"k8s_get_pod_logs", "k8s_get_resource_yaml", "k8s_describe_node", "kubectl_readonly"}:
         return max(800, min(default_max, 1800))
     if tool_name in {
@@ -178,9 +184,10 @@ def _tool_result_to_message_content(result: Any, *, tool_name: str) -> tuple[str
     """Convert tool result to model context with truncation for token control."""
     text = str(result)
     max_chars_default = max(0, int(getattr(Config, "AGENT_TOOL_RESULT_MAX_CHARS", 5000)))
-    max_chars = _tool_context_budget(tool_name, max_chars_default)
+    structured_payload = looks_like_structured_payload(text)
+    max_chars = _tool_context_budget(tool_name, max_chars_default, structured_payload=structured_payload)
 
-    if tool_name in _VERBOSE_CONTEXT_TOOLS and len(text) > max_chars:
+    if tool_name in _VERBOSE_CONTEXT_TOOLS and not structured_payload and len(text) > max_chars:
         compacted = _compact_high_signal_lines(text)
         if compacted and len(compacted) < len(text):
             text = (
@@ -236,28 +243,6 @@ def _build_evidence_corpus(messages: list[Any]) -> str:
         parts.append(text)
         total += len(text)
     return "\n".join(parts)
-
-
-def _user_signaled_unknown(*, user_input: str, chat_history: list[Any]) -> bool:
-    text_parts: list[str] = [str(user_input or "")]
-    for msg in chat_history:
-        if str(getattr(msg, "type", "")).lower() != "human":
-            continue
-        text_parts.append(_message_content_text(msg))
-    text = " ".join(text_parts).lower()
-    markers = (
-        "i don't know",
-        "i dont know",
-        "no idea",
-        "not sure",
-        "i'm not sure",
-        "im not sure",
-        "stop asking",
-        "no backup",
-        "i dont have",
-        "i don't have",
-    )
-    return any(marker in text for marker in markers)
 
 
 def _extract_aws_reference_tokens(command: str) -> list[str]:
@@ -378,8 +363,68 @@ def _semantic_tool_signature(tool_name: str, tool_args: Any, intent: CommandInte
     return f"{tool_name}:{json.dumps(normalized, sort_keys=True, ensure_ascii=False)}"
 
 
+def _single_target_read_fanout_signature(
+    tool_name: str,
+    tool_args: Any,
+    intent: CommandIntent | None = None,
+) -> str | None:
+    """Return a coarse signature for readonly one-resource fanout patterns."""
+    if tool_name != "kubectl_readonly" or not isinstance(tool_args, dict):
+        return None
+    if intent is not None and intent.capability != "safe_read":
+        return None
+
+    command_text = ""
+    if intent is not None and intent.normalized_command:
+        command_text = intent.normalized_command
+    else:
+        command_text = str(tool_args.get("command") or "").strip()
+    if not command_text:
+        return None
+
+    try:
+        tokens = shlex.split(command_text)
+    except Exception:
+        tokens = command_text.split()
+    if len(tokens) < 3:
+        return None
+
+    verb = tokens[0].lower()
+    if verb not in {"get", "describe", "top"}:
+        return None
+
+    if any(flag in tokens for flag in ("-A", "--all-namespaces")):
+        return None
+
+    if verb == "top":
+        resource = tokens[1].lower()
+        name = tokens[2]
+    else:
+        resource = tokens[1].lower()
+        name = tokens[2]
+
+    if not resource or not name or name.startswith("-"):
+        return None
+    if "," in resource or "," in name:
+        return None
+
+    normalized_resource = resource.split("/", 1)[0].rstrip("s")
+    if normalized_resource not in {"pod", "node", "service", "deployment", "statefulset", "daemonset", "ingress", "pvc", "pv"}:
+        return None
+    return f"{tool_name}:single-target-read:{normalized_resource}"
+
+
+def _should_prefer_aggregated_reads(turn_plan: TurnPlan | None) -> bool:
+    if turn_plan is None:
+        return False
+    aspects = set(getattr(turn_plan, "requested_aspects", ()) or ())
+    return bool(aspects.intersection({"inventory", "capacity", "cost", "optimization", "explanation"}))
+
+
 def _trim_record_excerpt(text: Any, *, max_chars: int = 1200) -> str:
     clean = str(text or "").strip()
+    if looks_like_structured_payload(clean):
+        max_chars = max(max_chars, int(getattr(Config, "AGENT_STRUCTURED_TOOL_RESULT_MAX_CHARS", 12000)))
     if len(clean) <= max_chars:
         return clean
     return clean[: max_chars - 3].rstrip() + "..."
@@ -592,81 +637,38 @@ def _minimum_successful_calls_for_plan(turn_plan: TurnPlan) -> int:
     return min(minimum, 4)
 
 
-def _response_requests_readonly_confirmation(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
-        return False
-    asks_confirmation = any(
-        marker in lowered
-        for marker in (
-            "would you like me to proceed",
-            "do you want me to proceed",
-            "please confirm",
-            "yes/no",
-            "reply `yes`",
-            "reply yes",
-        )
-    )
-    if not asks_confirmation:
-        return False
-
-    readonly_markers = (
-        "read-only",
-        "diagnostic",
-        "diagnostics",
-        "investigat",
-        "inspect",
-        "check",
-        "describe",
-        "logs",
-        "list",
-        "show",
-        "get",
-        "review",
-        "trace",
-    )
-    write_markers = (
-        "restart",
-        "scale",
-        "patch",
-        "apply",
-        "delete",
-        "modify",
-        "update",
-        "create",
-        "write action",
-        "mutating",
-    )
-    return any(marker in lowered for marker in readonly_markers) and not any(marker in lowered for marker in write_markers)
-
-
-def _missing_requested_aspects(turn_plan: TurnPlan | None, final_text: str) -> tuple[str, ...]:
+def _missing_requested_aspects(
+    turn_plan: TurnPlan | None,
+    records: list[ToolExecutionRecord],
+) -> tuple[str, ...]:
     if turn_plan is None:
         return ()
-    lowered = str(final_text or "").lower()
+    successful_records = [record for record in records if record.success]
     missing: list[str] = []
     objectives = tuple(getattr(turn_plan, "objectives", ()) or ())
     if objectives:
         for objective in objectives:
-            markers = tuple(getattr(objective, "answer_markers", ()) or ())
-            if markers and not any(marker in lowered for marker in markers):
+            if not _objective_has_enough_evidence(
+                turn_plan=turn_plan,
+                objective=objective,
+                successful_records=successful_records,
+            ):
                 key = str(getattr(objective, "key", "") or "").strip() or "analysis"
                 if key not in missing:
                     missing.append(key)
         return tuple(missing)
 
     aspects = tuple(getattr(turn_plan, "requested_aspects", ()) or ())
-    for aspect in aspects:
-        if aspect == "analysis":
-            continue
-        missing.append(aspect)
+    if not _plan_has_enough_evidence(turn_plan, successful_records):
+        for aspect in aspects:
+            if aspect == "analysis":
+                continue
+            missing.append(aspect)
     return tuple(missing)
 
 
-def _force_readonly_completion_prompt(turn_plan: TurnPlan | None, final_text: str, *, missing_aspects: tuple[str, ...], readonly_follow_up: bool) -> str:
+def _force_readonly_completion_prompt(turn_plan: TurnPlan | None, final_text: str, *, missing_aspects: tuple[str, ...]) -> str:
     reasons: list[str] = []
-    if readonly_follow_up:
-        reasons.append("Do not ask for confirmation to continue read-only investigation.")
     if missing_aspects:
         reasons.append(f"You have not fully answered these parts of the request yet: {', '.join(missing_aspects)}.")
     stage = str(getattr(turn_plan, "stage", "") or "")
@@ -756,11 +758,13 @@ def handle_tool_calls(
         "MAX_SEMANTIC_DUPLICATE_TOOL_CALLS",
         max_duplicate_tool_calls,
     )
+    max_read_fanout_calls = max(3, int(getattr(Config, "MAX_SINGLE_TARGET_READ_FANOUT_CALLS", 4)))
 
     iteration = 0
     total_tool_calls = 0
     call_signature_counts: dict[str, int] = {}
     semantic_signature_counts: dict[str, int] = {}
+    read_fanout_signature_counts: dict[str, int] = {}
     execution_records: list[ToolExecutionRecord] = []
     current_response = response
     operator_intent_state = operator_intent_state or OperatorIntentState()
@@ -772,11 +776,10 @@ def handle_tool_calls(
 
         if not (hasattr(current_response, "tool_calls") and current_response.tool_calls):
             final_text = extract_response_text(current_response)
-            readonly_follow_up = _response_requests_readonly_confirmation(final_text)
-            missing_aspects = _missing_requested_aspects(turn_plan, final_text)
+            missing_aspects = _missing_requested_aspects(turn_plan, execution_records)
             if (
                 completeness_retries < max_completeness_retries
-                and (readonly_follow_up or missing_aspects)
+                and missing_aspects
                 and iteration < max_iterations
             ):
                 completeness_retries += 1
@@ -785,7 +788,7 @@ def handle_tool_calls(
                         {
                             "trace_id": trace_id,
                             "event": "tool_loop.force_readonly_continue",
-                            "reason": "readonly_confirmation" if readonly_follow_up else "missing_aspects",
+                            "reason": "missing_aspects",
                             "missing_aspects": list(missing_aspects),
                             "retry": completeness_retries,
                         }
@@ -798,7 +801,6 @@ def handle_tool_calls(
                             turn_plan,
                             final_text,
                             missing_aspects=missing_aspects,
-                            readonly_follow_up=readonly_follow_up,
                         )
                     )
                 )
@@ -907,6 +909,7 @@ def handle_tool_calls(
                 signature = f"{tool_name}:{str(tool_args)}"
 
             semantic_signature = _semantic_tool_signature(tool_name, tool_args, tool_intent)
+            read_fanout_signature = _single_target_read_fanout_signature(tool_name, tool_args, tool_intent)
 
             call_signature_counts[signature] = call_signature_counts.get(signature, 0) + 1
             if call_signature_counts[signature] > max_duplicate_tool_calls:
@@ -927,8 +930,7 @@ def handle_tool_calls(
                         content=(
                             "Duplicate tool call suppressed to avoid loops. "
                             "Pick a different tool/arguments and continue investigation. "
-                            "Good pivots: k8s_list_secrets, k8s_get_resource_yaml, k8s_describe_pod, "
-                            "k8s_get_pod_logs, kubectl_readonly, helm_readonly, aws_cli_readonly."
+                            "Good pivots: inspect different related resources, logs, events, manifests, provider metadata, or other relevant read-only CLI tools."
                         ),
                         tool_call_id=tool_call_id,
                     )
@@ -1075,8 +1077,7 @@ def handle_tool_calls(
                     ToolMessage(
                         content=(
                             f"Error: unknown tool '{tool_name}'. "
-                            "Use available alternatives such as k8s_list_secrets, k8s_get_resource_yaml, "
-                            "kubectl_readonly, helm_readonly, and aws_cli_readonly."
+                            "Use other relevant read-only diagnostics or generic CLI tools that can gather the same evidence."
                         ),
                         tool_call_id=tool_call_id,
                     )
@@ -1098,6 +1099,50 @@ def handle_tool_calls(
                     )
                 )
                 continue
+
+            if _should_prefer_aggregated_reads(turn_plan) and read_fanout_signature:
+                read_fanout_signature_counts[read_fanout_signature] = read_fanout_signature_counts.get(read_fanout_signature, 0) + 1
+                if read_fanout_signature_counts[read_fanout_signature] > max_read_fanout_calls:
+                    if tw and trace_id:
+                        tw.emit(
+                            {
+                                "trace_id": trace_id,
+                                "event": "tool_loop.read_fanout_suppressed",
+                                "tool": tool_name,
+                                "requested_tool": original_name,
+                                "args": tool_args,
+                                "fanout_key": read_fanout_signature,
+                                "count": read_fanout_signature_counts[read_fanout_signature],
+                                "max_single_target_read_fanout_calls": max_read_fanout_calls,
+                            }
+                        )
+                    tool_messages.append(
+                        ToolMessage(
+                            content=(
+                                "Single-resource read fanout suppressed. "
+                                "For inventory, capacity, optimization, cost, or explanation requests, switch to one or a few aggregated read commands "
+                                "that cover all relevant resources at once instead of inspecting each resource individually."
+                            ),
+                            tool_call_id=tool_call_id,
+                        )
+                    )
+                    execution_records.append(
+                        ToolExecutionRecord(
+                            tool_name=tool_name,
+                            requested_tool=original_name,
+                            args=tool_args,
+                            semantic_key=semantic_signature,
+                            success=False,
+                            summary="Single-target readonly fanout suppressed to encourage aggregated reads.",
+                            capability=tool_intent.capability if tool_intent is not None else "",
+                            evidence_categories=_evidence_categories_for_call(
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                intent=tool_intent,
+                            ),
+                        )
+                    )
+                    continue
 
             cached_result = _cached_result_for_call(
                 incident_state=incident_state,
@@ -1269,10 +1314,6 @@ def handle_tool_calls(
                 single_name = single.tool.name
                 single_args = single.args
 
-                if single_name == "restart_kubernetes_pod":
-                    content_text = extract_response_text(current_response)
-                    approval.record_restart_context(single_args, content_text)
-
                 cmd_preview = format_command_preview(single_name, single_args)
                 approval.set_pending_action(single.tool, single_args)
                 _notify_status(status_callback, f"Prepared `{single_name}`. Waiting for approval...")
@@ -1287,17 +1328,12 @@ def handle_tool_calls(
                         }
                     )
 
-                batch_prompt = ""
-                if approval.should_offer_batch_prompt(single_name, single_args):
-                    batch_prompt = "If you want all suggested pods restarted in one operation, reply: `do all at once`.\n"
-
                 cmd_block = commands_code_block(cmd_preview)
                 return ToolLoopOutcome(
                     final_text=(
                         f"I recommend running `{single_name}` with args {single_args}, but it requires approval.\n"
                         "Planned command(s):\n"
                         f"{cmd_block}\n"
-                        f"{batch_prompt}"
                         "Would you like me to proceed? (yes/no)"
                     ),
                     records=execution_records,
@@ -1393,11 +1429,10 @@ def handle_tool_calls(
             )
             forced_text = extract_response_text(forced)
             if (forced_text or "").strip():
-                readonly_follow_up = _response_requests_readonly_confirmation(forced_text)
-                missing_aspects = _missing_requested_aspects(turn_plan, forced_text)
+                missing_aspects = _missing_requested_aspects(turn_plan, execution_records)
                 if (
                     completeness_retries < max_completeness_retries
-                    and (readonly_follow_up or missing_aspects)
+                    and missing_aspects
                     and iteration < max_iterations
                 ):
                     completeness_retries += 1
@@ -1406,7 +1441,7 @@ def handle_tool_calls(
                             {
                                 "trace_id": trace_id,
                                 "event": "tool_loop.force_readonly_continue",
-                                "reason": "readonly_confirmation" if readonly_follow_up else "missing_aspects",
+                                "reason": "missing_aspects",
                                 "missing_aspects": list(missing_aspects),
                                 "retry": completeness_retries,
                             }
@@ -1419,7 +1454,6 @@ def handle_tool_calls(
                                 turn_plan,
                                 forced_text,
                                 missing_aspects=missing_aspects,
-                                readonly_follow_up=readonly_follow_up,
                             )
                         )
                     )
@@ -1457,18 +1491,11 @@ def handle_tool_calls(
                 }
             )
 
-        user_unknown = _user_signaled_unknown(user_input=user_input, chat_history=chat_history)
-        blocker_guidance = (
-            "Do NOT ask for credentials/secret names again; user already said they do not know. "
-            "Give best-effort diagnosis and concrete next actions from existing evidence."
-            if user_unknown
-            else "If evidence is insufficient, ask ONE specific clarifying question."
-        )
         messages.append(
             HumanMessage(
                 content=(
                     "Stop calling tools now. Provide your best incident summary based only on the tool results already retrieved. "
-                    f"{blocker_guidance}"
+                    "If evidence is insufficient, clearly state what remains unverified and give the best next actions from existing evidence."
                 )
             )
         )

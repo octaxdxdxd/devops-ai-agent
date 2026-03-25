@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import Config
+from ..utils.payload_shape import looks_like_structured_payload
 
 
 _AWS_ARN_RE = re.compile(r"\barn:aws[a-z-]*:[^\s'\"]+\b", re.IGNORECASE)
@@ -180,7 +181,7 @@ class OperatorIntentState:
         return False
 
     def is_following_proposed_plan(self) -> bool:
-        return self.mode == "follow_up_action"
+        return False
 
     def render_context_block(self) -> str:
         lines = [
@@ -192,122 +193,13 @@ class OperatorIntentState:
             lines.append(f"- Constraints: {', '.join(self.pinned_constraints)}")
         if self.last_user_instruction:
             lines.append(f"- Latest operator instruction: {self.last_user_instruction}")
-        if self.awaiting_follow_up and self.pending_step_summary:
-            lines.append(f"- Pending next step: {self.pending_step_summary}")
-        if self.awaiting_follow_up and self.pending_step_kind:
-            lines.append(f"- Pending step kind: {self.pending_step_kind}")
         return "\n".join(lines)
-
-
-_APPROVAL_DECISIONS = {"yes", "y", "approve", "proceed", "do it", "run it", "ok", "no", "n", "cancel", "stop"}
-_FOLLOW_UP_QUESTION_RE = re.compile(
-    r"(would you like me|do you want me|reply\s+`?yes`?|yes/no|please confirm)",
-    re.IGNORECASE,
-)
-_ACTION_SUMMARY_RE = re.compile(
-    r"(?:Recommended Action|Next Best Action|Next Step)\s*:\s*(.+)",
-    re.IGNORECASE,
-)
-_INFO_REQUEST_PREFIXES = ("why ", "what ", "how ", "which ", "where ", "who ", "explain ")
-_PROCEED_LINE_RE = re.compile(
-    r"(?:would you like me|do you confirm i should|shall i|should i|do you want me to|please confirm)\s+(.+?)(?:\?|$)",
-    re.IGNORECASE,
-)
-_IMPLEMENTATION_SIGNAL_RE = re.compile(
-    r"\b(apply|patch|update|create|delete|scale|restart|rollout|implement|migrate|reconfigure|change|modify)\b",
-    re.IGNORECASE,
-)
-_INVESTIGATION_SIGNAL_RE = re.compile(
-    r"\b(inspect|check|examine|review|verify|diagnostic|diagnostics|look at|gather|read|describe|logs?)\b",
-    re.IGNORECASE,
-)
-_PREPARE_SIGNAL_RE = re.compile(
-    r"\b(prepare|draft|generate|show)\b.*\b(commands?|patch(?:es)?|plan)\b",
-    re.IGNORECASE,
-)
-_COMMAND_OR_PATCH_RE = re.compile(r"```[\s\S]+?```|(?:^|\n)\s*(kubectl|aws|helm)\s+", re.IGNORECASE)
-_FOLLOW_THROUGH_PREFIXES = (
-    "yes",
-    "yeah",
-    "yep",
-    "sure",
-    "ok",
-    "okay",
-    "please",
-    "can you",
-    "could you",
-    "would you",
-    "implement",
-    "continue",
-    "go ahead",
-    "proceed",
-    "let's",
-    "lets",
-)
-_NON_ACTION_SHORT_REPLIES = {"hi", "hello", "hey", "thanks", "thank you"}
-
-
-def _build_operator_constraints(mode: str, execution_policy: str) -> list[str]:
-    constraints: list[str] = []
-    if mode == "follow_up_action":
-        constraints.append("Continue with the previously proposed next step")
-        constraints.append("Do not restart diagnosis unless the user changes direction")
-    return constraints
-
-
 def _clear_pending_step(operator_intent_state: OperatorIntentState) -> None:
     operator_intent_state.pending_step_summary = ""
     operator_intent_state.pending_step_focus = "general"
     operator_intent_state.pending_step_stage = ""
     operator_intent_state.pending_step_kind = ""
     operator_intent_state.awaiting_follow_up = False
-
-
-def _looks_like_information_request(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
-        return False
-    if lowered.endswith("?"):
-        return True
-    return lowered.startswith(_INFO_REQUEST_PREFIXES)
-
-
-def _looks_like_follow_through(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    if not lowered or lowered in _NON_ACTION_SHORT_REPLIES:
-        return False
-    if _looks_like_information_request(lowered):
-        return False
-    if lowered in _APPROVAL_DECISIONS:
-        return True
-    if any(lowered.startswith(prefix) for prefix in _FOLLOW_THROUGH_PREFIXES):
-        return True
-    return len(lowered.split()) <= 8
-
-
-def _extract_pending_step_summary(text: str) -> str:
-    summary_match = _ACTION_SUMMARY_RE.search(text)
-    if summary_match:
-        return summary_match.group(1).strip()
-    proceed_match = _PROCEED_LINE_RE.search(text)
-    if proceed_match:
-        return proceed_match.group(1).strip()
-    return _extract_first_sentence(text)
-
-
-def _classify_pending_step(text: str, turn_plan: Any) -> tuple[str, str]:
-    raw = str(text or "").strip()
-    lowered = raw.lower()
-    if _PREPARE_SIGNAL_RE.search(raw):
-        return "prepare", "command"
-    if _COMMAND_OR_PATCH_RE.search(raw) or _IMPLEMENTATION_SIGNAL_RE.search(raw):
-        return "implementation", "command"
-    if _INVESTIGATION_SIGNAL_RE.search(raw):
-        return "investigate", "collect"
-    stage = str(getattr(turn_plan, "stage", "") or "")
-    if stage in {"command", "execute"}:
-        return "implementation", "command"
-    return "investigate", "collect"
 
 
 def register_operator_follow_up(
@@ -317,30 +209,10 @@ def register_operator_follow_up(
     turn_plan: Any,
     approval_pending: bool = False,
 ) -> OperatorIntentState:
-    """Capture whether the assistant ended the turn by proposing a next step."""
-    if approval_pending:
-        _clear_pending_step(operator_intent_state)
-        if operator_intent_state.mode == "follow_up_action":
-            operator_intent_state.mode = "incident_response"
-            operator_intent_state.pinned_constraints = []
-        return operator_intent_state
-
-    text = str(final_text or "").strip()
-    if not text or not _FOLLOW_UP_QUESTION_RE.search(text):
-        _clear_pending_step(operator_intent_state)
-        if operator_intent_state.mode == "follow_up_action":
-            operator_intent_state.mode = "incident_response"
-            operator_intent_state.pinned_constraints = []
-        return operator_intent_state
-
-    pending_summary = _extract_pending_step_summary(text)
-    pending_kind, pending_stage = _classify_pending_step(text, turn_plan)
-    operator_intent_state.pending_step_summary = pending_summary
-    operator_intent_state.pending_step_focus = str(getattr(turn_plan, "focus", "general") or "general")
-    operator_intent_state.pending_step_stage = pending_stage
-    operator_intent_state.pending_step_kind = pending_kind
-    operator_intent_state.awaiting_follow_up = True
-    if operator_intent_state.mode != "follow_up_action":
+    """Do not infer follow-up workflow state from assistant prose."""
+    del final_text, turn_plan, approval_pending
+    _clear_pending_step(operator_intent_state)
+    if operator_intent_state.mode == "follow_up_action":
         operator_intent_state.mode = "incident_response"
         operator_intent_state.pinned_constraints = []
     return operator_intent_state
@@ -354,35 +226,21 @@ def update_operator_intent_state(
     incident_state: IncidentState | None = None,
     approval_pending: bool = False,
 ) -> OperatorIntentState:
-    """Update persistent operator intent from conversational context."""
+    """Keep only explicit operator metadata; do not infer workflow from wording."""
     text = str(user_input or "").strip()
-    lowered = text.lower()
-    if not lowered:
+    if not text:
         return operator_intent_state
 
     operator_intent_state.last_user_instruction = text
     operator_intent_state.source_turn = turn_index
 
-    if approval_pending and lowered in _APPROVAL_DECISIONS:
-        return operator_intent_state
-
-    if operator_intent_state.awaiting_follow_up and _looks_like_follow_through(text):
-        operator_intent_state.mode = "follow_up_action"
-        operator_intent_state.execution_policy = "approval_required"
-        operator_intent_state.pinned_constraints = _build_operator_constraints(
-            operator_intent_state.mode,
-            operator_intent_state.execution_policy,
-        )
+    if approval_pending:
         return operator_intent_state
 
     operator_intent_state.mode = "incident_response"
     operator_intent_state.execution_policy = "approval_required"
     operator_intent_state.pinned_constraints = []
-    if operator_intent_state.awaiting_follow_up:
-        _clear_pending_step(operator_intent_state)
-
-    if incident_state is not None and incident_state.active and not operator_intent_state.awaiting_follow_up:
-        operator_intent_state.pinned_constraints = []
+    _clear_pending_step(operator_intent_state)
     return operator_intent_state
 
 
@@ -409,6 +267,8 @@ def _extract_first_sentence(text: str) -> str:
 
 def _trim_excerpt(text: str, *, max_chars: int = 600) -> str:
     clean = str(text or "").strip()
+    if looks_like_structured_payload(clean):
+        max_chars = max(max_chars, int(getattr(Config, "AGENT_STRUCTURED_TOOL_RESULT_MAX_CHARS", 12000)))
     if len(clean) <= max_chars:
         return clean
     return clean[: max_chars - 3].rstrip() + "..."

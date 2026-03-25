@@ -1,9 +1,6 @@
 """Approval state and write-command preview helpers for the agent."""
 
 from __future__ import annotations
-
-import json
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,21 +21,15 @@ class PendingAction:
 
 
 class ApprovalCoordinator:
-    """Tracks pending write actions and batch-restart promotion context."""
+    """Tracks pending write actions awaiting explicit approval."""
 
     def __init__(self) -> None:
         self.pending_action: PendingAction | None = None
         self.pending_actions: list[PendingAction] = []
-        self.recent_restart_candidates: list[str] = []
-        self.recent_restart_namespace: str | None = None
-        self.recent_restart_reason: str = ""
 
     def clear(self) -> None:
         self.pending_action = None
         self.pending_actions = []
-        self.recent_restart_candidates = []
-        self.recent_restart_namespace = None
-        self.recent_restart_reason = ""
 
     def set_pending_action(self, tool: Any, args: dict) -> None:
         self.pending_actions = []
@@ -50,84 +41,6 @@ class ApprovalCoordinator:
 
     def has_pending(self) -> bool:
         return self.pending_action is not None or bool(self.pending_actions)
-
-    def record_restart_context(self, tool_args: dict, model_response_text: str) -> None:
-        namespace = str(tool_args.get("namespace") or "").strip() or "auto"
-        reason = str(tool_args.get("reason") or "")
-        candidates = extract_pod_candidates_from_text(model_response_text)
-
-        requested = str(tool_args.get("pod_name") or "").strip()
-        if requested and requested not in candidates:
-            candidates.insert(0, requested)
-
-        self.recent_restart_candidates = candidates[:20]
-        self.recent_restart_namespace = namespace
-        self.recent_restart_reason = reason
-
-    def should_offer_batch_prompt(self, tool_name: str, tool_args: dict) -> bool:
-        if tool_name != "restart_kubernetes_pod":
-            return False
-
-        requested = str(tool_args.get("pod_name") or "").strip()
-        candidates = [str(p).strip() for p in self.recent_restart_candidates if str(p).strip()]
-        if requested and requested not in candidates:
-            candidates.insert(0, requested)
-
-        unique_candidates = list(dict.fromkeys(candidates))
-        return len(unique_candidates) > 1
-
-    def should_promote_to_batch(self, decision: str) -> bool:
-        if not self.pending_action:
-            return False
-        return self.pending_action.tool.name == "restart_kubernetes_pod" and is_batch_intent(decision)
-
-    def promote_pending_to_batch(self, tools: list[Any]) -> bool:
-        if not self.pending_action:
-            return False
-        if self.pending_action.tool.name != "restart_kubernetes_pod":
-            return False
-
-        candidates = list(self.recent_restart_candidates or [])
-        if len(candidates) <= 1:
-            return False
-
-        batch_tool = next((tool for tool in tools if tool.name == "restart_kubernetes_pods_batch"), None)
-        if batch_tool is None:
-            return False
-
-        # Batch restarts should default to namespace auto-resolution per pod.
-        namespace = "auto"
-        reason = self.recent_restart_reason or self.pending_action.args.get("reason") or "Batch restart requested by user"
-
-        self.pending_action = PendingAction(
-            tool=batch_tool,
-            args={
-                "pod_names": candidates,
-                "namespace": namespace,
-                "reason": reason,
-            },
-        )
-        self.pending_actions = []
-        return True
-
-
-def extract_pod_candidates_from_text(text: str) -> list[str]:
-    """Extract likely pod identifiers from free text."""
-    tokens = re.findall(r"\b[a-z0-9]+(?:-[a-z0-9]+){2,}\b", text or "")
-    out: list[str] = []
-    seen: set[str] = set()
-    for token in tokens:
-        if token in seen:
-            continue
-        seen.add(token)
-        out.append(token)
-    return out[:20]
-
-
-def is_batch_intent(decision: str) -> bool:
-    """Heuristic to detect user intent to restart all suggested pods at once."""
-    text = (decision or "").lower()
-    return ("all" in text and ("restart" in text or "do" in text)) or "at once" in text or "batch" in text
 
 
 def is_repairable_command_tool(tool_name: str) -> bool:
@@ -176,51 +89,6 @@ def parse_command_repair_response(text: str) -> dict[str, str] | None:
         "command": parsed.get("command", ""),
         "reason": parsed.get("reason", ""),
     }
-
-
-def attempt_known_command_repair(tool_name: str, command: str, failure_text: str) -> str | None:
-    """Apply deterministic repairs for common command-shape mistakes before using the LLM."""
-    if tool_name != "aws_cli_execute":
-        return None
-
-    failure = str(failure_text or "")
-    if (
-        "MixedInstancesPolicy.LaunchTemplate" not in failure
-        or "LaunchTemplateId" not in failure
-        or "Version" not in failure
-    ):
-        return None
-
-    match = re.search(r"--mixed-instances-policy\s+'(?P<payload>\{.*\})'", command)
-    if not match:
-        return None
-
-    payload_text = match.group("payload")
-    try:
-        payload = json.loads(payload_text)
-    except json.JSONDecodeError:
-        return None
-
-    launch_template = payload.get("LaunchTemplate")
-    if not isinstance(launch_template, dict):
-        return None
-    if "LaunchTemplateSpecification" in launch_template:
-        return None
-    if "LaunchTemplateId" not in launch_template and "Version" not in launch_template:
-        return None
-
-    repaired_launch_template: dict[str, Any] = {
-        "LaunchTemplateSpecification": {
-            "LaunchTemplateId": launch_template.get("LaunchTemplateId"),
-            "Version": launch_template.get("Version", "$Default"),
-        }
-    }
-    if isinstance(launch_template.get("Overrides"), list):
-        repaired_launch_template["Overrides"] = launch_template["Overrides"]
-
-    payload["LaunchTemplate"] = repaired_launch_template
-    repaired_payload = json.dumps(payload, separators=(",", ":"))
-    return command.replace(payload_text, repaired_payload, 1)
 
 
 def format_command_preview(tool_name: str, tool_args: dict) -> str:
