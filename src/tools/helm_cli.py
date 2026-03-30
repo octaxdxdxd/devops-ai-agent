@@ -1,149 +1,132 @@
-"""Generic Helm command tools."""
+"""Helm connector for semantic investigations and approval-gated writes."""
 
 from __future__ import annotations
 
-import shlex
 import shutil
-import subprocess
-
-from langchain_core.tools import tool
+from typing import Any
 
 from ..config import Config
-from ..utils.command_intent import classify_command_intent
-from .k8s_common import truncate_text
+from .common import ToolObservation, first_non_flag, format_error_summary, parse_json_output, run_subprocess, shell_split, truncate_text
 
 
-def _helm_not_found_msg() -> str:
-    return "❌ `helm` not found in PATH in this runtime. I cannot execute Helm commands here until it is available."
+_READONLY_VERBS = {"get", "history", "list", "search", "show", "status", "template", "version"}
+_FLAG_NAMES = {"-n", "--namespace", "--kube-context", "--kubeconfig", "--output"}
 
 
-def _ensure_helm_installed() -> bool:
-    return bool(shutil.which("helm"))
+class HelmConnector:
+    def __init__(self) -> None:
+        self.family = "helm"
 
+    @staticmethod
+    def _ensure_binary() -> None:
+        if not shutil.which("helm"):
+            raise RuntimeError("helm is not installed or not on PATH")
 
-def _normalize_helm_command(command: str) -> tuple[list[str] | None, str | None]:
-    raw = (command or "").strip()
-    if not raw:
-        return None, "❌ command is required. Example: `list -A`."
-    try:
-        tokens = shlex.split(raw)
-    except ValueError as exc:
-        return None, f"❌ Invalid helm command syntax: {exc}"
+    @staticmethod
+    def _base_args() -> list[str]:
+        args = ["helm"]
+        if Config.K8S_KUBECONFIG:
+            args.extend(["--kubeconfig", Config.K8S_KUBECONFIG])
+        if Config.K8S_CONTEXT:
+            args.extend(["--kube-context", Config.K8S_CONTEXT])
+        return args
 
-    if not tokens:
-        return None, "❌ command is required."
-    if tokens[0].lower() == "helm":
-        tokens = tokens[1:]
-    if not tokens:
-        return None, "❌ command is required after `helm`."
+    def _run(self, tokens: list[str]) -> tuple[list[str], Any]:
+        self._ensure_binary()
+        args = [*self._base_args(), *tokens]
+        result = run_subprocess(args, timeout_sec=Config.HELM_TIMEOUT_SEC)
+        if not result.ok:
+            raise RuntimeError(format_error_summary(result))
+        payload = parse_json_output(result.stdout)
+        return [result.command], payload if payload is not None else result.stdout
 
-    first = tokens[0].lower()
-    if first == "kubectl":
-        return None, "❌ Invalid helm command: this looks like a kubectl command. Use `kubectl_readonly` or `kubectl_execute`."
-    if first == "aws":
-        return None, "❌ Invalid helm command: this looks like an AWS CLI command. Use `aws_cli_readonly` or `aws_cli_execute`."
-
-    return tokens, None
-
-
-def _run_helm(args: list[str]) -> tuple[int, str, str]:
-    proc = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        timeout=max(10, Config.K8S_REQUEST_TIMEOUT_SEC + 20),
-    )
-    return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
-
-
-def _command_result(command_args: list[str], *, reason: str = "") -> str:
-    command_text = shlex.join(command_args)
-    code, out, err = _run_helm(command_args)
-    if code != 0:
-        return (
-            f"Planned command:\n```bash\n{command_text}\n```\n"
-            f"❌ helm command failed (exit={code}).\n"
-            f"Details: {truncate_text(err or out or 'unknown error')}"
+    def release_overview(self, *, all_namespaces: bool = True) -> ToolObservation:
+        tokens = ["list", "-o", "json"]
+        if all_namespaces:
+            tokens.append("-A")
+        commands, payload = self._run(tokens)
+        releases = payload if isinstance(payload, list) else []
+        structured_releases = []
+        for item in releases:
+            if not isinstance(item, dict):
+                continue
+            structured_releases.append(
+                {
+                    "name": item.get("name"),
+                    "namespace": item.get("namespace"),
+                    "revision": item.get("revision"),
+                    "status": item.get("status"),
+                    "chart": item.get("chart"),
+                    "app_version": item.get("app_version"),
+                }
+            )
+        summary = f"Found {len(structured_releases)} Helm release(s)."
+        return ToolObservation(
+            family=self.family,
+            action="release_overview",
+            summary=summary,
+            structured={"releases": structured_releases[:80]},
+            commands=commands,
+            raw_preview=truncate_text(str(structured_releases[:16]), max_chars=1800),
         )
 
-    reason_line = f"\nReason: {reason}" if reason else ""
-    return (
-        f"Planned command:\n```bash\n{command_text}\n```\n"
-        f"✅ helm command executed successfully.{reason_line}\n"
-        f"Output:\n{truncate_text(out or '(no output)')}"
-    )
-
-
-def _intent_error(intent, *, readonly: bool) -> str | None:
-    if intent.is_blocked:
-        return f"❌ {intent.reason}"
-    if intent.is_sensitive_read:
-        return f"❌ {intent.reason}"
-    if readonly and intent.capability == "write":
-        return (
-            f"❌ helm verb `{intent.verb or 'unknown'}` appears mutating and is blocked in helm_readonly. "
-            "Use `helm_execute` (approval required)."
-        )
-    if not readonly and intent.capability == "safe_read":
-        return (
-            f"❌ helm verb `{intent.verb or 'unknown'}` is read-only. "
-            "Use `helm_readonly` instead."
-        )
-    return None
-
-
-@tool
-def helm_readonly(command: str) -> str:
-    """Run a Helm read command.
-
-    Examples:
-    - list -A
-    - status gitlab -n gitlab
-    - get values gitlab -n gitlab
-    """
-    if not _ensure_helm_installed():
-        return _helm_not_found_msg()
-
-    tokens, err = _normalize_helm_command(command)
-    if err:
-        return err
-    assert tokens is not None
-
-    intent = classify_command_intent("helm_readonly", shlex.join(tokens))
-    intent_err = _intent_error(intent, readonly=True)
-    if intent_err:
-        return intent_err
-
-    return _command_result(["helm", *tokens])
-
-
-@tool
-def helm_execute(command: str, reason: str = "") -> str:
-    """Run mutating Helm commands only."""
-    if not _ensure_helm_installed():
-        return _helm_not_found_msg()
-
-    tokens, err = _normalize_helm_command(command)
-    if err:
-        return err
-    assert tokens is not None
-
-    command_args = ["helm", *tokens]
-    command_text = shlex.join(command_args)
-    intent = classify_command_intent("helm_execute", shlex.join(tokens))
-    intent_err = _intent_error(intent, readonly=False)
-    if intent_err:
-        return intent_err
-
-    if Config.K8S_DRY_RUN and intent.is_mutating:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            f"Planned command:\n```bash\n{command_text}\n```\n"
-            f"Reason: {reason or 'n/a'}"
+    def release_details(self, *, release_name: str, namespace: str) -> ToolObservation:
+        status_commands, status_payload = self._run(["status", release_name, "-n", namespace, "-o", "json"])
+        values_commands, values_payload = self._run(["get", "values", release_name, "-n", namespace, "-o", "yaml"])
+        manifest_commands, manifest_payload = self._run(["get", "manifest", release_name, "-n", namespace])
+        structured = {
+            "release_name": release_name,
+            "namespace": namespace,
+            "status": status_payload,
+            "values": values_payload,
+            "manifest_preview": truncate_text(str(manifest_payload), max_chars=2400),
+        }
+        return ToolObservation(
+            family=self.family,
+            action="release_details",
+            summary=f"Collected Helm release details for `{release_name}` in namespace `{namespace}`.",
+            structured=structured,
+            commands=[*status_commands, *values_commands, *manifest_commands],
+            raw_preview=truncate_text(str(structured), max_chars=2600),
         )
 
-    return _command_result(command_args, reason=reason)
+    def raw_read(self, command: str) -> ToolObservation:
+        tokens = shell_split(command)
+        if tokens and tokens[0] == "helm":
+            tokens = tokens[1:]
+        verb = first_non_flag(tokens, skip_value_flags=_FLAG_NAMES)
+        if verb not in _READONLY_VERBS:
+            raise RuntimeError(f"`{command}` is not a recognized read-only Helm command")
+        commands, payload = self._run(tokens)
+        return ToolObservation(
+            family=self.family,
+            action="raw_read",
+            summary=f"Executed read-only Helm command `{command}`.",
+            structured={"command": command, "output": payload},
+            commands=commands,
+            raw_preview=truncate_text(str(payload), max_chars=2400),
+        )
 
-
-def get_helm_tools() -> list:
-    return [helm_readonly, helm_execute]
+    def execute(self, command: str) -> ToolObservation:
+        tokens = shell_split(command)
+        if tokens and tokens[0] == "helm":
+            tokens = tokens[1:]
+        if Config.K8S_DRY_RUN:
+            args = [*self._base_args(), *tokens]
+            return ToolObservation(
+                family=self.family,
+                action="raw_write",
+                summary="Helm dry-run mode is enabled; no mutating command was executed.",
+                structured={"command": " ".join(args), "dry_run": True},
+                commands=[" ".join(args)],
+                raw_preview="dry run",
+            )
+        commands, payload = self._run(tokens)
+        return ToolObservation(
+            family=self.family,
+            action="raw_write",
+            summary=f"Executed mutating Helm command `{command}` successfully.",
+            structured={"command": command, "output": payload},
+            commands=commands,
+            raw_preview=truncate_text(str(payload), max_chars=2400),
+        )

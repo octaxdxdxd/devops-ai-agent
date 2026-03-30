@@ -1,5 +1,5 @@
-"""Autonomous monitoring package."""
+"""Autonomy package placeholder.
 
-from .simple_monitor import SimpleAutonomyEngine
-
-__all__ = ["SimpleAutonomyEngine"]
+The rebuilt backend does not use the previous background autonomy subsystem.
+UI compatibility is handled directly by LogAnalyzerAgent.
+"""

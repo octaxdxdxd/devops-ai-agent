@@ -1,47 +1,18 @@
-"""AWS CLI tools with safety guardrails.
-
-Design:
-- Read-only tool is default and constrained by allowlist.
-- Write tool is separately exposed and intended to require explicit approval.
-- All executions are audited to JSONL.
-"""
+"""AWS connector for semantic investigations and approval-gated writes."""
 
 from __future__ import annotations
 
-import fnmatch
-import json
+from collections import Counter
 import os
-import re
-import shlex
 import shutil
-import subprocess
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-
-from langchain_core.tools import tool
+from typing import Any
 
 from ..config import Config
-from ..utils.command_intent import classify_command_intent
-from .k8s_common import truncate_text
+from .common import ToolObservation, format_error_summary, parse_json_output, run_subprocess, shell_split, truncate_text
 
 
-_SAFE_TOKEN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-_GLOBAL_SERVICES = {
-    "route53",
-    "cloudfront",
-    "organizations",
-    "iam",
-    "account",
-    "shield",
-}
-_META_KEYS = {"responsemetadata", "nexttoken", "marker", "istruncated", "continuationtoken"}
-_READONLY_OPERATION_EXCEPTIONS = {
-    "start-query",
-    "get-query-results",
-    "filter-log-events",
-    "generate-query",
-}
+_GLOBAL_SERVICES = {"iam", "route53", "organizations", "cloudfront", "account", "sts"}
+_READONLY_OPERATION_EXCEPTIONS = {"start-query", "get-query-results", "filter-log-events"}
 _MUTATING_OPERATION_PREFIXES = (
     "add",
     "associate",
@@ -56,12 +27,9 @@ _MUTATING_OPERATION_PREFIXES = (
     "disassociate",
     "enable",
     "execute",
-    "export",
     "import",
     "modify",
     "patch",
-    "promote",
-    "publish",
     "put",
     "reboot",
     "register",
@@ -71,7 +39,6 @@ _MUTATING_OPERATION_PREFIXES = (
     "restore",
     "resume",
     "revoke",
-    "rotate",
     "run",
     "send",
     "set",
@@ -82,521 +49,361 @@ _MUTATING_OPERATION_PREFIXES = (
     "terminate",
     "untag",
     "update",
-    "upgrade",
 )
 
 
-def _csv_to_list(value: str) -> list[str]:
-    return [item.strip() for item in (value or "").split(",") if item.strip()]
-
-
-def _redact(text: str) -> str:
-    out = text or ""
-    out = re.sub(r"AKIA[0-9A-Z]{16}", "[REDACTED_AWS_ACCESS_KEY_ID]", out)
-    out = re.sub(r"ASIA[0-9A-Z]{16}", "[REDACTED_AWS_ACCESS_KEY_ID]", out)
-    out = re.sub(r"(?i)(aws_secret_access_key\s*[=:]\s*)([^\s]+)", r"\1[REDACTED]", out)
-    out = re.sub(r"(?i)(aws_session_token\s*[=:]\s*)([^\s]+)", r"\1[REDACTED]", out)
-    return out
-
-
-def _ensure_aws_cli_installed() -> bool:
-    return bool(shutil.which("aws"))
-
-
-def _normalize_command(command: str) -> tuple[list[str] | None, str | None]:
-    raw = (command or "").strip()
-    if not raw:
-        return None, "❌ command is required. Example: `sts get-caller-identity`."
-
-    try:
-        tokens = shlex.split(raw)
-    except ValueError as exc:
-        return None, f"❌ Invalid command syntax: {exc}"
-
-    if not tokens:
-        return None, "❌ command is required."
-
-    if tokens[0].lower() == "aws":
-        tokens = tokens[1:]
-
-    if len(tokens) < 2:
-        return None, "❌ Command must include service and operation (e.g., `ec2 describe-instances`)."
-
-    service = (tokens[0] or "").strip().lower()
-    operation = (tokens[1] or "").strip().lower()
-
-    if service in {"kubectl", "k8s", "kubernetes"}:
-        return (
-            None,
-            "❌ Invalid AWS CLI command: this looks like a Kubernetes command. "
-            "Use Kubernetes tools (`kubectl_readonly` / `kubectl_execute`) instead.",
-        )
-    if service == "helm":
-        return (
-            None,
-            "❌ Invalid AWS CLI command: this looks like a Helm command. "
-            "Use Helm tools (`helm_readonly` / `helm_execute`) instead.",
-        )
-
-    if not _SAFE_TOKEN.fullmatch(service):
-        return None, f"❌ Invalid AWS service token: {service!r}."
-    if not _SAFE_TOKEN.fullmatch(operation):
-        return None, f"❌ Invalid AWS operation token: {operation!r}."
-
-    return tokens, None
-
-
-def _is_action_allowed(service: str, operation: str, patterns: list[str]) -> bool:
-    action = f"{service}:{operation}"
-    action_lower = action.lower()
-    for pattern in patterns:
-        p = pattern.strip().lower()
-        if not p:
+def _tag_name(tags: list[dict[str, Any]] | None) -> str:
+    for tag in tags or []:
+        if not isinstance(tag, dict):
             continue
-        if ":" not in p:
-            continue
-        if fnmatch.fnmatch(action_lower, p):
-            return True
-    return False
-
-
-def _looks_mutating_operation(operation: str) -> bool:
-    op = (operation or "").strip().lower()
-    if not op:
-        return True
-    if op in _READONLY_OPERATION_EXCEPTIONS:
-        return False
-    return op.startswith(_MUTATING_OPERATION_PREFIXES)
-
-
-def _build_final_args(tokens: list[str]) -> list[str]:
-    final = ["aws", "--no-cli-pager", *tokens]
-
-    lowered = [str(item).lower() for item in tokens]
-    if Config.AWS_CLI_PROFILE and "--profile" not in lowered:
-        final.extend(["--profile", Config.AWS_CLI_PROFILE])
-    if Config.AWS_CLI_DEFAULT_REGION and "--region" not in lowered:
-        final.extend(["--region", Config.AWS_CLI_DEFAULT_REGION])
-
-    return final
-
-
-def _has_region_flag(tokens: list[str]) -> bool:
-    lowered = [str(item).lower() for item in tokens]
-    for i, item in enumerate(lowered):
-        if item == "--region":
-            return i + 1 < len(lowered)
-        if item.startswith("--region="):
-            return True
-    return False
-
-
-def _append_region(tokens: list[str], region: str) -> list[str]:
-    if _has_region_flag(tokens):
-        return list(tokens)
-    return [*tokens, "--region", region]
-
-
-def _resolve_preferred_region() -> str:
-    for value in [
-        Config.AWS_CLI_DEFAULT_REGION,
-        os.getenv("AWS_REGION", "").strip(),
-        os.getenv("AWS_DEFAULT_REGION", "").strip(),
-    ]:
-        if value:
-            return value
+        if str(tag.get("Key") or "") == "Name":
+            return str(tag.get("Value") or "")
     return ""
 
 
-def _candidate_regions() -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
+class AWSConnector:
+    def __init__(self) -> None:
+        self.family = "aws"
 
-    preferred = _resolve_preferred_region()
-    if preferred:
-        seen.add(preferred)
-        out.append(preferred)
+    @staticmethod
+    def _ensure_binary() -> None:
+        if not shutil.which("aws"):
+            raise RuntimeError("aws CLI is not installed or not on PATH")
 
-    for value in _csv_to_list(Config.AWS_CLI_FALLBACK_REGIONS):
-        if value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
+    @staticmethod
+    def _preferred_region() -> str:
+        for value in [
+            Config.AWS_CLI_DEFAULT_REGION,
+            os.getenv("AWS_REGION", "").strip(),
+            os.getenv("AWS_DEFAULT_REGION", "").strip(),
+        ]:
+            if value:
+                return value
+        return ""
 
-    limit = max(1, Config.AWS_CLI_AUTO_REGION_FANOUT_MAX)
-    return out[:limit]
+    @classmethod
+    def _candidate_regions(cls) -> list[str]:
+        preferred = cls._preferred_region()
+        seen: set[str] = set()
+        regions: list[str] = []
+        if preferred:
+            seen.add(preferred)
+            regions.append(preferred)
+        for item in [value.strip() for value in str(Config.AWS_CLI_FALLBACK_REGIONS or "").split(",") if value.strip()]:
+            if item in seen:
+                continue
+            seen.add(item)
+            regions.append(item)
+        return regions[: max(1, int(Config.AWS_CLI_AUTO_REGION_FANOUT_MAX))]
 
+    @staticmethod
+    def _normalize_tokens(command: str) -> list[str]:
+        tokens = shell_split(command)
+        if tokens and tokens[0].lower() == "aws":
+            tokens = tokens[1:]
+        if len(tokens) < 2:
+            raise ValueError("AWS command must include service and operation")
+        return tokens
 
-def _is_effectively_empty_json(value) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value.strip() == ""
-    if isinstance(value, list):
-        if not value:
-            return True
-        return all(_is_effectively_empty_json(item) for item in value)
-    if isinstance(value, dict):
-        keys = [k for k in value.keys() if str(k).lower() not in _META_KEYS]
-        if not keys:
-            return True
-        return all(_is_effectively_empty_json(value.get(k)) for k in keys)
-    return False
+    @staticmethod
+    def _service_and_operation(tokens: list[str]) -> tuple[str, str]:
+        return str(tokens[0] or "").lower(), str(tokens[1] or "").lower()
 
-
-def _is_effectively_empty_output(stdout: str) -> bool:
-    text = (stdout or "").strip()
-    if not text:
-        return True
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
+    @staticmethod
+    def _has_region(tokens: list[str]) -> bool:
+        for index, token in enumerate(tokens):
+            lowered = str(token).lower()
+            if lowered == "--region" and index + 1 < len(tokens):
+                return True
+            if lowered.startswith("--region="):
+                return True
         return False
-    return _is_effectively_empty_json(payload)
 
+    @staticmethod
+    def _append_region(tokens: list[str], region: str) -> list[str]:
+        if not region or AWSConnector._has_region(tokens):
+            return list(tokens)
+        return [*tokens, "--region", region]
 
-def _run_aws(final_args: list[str]) -> tuple[int, str, str, float]:
-    t0 = time.perf_counter()
-    proc = subprocess.run(
-        final_args,
-        capture_output=True,
-        text=True,
-        timeout=max(5, Config.AWS_CLI_TIMEOUT_SEC),
-    )
-    duration_ms = (time.perf_counter() - t0) * 1000.0
-    stdout = (proc.stdout or "").strip()
-    stderr = (proc.stderr or "").strip()
-    return proc.returncode, stdout, stderr, duration_ms
+    @staticmethod
+    def _is_mutating(operation: str) -> bool:
+        lowered = str(operation or "").lower()
+        if lowered in _READONLY_OPERATION_EXCEPTIONS:
+            return False
+        return lowered.startswith(_MUTATING_OPERATION_PREFIXES)
 
+    @staticmethod
+    def _base_args(tokens: list[str]) -> list[str]:
+        args = ["aws", "--no-cli-pager", *tokens]
+        lowered = [str(item).lower() for item in tokens]
+        if Config.AWS_CLI_PROFILE and "--profile" not in lowered:
+            args.extend(["--profile", Config.AWS_CLI_PROFILE])
+        if Config.AWS_CLI_DEFAULT_REGION and "--region" not in lowered:
+            args.extend(["--region", Config.AWS_CLI_DEFAULT_REGION])
+        return args
 
-def _bash_block(command_text: str) -> str:
-    return f"```bash\n{command_text}\n```"
+    def _run(self, tokens: list[str]) -> tuple[str, Any]:
+        self._ensure_binary()
+        args = self._base_args(tokens)
+        result = run_subprocess(args, timeout_sec=Config.AWS_CLI_TIMEOUT_SEC)
+        if not result.ok:
+            raise RuntimeError(format_error_summary(result))
+        payload = parse_json_output(result.stdout)
+        return result.command, payload if payload is not None else result.stdout
 
+    def _run_multi_region(self, tokens: list[str], *, force_all_regions: bool = False) -> tuple[list[str], list[dict[str, Any]]]:
+        service, _ = self._service_and_operation(tokens)
+        if service in _GLOBAL_SERVICES:
+            command, payload = self._run(tokens)
+            return [command], [{"region": "global", "payload": payload}]
 
-def _audit(
-    *,
-    mode: str,
-    command: str,
-    service: str,
-    operation: str,
-    allowed: bool,
-    reason: str,
-    exit_code: int | None,
-    duration_ms: float | None,
-    stdout_len: int,
-    stderr_len: int,
-) -> None:
-    path = Path(Config.AWS_CLI_AUDIT_LOG)
-    path.parent.mkdir(parents=True, exist_ok=True)
+        commands: list[str] = []
+        outputs: list[dict[str, Any]] = []
+        regions = self._candidate_regions()
+        if self._has_region(tokens):
+            command, payload = self._run(tokens)
+            return [command], [{"region": "explicit", "payload": payload}]
+        if not force_all_regions and Config.AWS_CLI_DEFAULT_REGION:
+            command, payload = self._run(self._append_region(tokens, Config.AWS_CLI_DEFAULT_REGION))
+            return [command], [{"region": Config.AWS_CLI_DEFAULT_REGION, "payload": payload}]
+        for region in regions:
+            command, payload = self._run(self._append_region(tokens, region))
+            commands.append(command)
+            outputs.append({"region": region, "payload": payload})
+        return commands, outputs
 
-    event = {
-        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "schema": "aiops.aws_cli_audit.v1",
-        "user": os.getenv("USER") or os.getenv("USERNAME") or "unknown",
-        "mode": mode,
-        "service": service,
-        "operation": operation,
-        "allowed": allowed,
-        "reason": reason,
-        "exit_code": exit_code,
-        "duration_ms": duration_ms,
-        "stdout_len": stdout_len,
-        "stderr_len": stderr_len,
-        "command": _redact(command),
-    }
-
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
-
-
-def _intent_error(intent, *, readonly: bool) -> str | None:
-    if intent.is_blocked:
-        return f"❌ {intent.reason}"
-    if intent.is_sensitive_read:
-        return f"❌ {intent.reason}"
-    if readonly and intent.capability == "write":
-        return (
-            f"❌ Action `{intent.verb or 'unknown'}` looks mutating and is blocked in `aws_cli_readonly`. "
-            "Use `aws_cli_execute` (approval required)."
+    def identity(self) -> ToolObservation:
+        command, payload = self._run(["sts", "get-caller-identity"])
+        summary = f"Authenticated as AWS account `{payload.get('Account', 'unknown')}`." if isinstance(payload, dict) else "Retrieved AWS caller identity."
+        return ToolObservation(
+            family=self.family,
+            action="identity",
+            summary=summary,
+            structured=payload if isinstance(payload, dict) else {"output": payload},
+            commands=[command],
+            raw_preview=truncate_text(str(payload), max_chars=1200),
         )
-    if not readonly and intent.capability == "safe_read":
-        return (
-            f"❌ Action `{intent.verb or 'unknown'}` is read-only. "
-            "Use `aws_cli_readonly` instead."
-        )
-    return None
 
-
-def _execute(tokens: list[str], *, mode: str, reason: str = "") -> str:
-    service = tokens[0].lower()
-    operation = tokens[1].lower()
-
-    if Config.AWS_CLI_ENFORCE_BLOCKLIST:
-        blocklist = _csv_to_list(Config.AWS_CLI_BLOCKLIST)
-        if _is_action_allowed(service, operation, blocklist):
-            _audit(
-                mode=mode,
-                command=" ".join(["aws", *tokens]),
-                service=service,
-                operation=operation,
-                allowed=False,
-                reason="blocked_by_blocklist",
-                exit_code=None,
-                duration_ms=None,
-                stdout_len=0,
-                stderr_len=0,
-            )
-            return f"❌ Action `{service}:{operation}` is blocked by policy."
-
-    if mode == "readonly":
-        if _looks_mutating_operation(operation):
-            _audit(
-                mode=mode,
-                command=" ".join(["aws", *tokens]),
-                service=service,
-                operation=operation,
-                allowed=False,
-                reason="mutating_operation_in_readonly_mode",
-                exit_code=None,
-                duration_ms=None,
-                stdout_len=0,
-                stderr_len=0,
-            )
-            return (
-                f"❌ Action `{service}:{operation}` looks mutating and is blocked in `aws_cli_readonly`. "
-                "Use `aws_cli_execute` (approval required)."
-            )
-
-        if not Config.AWS_CLI_ALLOW_ALL_READ:
-            readonly_allowlist = _csv_to_list(Config.AWS_CLI_READONLY_ALLOWLIST)
-            if not _is_action_allowed(service, operation, readonly_allowlist):
-                _audit(
-                    mode=mode,
-                    command=" ".join(["aws", *tokens]),
-                    service=service,
-                    operation=operation,
-                    allowed=False,
-                    reason="not_in_readonly_allowlist",
-                    exit_code=None,
-                    duration_ms=None,
-                    stdout_len=0,
-                    stderr_len=0,
+    def regions(self) -> ToolObservation:
+        command, payload = self._run(["ec2", "describe-regions", "--all-regions"])
+        regions = []
+        if isinstance(payload, dict):
+            for item in payload.get("Regions") or []:
+                if not isinstance(item, dict):
+                    continue
+                regions.append(
+                    {
+                        "name": item.get("RegionName"),
+                        "opt_in_status": item.get("OptInStatus"),
+                    }
                 )
-                return (
-                    f"❌ Action `{service}:{operation}` is not in readonly allowlist. "
-                    "Use `aws_cli_execute` (with approval) and allowlist configuration for mutating commands."
-                )
-
-    if mode == "write" and not Config.AWS_CLI_ALLOW_ALL_WRITE:
-        write_allowlist = _csv_to_list(Config.AWS_CLI_WRITE_ALLOWLIST)
-        if not _is_action_allowed(service, operation, write_allowlist):
-            _audit(
-                mode=mode,
-                command=" ".join(["aws", *tokens]),
-                service=service,
-                operation=operation,
-                allowed=False,
-                reason="not_in_write_allowlist",
-                exit_code=None,
-                duration_ms=None,
-                stdout_len=0,
-                stderr_len=0,
-            )
-            return (
-                f"❌ Action `{service}:{operation}` is not in write allowlist. "
-                "Add an explicit allowlist pattern in AWS_CLI_WRITE_ALLOWLIST to permit it."
-            )
-
-    service_is_global = service in _GLOBAL_SERVICES
-    region_provided = _has_region_flag(tokens)
-    preferred_region = _resolve_preferred_region()
-
-    if mode == "write" and Config.AWS_CLI_DRY_RUN:
-        final_args = _build_final_args(tokens)
-        command_text = " ".join(final_args)
-        _audit(
-            mode=mode,
-            command=command_text,
-            service=service,
-            operation=operation,
-            allowed=True,
-            reason="dry_run",
-            exit_code=0,
-            duration_ms=0.0,
-            stdout_len=0,
-            stderr_len=0,
-        )
-        return (
-            "🧪 AWS CLI dry-run mode enabled; no command executed.\n"
-            f"Planned command:\n{_bash_block(command_text)}\n"
-            f"Reason: {reason or 'n/a'}"
+        return ToolObservation(
+            family=self.family,
+            action="regions",
+            summary=f"Discovered {len(regions)} AWS regions.",
+            structured={"regions": regions},
+            commands=[command],
+            raw_preview=truncate_text(str(regions[:20]), max_chars=1800),
         )
 
-    attempts: list[tuple[list[str], str]] = []
-    if mode == "readonly" and not service_is_global and not region_provided:
-        if preferred_region:
-            attempts.append((_build_final_args(_append_region(tokens, preferred_region)), preferred_region))
-        elif Config.AWS_CLI_REQUIRE_DEFAULT_REGION_FOR_REGIONAL:
-            return (
-                f"❌ `{service}:{operation}` is a regional AWS API and no region was provided.\n"
-                "Set `AWS_CLI_DEFAULT_REGION` in .env or provide `--region <region>` in the command."
-            )
-        elif Config.AWS_CLI_AUTO_REGION_RETRY:
-            candidate_regions = _candidate_regions()
-            if candidate_regions:
-                for r in candidate_regions:
-                    attempts.append((_build_final_args(_append_region(tokens, r)), r))
-            else:
-                attempts.append((_build_final_args(tokens), "auto/default"))
+    def ec2_overview(self, *, states: list[str] | None = None, regions: list[str] | None = None, all_regions: bool = True) -> ToolObservation:
+        state_values = states or ["pending", "running", "stopping", "stopped"]
+        tokens = [
+            "ec2",
+            "describe-instances",
+            "--filters",
+            f"Name=instance-state-name,Values={','.join(state_values)}",
+        ]
+        commands: list[str] = []
+        outputs: list[dict[str, Any]] = []
+        if regions:
+            for region in regions:
+                command, payload = self._run(self._append_region(tokens, region))
+                commands.append(command)
+                outputs.append({"region": region, "payload": payload})
         else:
-            attempts.append((_build_final_args(tokens), "explicit/default"))
-    else:
-        attempts.append((_build_final_args(tokens), "explicit/default"))
+            commands, outputs = self._run_multi_region(tokens, force_all_regions=all_regions)
 
-    regions_checked: list[str] = []
-    first_error: str | None = None
-    saw_empty_success = False
-    last_command_text = ""
-    last_stdout = ""
-
-    for final_args, attempt_region in attempts:
-        command_text = " ".join(final_args)
-        last_command_text = command_text
-        regions_checked.append(attempt_region)
-
-        try:
-            code, stdout, stderr, duration_ms = _run_aws(final_args)
-            last_stdout = stdout
-            _audit(
-                mode=mode,
-                command=command_text,
-                service=service,
-                operation=operation,
-                allowed=True,
-                reason="executed",
-                exit_code=code,
-                duration_ms=duration_ms,
-                stdout_len=len(stdout),
-                stderr_len=len(stderr),
-            )
-
-            if code != 0:
-                if not first_error:
-                    first_error = (
-                        f"Planned command:\n{_bash_block(command_text)}\n"
-                        f"❌ AWS CLI command failed (exit={code}).\n"
-                        f"Details: {truncate_text(_redact(stderr or stdout or 'unknown error'))}"
+        instances: list[dict[str, Any]] = []
+        state_counts: Counter[str] = Counter()
+        for item in outputs:
+            region = str(item.get("region") or "")
+            payload = item.get("payload")
+            reservations = payload.get("Reservations") if isinstance(payload, dict) else []
+            for reservation in reservations or []:
+                if not isinstance(reservation, dict):
+                    continue
+                for instance in reservation.get("Instances") or []:
+                    if not isinstance(instance, dict):
+                        continue
+                    state = ((instance.get("State") or {}).get("Name")) or "unknown"
+                    state_counts[str(state)] += 1
+                    instances.append(
+                        {
+                            "region": region,
+                            "instance_id": instance.get("InstanceId"),
+                            "state": state,
+                            "instance_type": instance.get("InstanceType"),
+                            "private_ip": instance.get("PrivateIpAddress"),
+                            "name": _tag_name(instance.get("Tags")),
+                        }
                     )
-                continue
-
-            if mode == "readonly" and len(attempts) > 1 and _is_effectively_empty_output(stdout):
-                saw_empty_success = True
-                continue
-
-            output = stdout or "(no output)"
-            region_suffix = ""
-            if mode == "readonly" and len(attempts) > 1:
-                region_suffix = f"\nRegions checked: {', '.join(regions_checked)}"
-            return (
-                f"Planned command:\n{_bash_block(command_text)}\n"
-                f"✅ AWS CLI command executed successfully.{region_suffix}\n"
-                f"Output:\n{truncate_text(_redact(output), max_chars=Config.K8S_OUTPUT_MAX_CHARS)}"
-            )
-        except subprocess.TimeoutExpired:
-            _audit(
-                mode=mode,
-                command=command_text,
-                service=service,
-                operation=operation,
-                allowed=True,
-                reason="timeout",
-                exit_code=124,
-                duration_ms=float(Config.AWS_CLI_TIMEOUT_SEC) * 1000.0,
-                stdout_len=0,
-                stderr_len=0,
-            )
-            if not first_error:
-                first_error = (
-                    f"❌ AWS CLI command timed out after {Config.AWS_CLI_TIMEOUT_SEC}s.\n"
-                    f"Command:\n{_bash_block(command_text)}"
-                )
-            continue
-
-    if saw_empty_success and mode == "readonly" and len(attempts) == 1 and not service_is_global and not region_provided:
-        if Config.AWS_CLI_PROMPT_FOR_REGION_ON_EMPTY:
-            prompt_lines = [
-                f"Planned command:\n{_bash_block(last_command_text)}",
-                f"✅ No resources found in region `{regions_checked[0]}`.",
-                "You can provide a different region (for example `--region us-west-2`) and I will rerun.",
-            ]
-            if Config.AWS_CLI_AUTO_REGION_RETRY:
-                fanout_regions = _candidate_regions()
-                if fanout_regions:
-                    prompt_lines.append(f"If you want, I can also scan fallback regions: {', '.join(fanout_regions)}")
-            return "\n".join(prompt_lines)
-
-    if saw_empty_success and mode == "readonly" and len(attempts) > 1:
-        details = truncate_text(_redact(last_stdout or "(no output)"), max_chars=Config.K8S_OUTPUT_MAX_CHARS)
-        return (
-            f"Planned command:\n{_bash_block(last_command_text)}\n"
-            "✅ AWS CLI command executed, but no resources were found in checked regions.\n"
-            f"Regions checked: {', '.join(regions_checked)}\n"
-            f"Output:\n{details}"
+        summary = f"Found {len(instances)} EC2 instance(s) across {len({item['region'] for item in outputs}) or 1} region(s)."
+        if state_counts:
+            summary += " States: " + ", ".join(f"{state}={count}" for state, count in state_counts.most_common())
+        return ToolObservation(
+            family=self.family,
+            action="ec2_overview",
+            summary=summary,
+            structured={"state_counts": dict(state_counts), "instances": instances[:120], "regions_checked": [item["region"] for item in outputs]},
+            commands=commands,
+            raw_preview=truncate_text(str(instances[:20]), max_chars=2200),
         )
 
-    return first_error or "❌ AWS CLI command did not complete successfully."
+    def asg_overview(self, *, all_regions: bool = True) -> ToolObservation:
+        tokens = ["autoscaling", "describe-auto-scaling-groups"]
+        commands, outputs = self._run_multi_region(tokens, force_all_regions=all_regions)
+        groups: list[dict[str, Any]] = []
+        for item in outputs:
+            region = str(item.get("region") or "")
+            payload = item.get("payload")
+            for group in (payload.get("AutoScalingGroups") if isinstance(payload, dict) else []) or []:
+                if not isinstance(group, dict):
+                    continue
+                groups.append(
+                    {
+                        "region": region,
+                        "name": group.get("AutoScalingGroupName"),
+                        "desired": group.get("DesiredCapacity"),
+                        "min": group.get("MinSize"),
+                        "max": group.get("MaxSize"),
+                        "instance_count": len(group.get("Instances") or []),
+                    }
+                )
+        summary = f"Found {len(groups)} Auto Scaling Group(s)."
+        return ToolObservation(
+            family=self.family,
+            action="asg_overview",
+            summary=summary,
+            structured={"auto_scaling_groups": groups[:120], "regions_checked": [item["region"] for item in outputs]},
+            commands=commands,
+            raw_preview=truncate_text(str(groups[:20]), max_chars=2200),
+        )
 
+    def eks_overview(self, *, all_regions: bool = True) -> ToolObservation:
+        commands: list[str] = []
+        clusters: list[dict[str, Any]] = []
+        for region in self._candidate_regions() if all_regions else [self._preferred_region()]:
+            if not region:
+                continue
+            list_command, list_payload = self._run(self._append_region(["eks", "list-clusters"], region))
+            commands.append(list_command)
+            names = list_payload.get("clusters") if isinstance(list_payload, dict) else []
+            for cluster_name in names or []:
+                describe_command, describe_payload = self._run(self._append_region(["eks", "describe-cluster", "--name", str(cluster_name)], region))
+                commands.append(describe_command)
+                cluster = (describe_payload.get("cluster") if isinstance(describe_payload, dict) else {}) or {}
+                cluster_record = {
+                    "region": region,
+                    "name": cluster.get("name"),
+                    "status": cluster.get("status"),
+                    "version": cluster.get("version"),
+                    "nodegroups": [],
+                }
+                nodegroup_command, nodegroup_payload = self._run(self._append_region(["eks", "list-nodegroups", "--cluster-name", str(cluster_name)], region))
+                commands.append(nodegroup_command)
+                nodegroup_names = nodegroup_payload.get("nodegroups") if isinstance(nodegroup_payload, dict) else []
+                for nodegroup_name in nodegroup_names or []:
+                    ng_command, ng_payload = self._run(
+                        self._append_region(
+                            ["eks", "describe-nodegroup", "--cluster-name", str(cluster_name), "--nodegroup-name", str(nodegroup_name)],
+                            region,
+                        )
+                    )
+                    commands.append(ng_command)
+                    nodegroup = (ng_payload.get("nodegroup") if isinstance(ng_payload, dict) else {}) or {}
+                    cluster_record["nodegroups"].append(
+                        {
+                            "name": nodegroup.get("nodegroupName"),
+                            "status": nodegroup.get("status"),
+                            "desired_size": ((nodegroup.get("scalingConfig") or {}).get("desiredSize")),
+                            "instance_types": nodegroup.get("instanceTypes") or [],
+                        }
+                    )
+                clusters.append(cluster_record)
+        summary = f"Found {len(clusters)} EKS cluster(s)."
+        return ToolObservation(
+            family=self.family,
+            action="eks_overview",
+            summary=summary,
+            structured={"clusters": clusters[:60]},
+            commands=commands,
+            raw_preview=truncate_text(str(clusters[:12]), max_chars=2400),
+        )
 
-@tool
-def aws_cli_readonly(command: str) -> str:
-    """Run an AWS CLI readonly command.
+    def compute_backing_overview(self) -> ToolObservation:
+        identity = self.identity()
+        ec2 = self.ec2_overview(all_regions=True)
+        asg = self.asg_overview(all_regions=True)
+        eks = self.eks_overview(all_regions=True)
+        structured = {
+            "identity": identity.structured,
+            "ec2": ec2.structured,
+            "asg": asg.structured,
+            "eks": eks.structured,
+        }
+        summary = (
+            f"AWS compute overview: {len(ec2.structured.get('instances', []))} EC2 instances, "
+            f"{len(asg.structured.get('auto_scaling_groups', []))} ASGs, "
+            f"{len(eks.structured.get('clusters', []))} EKS clusters discovered."
+        )
+        return ToolObservation(
+            family=self.family,
+            action="compute_backing_overview",
+            summary=summary,
+            structured=structured,
+            commands=[*identity.commands, *ec2.commands, *asg.commands, *eks.commands],
+            raw_preview=truncate_text(str(structured), max_chars=3000),
+        )
 
-    Input examples:
-    - sts get-caller-identity
-    - ec2 describe-instances --region us-east-1
+    def raw_read(self, command: str, *, all_regions: bool = True) -> ToolObservation:
+        tokens = self._normalize_tokens(command)
+        service, operation = self._service_and_operation(tokens)
+        if self._is_mutating(operation):
+            raise RuntimeError(f"`{command}` is not a recognized read-only AWS command")
+        commands, outputs = self._run_multi_region(tokens, force_all_regions=all_regions)
+        structured = {"service": service, "operation": operation, "results": outputs}
+        summary = f"Executed read-only AWS command `{command}` across {len(outputs)} target scope(s)."
+        return ToolObservation(
+            family=self.family,
+            action="raw_read",
+            summary=summary,
+            structured=structured,
+            commands=commands,
+            raw_preview=truncate_text(str(outputs), max_chars=2600),
+        )
 
-    In the default powerful posture, secret/decryption reads are allowed here.
-    """
-    if not Config.AWS_CLI_ENABLED:
-        return "❌ AWS CLI tools are disabled. Set AWS_CLI_ENABLED=1 to enable."
-    if not _ensure_aws_cli_installed():
-        return "❌ `aws` CLI not found in PATH in this runtime. I cannot execute AWS commands here until it is available."
-
-    tokens, err = _normalize_command(command)
-    if err:
-        return err
-    intent = classify_command_intent("aws_cli_readonly", shlex.join(tokens))
-    intent_err = _intent_error(intent, readonly=True)
-    if intent_err:
-        return intent_err
-    return _execute(tokens, mode="readonly")
-
-
-@tool
-def aws_cli_execute(command: str, reason: str = "") -> str:
-    """Run an AWS CLI mutating-capable command.
-
-    IMPORTANT: This is a mutating-capable tool and should require explicit user approval.
-    Read-only and sensitive-read commands are rejected here to keep generic execute
-    focused on explicit write operations. When AWS_CLI_ALLOW_ALL_WRITE=1, write
-    allowlist checks are bypassed.
-    """
-    if not Config.AWS_CLI_ENABLED:
-        return "❌ AWS CLI tools are disabled. Set AWS_CLI_ENABLED=1 to enable."
-    if not _ensure_aws_cli_installed():
-        return "❌ `aws` CLI not found in PATH in this runtime. I cannot execute AWS commands here until it is available."
-
-    tokens, err = _normalize_command(command)
-    if err:
-        return err
-    intent = classify_command_intent("aws_cli_execute", shlex.join(tokens))
-    intent_err = _intent_error(intent, readonly=False)
-    if intent_err:
-        return intent_err
-
-    reason = (reason or "").strip()
-    return _execute(tokens, mode="write", reason=reason)
-
-
-def get_aws_tools() -> list:
-    return [aws_cli_readonly, aws_cli_execute]
+    def execute(self, command: str) -> ToolObservation:
+        tokens = self._normalize_tokens(command)
+        _, operation = self._service_and_operation(tokens)
+        if not self._is_mutating(operation):
+            raise RuntimeError("AWS execute was called with a non-mutating command")
+        if Config.AWS_CLI_DRY_RUN:
+            args = self._base_args(tokens)
+            return ToolObservation(
+                family=self.family,
+                action="raw_write",
+                summary="AWS dry-run mode is enabled; no mutating command was executed.",
+                structured={"command": " ".join(args), "dry_run": True},
+                commands=[" ".join(args)],
+                raw_preview="dry run",
+            )
+        command_text, payload = self._run(tokens)
+        return ToolObservation(
+            family=self.family,
+            action="raw_write",
+            summary=f"Executed mutating AWS command `{command}` successfully.",
+            structured={"command": command_text, "output": payload},
+            commands=[command_text],
+            raw_preview=truncate_text(str(payload), max_chars=2400),
+        )

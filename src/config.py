@@ -1,201 +1,140 @@
-"""Configuration management for the AI Ops agent."""
+"""Lean configuration for the rebuilt AI Ops backend."""
+
+from __future__ import annotations
+
 import os
 import shutil
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-# Load environment variables
+
 load_dotenv()
 
 
+def _env_text(name: str, default: str = "") -> str:
+    return str(os.getenv(name, default) or "").strip()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env_text(name, "1" if default else "0").lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(_env_text(name, str(default)))
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(_env_text(name, str(default)))
+
+
 class Config:
-    """Application configuration"""
+    """Centralized runtime configuration.
 
-    SUPPORTED_LLM_PROVIDERS = ('gemini', 'openai', 'openrouter')
+    The new backend keeps only the values that materially affect runtime behavior.
+    A few legacy UI-facing flags remain as fixed compatibility constants.
+    """
 
-    # LLM Provider
-    # Supported values: 'gemini', 'openrouter', 'openai'
-    LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini').lower()
-    
-    # API Configuration
-    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-    GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+    SUPPORTED_LLM_PROVIDERS = ("gemini", "openai", "openrouter")
 
-    # Native OpenAI
-    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-    OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')
-    OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+    LOG_DIRECTORY = _env_text("LOG_DIRECTORY", "logs")
 
-    # OpenRouter
-    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-    OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'arcee-ai/trinity-large-preview:free')
-    OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
-    # Optional headers OpenRouter recommends
-    OPENROUTER_SITE_URL = os.getenv('OPENROUTER_SITE_URL')
-    OPENROUTER_APP_NAME = os.getenv('OPENROUTER_APP_NAME')
-    TEMPERATURE = float(os.getenv('TEMPERATURE', '0.1'))
-    
-    # Legacy path setting retained for backward compatibility (not used for local log tools anymore)
-    LOG_DIRECTORY = os.getenv('LOG_DIRECTORY', 'logs')
-    
-    # Kubernetes Configuration
-    K8S_KUBECONFIG = os.getenv('K8S_KUBECONFIG', '')
-    K8S_CONTEXT = os.getenv('K8S_CONTEXT', '')
-    K8S_DEFAULT_NAMESPACE = os.getenv('K8S_DEFAULT_NAMESPACE', 'default')
-    K8S_DRY_RUN = os.getenv('K8S_DRY_RUN', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    K8S_REQUEST_TIMEOUT_SEC = int(os.getenv('K8S_REQUEST_TIMEOUT_SEC', '20'))
-    K8S_OUTPUT_MAX_CHARS = int(os.getenv('K8S_OUTPUT_MAX_CHARS', '12000'))
-    TOOL_STRUCTURED_OUTPUT_MAX_CHARS = int(os.getenv('TOOL_STRUCTURED_OUTPUT_MAX_CHARS', '40000'))
-    K8S_CLI_ALLOW_ALL_READ = os.getenv('K8S_CLI_ALLOW_ALL_READ', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    K8S_CLI_ALLOW_ALL_WRITE = os.getenv('K8S_CLI_ALLOW_ALL_WRITE', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    K8S_CLI_READONLY_VERBS = os.getenv(
-        'K8S_CLI_READONLY_VERBS',
-        'get,describe,logs,top,api-resources,api-versions,cluster-info,version,config,explain,auth,events,diff,wait',
+    # Model/runtime selection
+    LLM_PROVIDER = _env_text("LLM_PROVIDER", "gemini").lower()
+    TEMPERATURE = _env_float("TEMPERATURE", 0.05)
+    LLM_REQUEST_TIMEOUT_SEC = _env_float("LLM_REQUEST_TIMEOUT_SEC", 120.0)
+    LLM_MAX_OUTPUT_TOKENS = _env_int("LLM_MAX_OUTPUT_TOKENS", 6144)
+    LLM_MAX_RESPONSE_CHARS = _env_int("LLM_MAX_RESPONSE_CHARS", 32000)
+    MAX_CHAT_HISTORY_MESSAGES = _env_int("MAX_CHAT_HISTORY_MESSAGES", 14)
+
+    # Provider credentials / defaults
+    GEMINI_API_KEY = _env_text("GEMINI_API_KEY")
+    GEMINI_MODEL = _env_text("GEMINI_MODEL", "gemini-2.5-flash")
+
+    OPENAI_API_KEY = _env_text("OPENAI_API_KEY")
+    OPENAI_MODEL = _env_text("OPENAI_MODEL", "gpt-4.1-mini")
+    OPENAI_BASE_URL = _env_text("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+    OPENROUTER_API_KEY = _env_text("OPENROUTER_API_KEY")
+    OPENROUTER_MODEL = _env_text("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+    OPENROUTER_BASE_URL = _env_text("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    OPENROUTER_SITE_URL = _env_text("OPENROUTER_SITE_URL")
+    OPENROUTER_APP_NAME = _env_text("OPENROUTER_APP_NAME")
+
+    # LLM retry/backoff
+    LLM_RETRY_ON_RATE_LIMIT = _env_bool("LLM_RETRY_ON_RATE_LIMIT", True)
+    LLM_RETRY_MAX_ATTEMPTS = _env_int("LLM_RETRY_MAX_ATTEMPTS", 3)
+    LLM_RETRY_BASE_DELAY_SEC = _env_float("LLM_RETRY_BASE_DELAY_SEC", 1.0)
+    LLM_RETRY_MAX_DELAY_SEC = _env_float("LLM_RETRY_MAX_DELAY_SEC", 8.0)
+
+    # Investigation loop
+    AGENT_MAX_STEPS = _env_int("AGENT_MAX_STEPS", 6)
+    AGENT_MAX_ACTIONS_PER_STEP = _env_int("AGENT_MAX_ACTIONS_PER_STEP", 3)
+
+    # Kubernetes / Helm
+    K8S_KUBECONFIG = _env_text("K8S_KUBECONFIG")
+    K8S_CONTEXT = _env_text("K8S_CONTEXT")
+    K8S_DEFAULT_NAMESPACE = _env_text("K8S_DEFAULT_NAMESPACE")
+    K8S_DRY_RUN = _env_bool("K8S_DRY_RUN", False)
+    K8S_REQUEST_TIMEOUT_SEC = _env_int("K8S_REQUEST_TIMEOUT_SEC", 30)
+    TOOL_STRUCTURED_OUTPUT_MAX_CHARS = _env_int("TOOL_STRUCTURED_OUTPUT_MAX_CHARS", 50000)
+    HELM_TIMEOUT_SEC = _env_int("HELM_TIMEOUT_SEC", 45)
+
+    # AWS
+    AWS_CLI_DRY_RUN = _env_bool("AWS_CLI_DRY_RUN", False)
+    AWS_CLI_TIMEOUT_SEC = _env_int("AWS_CLI_TIMEOUT_SEC", 45)
+    AWS_CLI_PROFILE = _env_text("AWS_CLI_PROFILE")
+    AWS_CLI_DEFAULT_REGION = _env_text("AWS_CLI_DEFAULT_REGION")
+    AWS_CLI_AUTO_REGION_FANOUT_MAX = _env_int("AWS_CLI_AUTO_REGION_FANOUT_MAX", 8)
+    AWS_CLI_FALLBACK_REGIONS = _env_text(
+        "AWS_CLI_FALLBACK_REGIONS",
+        "us-east-1,us-east-2,us-west-2,eu-west-1,eu-central-1,ap-southeast-1,ap-northeast-1",
     )
-    K8S_CLI_WRITE_ALLOWLIST_VERBS = os.getenv(
-        'K8S_CLI_WRITE_ALLOWLIST_VERBS',
-        'apply,create,delete,edit,patch,replace,scale,rollout,set,cordon,uncordon,drain,taint,label,annotate,autoscale',
-    )
 
-    # AWS CLI tools
-    AWS_CLI_ENABLED = os.getenv('AWS_CLI_ENABLED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AWS_CLI_DRY_RUN = os.getenv('AWS_CLI_DRY_RUN', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AWS_CLI_TIMEOUT_SEC = int(os.getenv('AWS_CLI_TIMEOUT_SEC', '30'))
-    AWS_CLI_PROFILE = os.getenv('AWS_CLI_PROFILE', '').strip()
-    AWS_CLI_DEFAULT_REGION = os.getenv('AWS_CLI_DEFAULT_REGION', '').strip()
-    AWS_CLI_AUDIT_LOG = os.getenv('AWS_CLI_AUDIT_LOG', os.path.join(LOG_DIRECTORY, 'aws_cli_audit.jsonl'))
-    AWS_CLI_AUTO_REGION_RETRY = os.getenv('AWS_CLI_AUTO_REGION_RETRY', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AWS_CLI_PROMPT_FOR_REGION_ON_EMPTY = os.getenv('AWS_CLI_PROMPT_FOR_REGION_ON_EMPTY', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AWS_CLI_REQUIRE_DEFAULT_REGION_FOR_REGIONAL = os.getenv('AWS_CLI_REQUIRE_DEFAULT_REGION_FOR_REGIONAL', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AWS_CLI_AUTO_REGION_FANOUT_MAX = int(os.getenv('AWS_CLI_AUTO_REGION_FANOUT_MAX', '6'))
-    AWS_CLI_ALLOW_ALL_READ = os.getenv('AWS_CLI_ALLOW_ALL_READ', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AWS_CLI_ALLOW_ALL_WRITE = os.getenv('AWS_CLI_ALLOW_ALL_WRITE', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AWS_CLI_ENFORCE_BLOCKLIST = os.getenv('AWS_CLI_ENFORCE_BLOCKLIST', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AWS_CLI_FALLBACK_REGIONS = os.getenv(
-        'AWS_CLI_FALLBACK_REGIONS',
-        'us-east-1,us-east-2,us-west-2,eu-west-1,eu-central-1,ap-southeast-1,ap-northeast-1',
-    )
-    AWS_CLI_READONLY_ALLOWLIST = os.getenv(
-        'AWS_CLI_READONLY_ALLOWLIST',
-        (
-            'sts:get-caller-identity,*:list*,*:get*,*:describe*,*:head*,'
-            '*:batch-get*,*:lookup*,*:query*,*:search*,*:select*,'
-            'cloudwatch:generate-query,logs:filter-log-events,logs:start-query,logs:get-query-results'
-        ),
-    )
-    AWS_CLI_WRITE_ALLOWLIST = os.getenv(
-        'AWS_CLI_WRITE_ALLOWLIST',
-        (
-            'autoscaling:resume-processes,autoscaling:suspend-processes,autoscaling:set-desired-capacity,'
-            'autoscaling:update-auto-scaling-group,autoscaling:start-instance-refresh,autoscaling:cancel-instance-refresh,'
-            'autoscaling:terminate-instance-in-auto-scaling-group,eks:update-nodegroup-config,eks:update-nodegroup-version,'
-            'eks:update-cluster-config,eks:update-cluster-version,eks:update-addon,eks:create-addon,eks:delete-addon,'
-            'ecs:update-service,ecs:run-task,ecs:start-task,ecs:stop-task,ecs:execute-command,'
-            'ec2:reboot-instances,ec2:start-instances,ec2:stop-instances,ec2:terminate-instances,ec2:create-tags,ec2:delete-tags,'
-            'rds:reboot-db-instance,rds:start-db-instance,rds:stop-db-instance,rds:modify-db-instance,'
-            'elasticloadbalancing:register-instances-with-load-balancer,elasticloadbalancing:deregister-instances-from-load-balancer,'
-            'elbv2:register-targets,elbv2:deregister-targets,elbv2:modify-target-group,elbv2:modify-listener,elbv2:modify-rule,'
-            'lambda:update-function-configuration,lambda:update-function-code,lambda:publish-version,lambda:put-function-concurrency,'
-            'route53:change-resource-record-sets,route53:create-health-check,route53:update-health-check,route53:delete-health-check,'
-            'cloudwatch:put-metric-alarm,cloudwatch:delete-alarms,cloudwatch:disable-alarm-actions,cloudwatch:enable-alarm-actions,'
-            'logs:put-retention-policy,logs:delete-retention-policy,logs:put-subscription-filter,logs:delete-subscription-filter,'
-            'ssm:send-command,ssm:start-automation-execution,ssm:start-session,ssm:cancel-command,'
-            'sns:publish,sns:subscribe,sns:unsubscribe,sqs:send-message,sqs:purge-queue,s3:put-object,s3:delete-object'
-        ),
-    ).strip()
-    AWS_CLI_BLOCKLIST = os.getenv('AWS_CLI_BLOCKLIST', 'iam:*,organizations:*,account:*').strip()
-    
-    # Agent Configuration
-    MAX_ITERATIONS = int(os.getenv('MAX_ITERATIONS', '8'))
-    MAX_TOOL_CALLS_PER_TURN = int(os.getenv('MAX_TOOL_CALLS_PER_TURN', '24'))
-    MAX_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_DUPLICATE_TOOL_CALLS', '3'))
-    MAX_SEMANTIC_DUPLICATE_TOOL_CALLS = int(os.getenv('MAX_SEMANTIC_DUPLICATE_TOOL_CALLS', '2'))
-    MAX_SINGLE_TARGET_READ_FANOUT_CALLS = int(os.getenv('MAX_SINGLE_TARGET_READ_FANOUT_CALLS', '4'))
-    MAX_CHAT_HISTORY_MESSAGES = int(os.getenv('MAX_CHAT_HISTORY_MESSAGES', '10'))
-    AGENT_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_TOOL_RESULT_MAX_CHARS', '2500'))
-    AGENT_STRUCTURED_TOOL_RESULT_MAX_CHARS = int(os.getenv('AGENT_STRUCTURED_TOOL_RESULT_MAX_CHARS', '12000'))
-    INCIDENT_STATE_MAX_EVIDENCE = int(os.getenv('INCIDENT_STATE_MAX_EVIDENCE', '8'))
-    INCIDENT_STATE_MAX_CACHE_ENTRIES = int(os.getenv('INCIDENT_STATE_MAX_CACHE_ENTRIES', '24'))
-    AGENT_ENABLE_INTENT_TOOL_FILTER = os.getenv('AGENT_ENABLE_INTENT_TOOL_FILTER', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    COMMAND_SAFETY_POSTURE = os.getenv('COMMAND_SAFETY_POSTURE', 'powerful').strip().lower()
-    DEEP_INITIAL_INVESTIGATION = os.getenv('DEEP_INITIAL_INVESTIGATION', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    LLM_RETRY_ON_RATE_LIMIT = os.getenv('LLM_RETRY_ON_RATE_LIMIT', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    LLM_RETRY_MAX_ATTEMPTS = int(os.getenv('LLM_RETRY_MAX_ATTEMPTS', '3'))
-    LLM_RETRY_BASE_DELAY_SEC = float(os.getenv('LLM_RETRY_BASE_DELAY_SEC', '1.0'))
-    LLM_RETRY_MAX_DELAY_SEC = float(os.getenv('LLM_RETRY_MAX_DELAY_SEC', '8.0'))
-    LLM_REQUEST_TIMEOUT_SEC = float(os.getenv('LLM_REQUEST_TIMEOUT_SEC', '90'))
-    LLM_MAX_OUTPUT_TOKENS = int(os.getenv('LLM_MAX_OUTPUT_TOKENS', '4096'))
-    LLM_MAX_RESPONSE_CHARS = int(os.getenv('LLM_MAX_RESPONSE_CHARS', '24000'))
-    VERBOSE = True
+    # Tracing
+    TRACE_ENABLED = _env_bool("TRACE_ENABLED", False)
+    TRACE_DIR = _env_text("TRACE_DIR", str(Path(LOG_DIRECTORY) / "traces"))
+    TRACE_MAX_FIELD_CHARS = _env_int("TRACE_MAX_FIELD_CHARS", 4000)
+    TRACE_REDACT = _env_bool("TRACE_REDACT", True)
 
-    # Tracing (structured JSONL)
-    TRACE_ENABLED = os.getenv('TRACE_ENABLED', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    TRACE_DIR = os.getenv('TRACE_DIR', os.path.join(LOG_DIRECTORY, 'traces'))
-    TRACE_MAX_FIELD_CHARS = int(os.getenv('TRACE_MAX_FIELD_CHARS', '2000'))
-    TRACE_REDACT = os.getenv('TRACE_REDACT', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    # Compatibility flags for the existing UI. These are fixed by design now.
+    COMMAND_SAFETY_POSTURE = "approval-gated-full-access"
+    K8S_CLI_ALLOW_ALL_READ = True
+    K8S_CLI_ALLOW_ALL_WRITE = True
+    AWS_CLI_ENABLED = True
+    AWS_CLI_ALLOW_ALL_READ = True
+    AWS_CLI_ALLOW_ALL_WRITE = True
 
-    # Autonomous Hybrid Monitoring
-    AUTONOMY_ENABLED = os.getenv('AUTONOMY_ENABLED', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AUTONOMY_SCAN_ON_USER_TURN = os.getenv('AUTONOMY_SCAN_ON_USER_TURN', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    AUTONOMY_NAMESPACE = os.getenv('AUTONOMY_NAMESPACE', 'all')
-    AUTONOMY_RECENT_MINUTES = int(os.getenv('AUTONOMY_RECENT_MINUTES', '30'))
-    AUTONOMY_BASELINE_MINUTES = int(os.getenv('AUTONOMY_BASELINE_MINUTES', '180'))
-    AUTONOMY_RESTART_HEAVY_THRESHOLD = int(os.getenv('AUTONOMY_RESTART_HEAVY_THRESHOLD', '3'))
-    AUTONOMY_STATE_FILE = os.getenv('AUTONOMY_STATE_FILE', os.path.join(LOG_DIRECTORY, 'autonomy_state.json'))
-    AUTONOMY_BACKGROUND_SCAN_INTERVAL_SEC = int(os.getenv('AUTONOMY_BACKGROUND_SCAN_INTERVAL_SEC', '300'))
-    AUTONOMY_ALERT_CACHE_MAX_AGE_SEC = int(os.getenv('AUTONOMY_ALERT_CACHE_MAX_AGE_SEC', '600'))
+    # The old background-autonomy subsystem is gone; keep the UI compatible without
+    # spending tokens on idle scans unless explicitly triggered.
+    AUTONOMY_ENABLED = False
+    AUTONOMY_SCAN_ON_USER_TURN = False
+    AUTONOMY_NAMESPACE = "all"
+    AUTONOMY_RECENT_MINUTES = 30
+    AUTONOMY_BACKGROUND_SCAN_INTERVAL_SEC = 300
+    AUTONOMY_ALERT_CACHE_MAX_AGE_SEC = 600
+    ALERT_PENDING_GRACE_MINUTES = 15
+    ALERT_CRITICAL_EVENT_MIN_COUNT = 3
 
-    # Simple alert monitor thresholds
-    ALERT_PENDING_GRACE_MINUTES = int(os.getenv('ALERT_PENDING_GRACE_MINUTES', '15'))
-    ALERT_CRITICAL_EVENT_MIN_COUNT = int(os.getenv('ALERT_CRITICAL_EVENT_MIN_COUNT', '3'))
-    ALERT_MIN_CONFIDENCE = int(os.getenv('ALERT_MIN_CONFIDENCE', '75'))
-    ALERT_REPEAT_MINUTES = int(os.getenv('ALERT_REPEAT_MINUTES', '120'))
-
-    # Alerts and notification channels
-    ALERT_COOLDOWN_MINUTES = int(os.getenv('ALERT_COOLDOWN_MINUTES', '30'))
-    ALERT_SLACK_WEBHOOK = os.getenv('ALERT_SLACK_WEBHOOK', '').strip()
-    ALERT_TEAMS_WEBHOOK = os.getenv('ALERT_TEAMS_WEBHOOK', '').strip()
-
-    ALERT_EMAIL_ENABLED = os.getenv('ALERT_EMAIL_ENABLED', '0').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    ALERT_EMAIL_FROM = os.getenv('ALERT_EMAIL_FROM', '').strip()
-    ALERT_EMAIL_TO = os.getenv('ALERT_EMAIL_TO', '').strip()
-    ALERT_SMTP_HOST = os.getenv('ALERT_SMTP_HOST', '').strip()
-    ALERT_SMTP_PORT = int(os.getenv('ALERT_SMTP_PORT', '587'))
-    ALERT_SMTP_USER = os.getenv('ALERT_SMTP_USER', '').strip()
-    ALERT_SMTP_PASSWORD = os.getenv('ALERT_SMTP_PASSWORD', '').strip()
-    ALERT_SMTP_USE_TLS = os.getenv('ALERT_SMTP_USE_TLS', '1').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
-    
     @classmethod
     def is_k8s_configured(cls) -> bool:
-        """Check if Kubernetes is configured"""
         return bool(shutil.which("kubectl"))
-    
+
     @classmethod
-    def validate(cls):
-        """Validate required configuration"""
-        if cls.LLM_PROVIDER == 'gemini':
-            if not cls.GEMINI_API_KEY:
-                raise ValueError(
-                    "GEMINI_API_KEY not found. "
-                    "Please set it in .env file or environment variables."
-                )
-        elif cls.LLM_PROVIDER == 'openai':
-            if not cls.OPENAI_API_KEY:
-                raise ValueError(
-                    "OPENAI_API_KEY not found. "
-                    "Please set it in .env file or environment variables."
-                )
-        elif cls.LLM_PROVIDER == 'openrouter':
-            if not cls.OPENROUTER_API_KEY:
-                raise ValueError(
-                    "OpenRouter API key not found. "
-                    "Set OPENROUTER_API_KEY in .env or environment variables."
-                )
-        else:
+    def validate(cls) -> None:
+        provider = str(cls.LLM_PROVIDER or "gemini").strip().lower()
+        if provider not in cls.SUPPORTED_LLM_PROVIDERS:
             raise ValueError(
-                f"Unsupported LLM_PROVIDER: {cls.LLM_PROVIDER!r}. Use 'gemini', 'openai', or 'openrouter'."
+                f"Unsupported LLM_PROVIDER: {provider!r}. Use one of {', '.join(cls.SUPPORTED_LLM_PROVIDERS)}."
             )
-        
-        # Local log directory is no longer required for normal operation.
+
+        if provider == "gemini" and not cls.GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY not found. Set it in .env or environment variables.")
+        if provider == "openai" and not cls.OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY not found. Set it in .env or environment variables.")
+        if provider == "openrouter" and not cls.OPENROUTER_API_KEY:
+            raise ValueError("OPENROUTER_API_KEY not found. Set it in .env or environment variables.")
 
     @classmethod
     def get_active_model_name(cls) -> str:
@@ -203,47 +142,38 @@ class Config:
 
     @classmethod
     def get_model_name_for_provider(cls, provider: str | None) -> str:
-        selected = str(provider or cls.LLM_PROVIDER or 'gemini').strip().lower()
-        if selected == 'openai':
+        selected = str(provider or cls.LLM_PROVIDER or "gemini").strip().lower()
+        if selected == "openai":
             return cls.OPENAI_MODEL
-        if selected == 'openrouter':
+        if selected == "openrouter":
             return cls.OPENROUTER_MODEL
         return cls.GEMINI_MODEL
 
     @classmethod
     def set_runtime_model_selection(cls, provider: str, model_name: str | None = None) -> str:
-        """Apply an in-memory provider/model selection for the current app session."""
-        selected_provider = str(provider or cls.LLM_PROVIDER or 'gemini').strip().lower()
+        selected_provider = str(provider or cls.LLM_PROVIDER or "gemini").strip().lower()
         if selected_provider not in cls.SUPPORTED_LLM_PROVIDERS:
             raise ValueError(
-                f"Unsupported LLM_PROVIDER: {selected_provider!r}. "
-                "Use 'gemini', 'openai', or 'openrouter'."
+                f"Unsupported LLM_PROVIDER: {selected_provider!r}. Use one of {', '.join(cls.SUPPORTED_LLM_PROVIDERS)}."
             )
 
-        selected_model = str(model_name or '').strip() or cls.get_model_name_for_provider(selected_provider)
-
+        selected_model = str(model_name or "").strip() or cls.get_model_name_for_provider(selected_provider)
         cls.LLM_PROVIDER = selected_provider
-        if selected_provider == 'openai':
+        if selected_provider == "openai":
             cls.OPENAI_MODEL = selected_model
-        elif selected_provider == 'openrouter':
+        elif selected_provider == "openrouter":
             cls.OPENROUTER_MODEL = selected_model
         else:
             cls.GEMINI_MODEL = selected_model
-
         return selected_model
-    
+
     @classmethod
     def get_system_prompt(cls) -> str:
-        """Get the system prompt for the agent"""
-        prompt_file = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'system_prompt.txt'
-        )
+        prompt_file = Path(__file__).resolve().parent.parent / "system_prompt.txt"
         try:
-            with open(prompt_file, 'r', encoding='utf-8') as f:
-                return f.read()
-        except FileNotFoundError:
+            return prompt_file.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
             raise ValueError(
                 f"System prompt file not found: {prompt_file}\n"
                 "Please ensure system_prompt.txt exists in the project root."
-            )
+            ) from exc

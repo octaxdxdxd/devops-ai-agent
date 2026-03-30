@@ -1,359 +1,468 @@
-"""Generic kubectl command tools.
-
-These tools let the agent execute arbitrary kubectl commands directly.
-Write commands are approval-gated by the agent policy layer.
-"""
+"""Kubernetes connector for semantic investigations and approval-gated writes."""
 
 from __future__ import annotations
 
-import shlex
-
-from langchain_core.tools import tool
+from collections import Counter
+import shutil
+from typing import Any
 
 from ..config import Config
-from ..utils.command_intent import classify_command_intent
-from .k8s_common import (
-    ensure_kubectl_installed,
-    is_cluster_scoped_kind,
-    kubectl_base_args,
-    kubectl_not_found_msg,
-    resolve_namespace_for_resource,
-    run_kubectl,
-    truncate_text,
-)
+from .common import ToolObservation, first_non_flag, format_error_summary, parse_json_output, run_subprocess, shell_split, truncate_text
 
 
-_OPTIONS_WITH_VALUE = {
-    "-n",
-    "--namespace",
-    "-f",
-    "--filename",
-    "-l",
-    "--selector",
-    "--field-selector",
-    "--context",
-    "--kubeconfig",
-    "-o",
-    "--output",
-    "--as",
-    "--as-group",
-    "--server",
-    "--token",
-    "--cluster",
-    "--user",
-    "--request-timeout",
-}
-_ALL_NAMESPACE_FLAGS = {"-A", "--all-namespaces"}
-
-_TARGET_ONLY_VERBS = {"exec", "logs", "attach", "port-forward"}
-_SKIP_AUTONAMESPACE_VERBS = {
-    "cp",
-    "debug",
-    "auth",
+_READONLY_VERBS = {
     "api-resources",
     "api-versions",
+    "auth",
     "cluster-info",
     "config",
+    "describe",
+    "diff",
+    "events",
+    "explain",
+    "get",
+    "logs",
+    "top",
     "version",
-    "completion",
-    "plugin",
+    "wait",
 }
+_GLOBAL_FLAG_NAMES = {"-n", "--namespace", "--context", "--kubeconfig", "-l", "--selector", "-o", "--output"}
 
 
-def _csv_to_set(value: str) -> set[str]:
-    return {item.strip().lower() for item in (value or "").split(",") if item.strip()}
+def _container_restart_total(pod: dict[str, Any]) -> int:
+    statuses = (pod.get("status") or {}).get("containerStatuses") or []
+    return sum(int(item.get("restartCount") or 0) for item in statuses if isinstance(item, dict))
 
 
-def _normalize_kubectl_command(command: str) -> tuple[list[str] | None, str | None]:
-    raw = (command or "").strip()
-    if not raw:
-        return None, "❌ command is required. Example: `get pods -A`."
+class KubernetesConnector:
+    def __init__(self) -> None:
+        self.family = "k8s"
 
-    try:
-        tokens = shlex.split(raw)
-    except ValueError as exc:
-        return None, f"❌ Invalid kubectl command syntax: {exc}"
+    @staticmethod
+    def _ensure_binary() -> None:
+        if not shutil.which("kubectl"):
+            raise RuntimeError("kubectl is not installed or not on PATH")
 
-    if not tokens:
-        return None, "❌ command is required."
+    @staticmethod
+    def _base_args() -> list[str]:
+        args = ["kubectl"]
+        if Config.K8S_KUBECONFIG:
+            args.extend(["--kubeconfig", Config.K8S_KUBECONFIG])
+        if Config.K8S_CONTEXT:
+            args.extend(["--context", Config.K8S_CONTEXT])
+        args.extend(["--request-timeout", f"{Config.K8S_REQUEST_TIMEOUT_SEC}s"])
+        return args
 
-    if tokens[0].lower() == "kubectl":
-        tokens = tokens[1:]
+    def _run(self, tokens: list[str]) -> tuple[list[str], Any]:
+        self._ensure_binary()
+        args = [*self._base_args(), *tokens]
+        result = run_subprocess(args, timeout_sec=Config.K8S_REQUEST_TIMEOUT_SEC + 10)
+        if not result.ok:
+            raise RuntimeError(format_error_summary(result))
+        payload = parse_json_output(result.stdout)
+        return [result.command], payload if payload is not None else result.stdout
 
-    if not tokens:
-        return None, "❌ command is required after `kubectl`."
+    def _run_json(self, tokens: list[str]) -> tuple[list[str], dict[str, Any] | list[Any]]:
+        commands, payload = self._run(tokens)
+        if not isinstance(payload, (dict, list)):
+            raise RuntimeError(f"`{' '.join(tokens)}` did not return JSON output")
+        return commands, payload
 
-    first = tokens[0].lower()
-    if first == "helm":
-        return None, "❌ Invalid kubectl command: this looks like a Helm command. Use `helm_readonly` or `helm_execute`."
-    if first == "aws":
-        return None, "❌ Invalid kubectl command: this looks like an AWS CLI command. Use `aws_cli_readonly` or `aws_cli_execute`."
+    def _namespace_args(self, namespace: str | None, *, all_namespaces: bool = False) -> list[str]:
+        if all_namespaces:
+            return ["-A"]
+        ns = str(namespace or "").strip()
+        if ns:
+            return ["-n", ns]
+        if Config.K8S_DEFAULT_NAMESPACE:
+            return ["-n", Config.K8S_DEFAULT_NAMESPACE]
+        return []
 
-    return tokens, None
+    def list_namespaces(self) -> ToolObservation:
+        commands, payload = self._run_json(["get", "namespaces", "-o", "json"])
+        items = payload.get("items") if isinstance(payload, dict) else []
+        names = [str((item.get("metadata") or {}).get("name") or "") for item in items if isinstance(item, dict)]
+        return ToolObservation(
+            family=self.family,
+            action="list_namespaces",
+            summary=f"Found {len(names)} namespaces.",
+            structured={"namespace_count": len(names), "namespaces": names},
+            commands=commands,
+            raw_preview=truncate_text(str(names), max_chars=1200),
+        )
 
-
-def _next_positional_index(tokens: list[str], start: int = 0) -> int | None:
-    i = start
-    while i < len(tokens):
-        token = str(tokens[i]).strip()
-        if not token:
-            i += 1
-            continue
-
-        if token == "--":
-            if i + 1 < len(tokens):
-                return i + 1
-            return None
-
-        if token.startswith("-"):
-            if token in _OPTIONS_WITH_VALUE:
-                i += 2
+    def node_overview(self) -> ToolObservation:
+        commands, payload = self._run_json(["get", "nodes", "-o", "json"])
+        items = payload.get("items") if isinstance(payload, dict) else []
+        nodes: list[dict[str, Any]] = []
+        ready_count = 0
+        for item in items:
+            if not isinstance(item, dict):
                 continue
-            i += 1
-            continue
-
-        return i
-    return None
-
-
-def _extract_namespace(tokens: list[str]) -> tuple[str | None, int | None, bool]:
-    for i, raw in enumerate(tokens):
-        token = str(raw).strip()
-        if token in {"-n", "--namespace"}:
-            if i + 1 < len(tokens):
-                return str(tokens[i + 1]).strip(), i, False
-            return "", i, False
-        if token.startswith("--namespace="):
-            return token.split("=", 1)[1].strip(), i, True
-    return None, None, False
-
-
-def _uses_all_namespaces(tokens: list[str]) -> bool:
-    lowered = {str(t).strip().lower() for t in tokens}
-    return bool(lowered & {x.lower() for x in _ALL_NAMESPACE_FLAGS})
-
-
-def _parse_target_kind_name(tokens: list[str]) -> tuple[str | None, str | None]:
-    verb_idx = _next_positional_index(tokens, 0)
-    if verb_idx is None:
-        return None, None
-
-    verb = str(tokens[verb_idx]).strip().lower()
-
-    if verb in {"apply", "create"}:
-        return None, None
-    if verb in _SKIP_AUTONAMESPACE_VERBS:
-        return None, None
-
-    if verb in {"set", "rollout"}:
-        sub_idx = _next_positional_index(tokens, verb_idx + 1)
-        if sub_idx is None:
-            return None, None
-        target_idx = _next_positional_index(tokens, sub_idx + 1)
-        if target_idx is None:
-            return None, None
-        target = str(tokens[target_idx]).strip()
-        if "/" in target:
-            kind, name = target.split("/", 1)
-            return kind.strip(), name.strip()
-        name_idx = _next_positional_index(tokens, target_idx + 1)
-        if name_idx is None:
-            return None, None
-        return target, str(tokens[name_idx]).strip()
-
-    if verb in _TARGET_ONLY_VERBS:
-        target_idx = _next_positional_index(tokens, verb_idx + 1)
-        if target_idx is None:
-            return None, None
-        target = str(tokens[target_idx]).strip()
-        if not target:
-            return None, None
-        if "/" in target:
-            kind, name = target.split("/", 1)
-            return kind.strip(), name.strip()
-        # For exec/logs/attach, bare target is usually a pod name.
-        return "pod", target
-
-    kind_idx = _next_positional_index(tokens, verb_idx + 1)
-    if kind_idx is None:
-        return None, None
-
-    kind = str(tokens[kind_idx]).strip()
-    if "/" in kind:
-        kind_part, name_part = kind.split("/", 1)
-        if name_part:
-            return kind_part.strip(), name_part.strip()
-
-    name_idx = _next_positional_index(tokens, kind_idx + 1)
-    if name_idx is None:
-        return None, None
-    return kind, str(tokens[name_idx]).strip()
-
-
-def _autoresolve_namespace(tokens: list[str]) -> tuple[list[str] | None, str | None]:
-    if _uses_all_namespaces(tokens):
-        return list(tokens), None
-
-    namespace_hint, ns_idx, ns_eq = _extract_namespace(tokens)
-    explicit_namespace = (namespace_hint or "").strip()
-    if explicit_namespace and explicit_namespace.lower() not in {"auto", "any", "all"}:
-        # Respect explicit namespace; do not reinterpret command grammar.
-        return list(tokens), None
-
-    kind, name = _parse_target_kind_name(tokens)
-    if not kind or not name:
-        return list(tokens), None
-    if is_cluster_scoped_kind(kind):
-        return list(tokens), None
-
-    resolved_ns, resolve_err = resolve_namespace_for_resource(kind, name, namespace_hint or "")
-    if resolve_err:
-        return None, resolve_err
-    if not resolved_ns:
-        return None, f"❌ Could not resolve namespace for {kind} '{name}'."
-
-    rewritten = list(tokens)
-    if ns_idx is None:
-        rewritten.extend(["-n", resolved_ns])
-    elif ns_eq:
-        rewritten[ns_idx] = f"--namespace={resolved_ns}"
-    elif ns_idx + 1 < len(rewritten):
-        rewritten[ns_idx + 1] = resolved_ns
-
-    return rewritten, None
-
-
-def _build_kubectl_args(tokens: list[str]) -> list[str]:
-    return [*kubectl_base_args(), *tokens]
-
-
-def _intent_message(intent, *, readonly: bool) -> str | None:
-    if intent.is_blocked:
-        return f"❌ {intent.reason}"
-    if intent.is_sensitive_read:
-        return f"❌ {intent.reason}"
-    if readonly and intent.capability == "write":
-        return (
-            f"❌ kubectl verb `{intent.verb or 'unknown'}` is mutating and is blocked in kubectl_readonly. "
-            "Use `kubectl_execute` (approval required)."
-        )
-    if not readonly and intent.capability == "safe_read":
-        return (
-            f"❌ kubectl verb `{intent.verb or 'unknown'}` is read-only. "
-            "Use `kubectl_readonly` instead."
-        )
-    return None
-
-
-def _command_result(command_args: list[str], *, reason: str = "") -> str:
-    command_text = shlex.join(command_args)
-    code, out, err = run_kubectl(command_args)
-    if code != 0:
-        return (
-            f"Planned command:\n```bash\n{command_text}\n```\n"
-            f"❌ kubectl command failed (exit={code}).\n"
-            f"Details: {truncate_text(err or out or 'unknown error')}"
+            metadata = item.get("metadata") or {}
+            status = item.get("status") or {}
+            ready = False
+            pressure: list[str] = []
+            for condition in status.get("conditions") or []:
+                if not isinstance(condition, dict):
+                    continue
+                cond_type = str(condition.get("type") or "")
+                cond_status = str(condition.get("status") or "")
+                if cond_type == "Ready":
+                    ready = cond_status == "True"
+                if cond_type.endswith("Pressure") and cond_status == "True":
+                    pressure.append(cond_type)
+            if ready:
+                ready_count += 1
+            nodes.append(
+                {
+                    "name": metadata.get("name"),
+                    "ready": ready,
+                    "taints": [str(item.get("key")) for item in (item.get("spec") or {}).get("taints") or [] if isinstance(item, dict)],
+                    "pressure": pressure,
+                }
+            )
+        not_ready = [node for node in nodes if not node.get("ready")]
+        summary = f"{ready_count}/{len(nodes)} nodes are Ready."
+        if not_ready:
+            summary += f" {len(not_ready)} node(s) are not Ready."
+        return ToolObservation(
+            family=self.family,
+            action="node_overview",
+            summary=summary,
+            structured={
+                "node_count": len(nodes),
+                "ready_count": ready_count,
+                "not_ready_count": len(not_ready),
+                "nodes": nodes[:40],
+            },
+            commands=commands,
+            raw_preview=truncate_text(str(nodes[:12]), max_chars=1800),
         )
 
-    reason_line = f"\nReason: {reason}" if reason else ""
-    return (
-        f"Planned command:\n```bash\n{command_text}\n```\n"
-        f"✅ kubectl command executed successfully.{reason_line}\n"
-        f"Output:\n{truncate_text(out or '(no output)')}"
-    )
-
-
-@tool
-def kubectl_readonly(command: str) -> str:
-    """Run a kubectl read command.
-
-    Examples:
-    - get pods -A
-    - describe pod my-pod -n prod
-    - logs my-pod -n prod --tail 200
-
-    In the default powerful posture, secret extraction reads are allowed here and
-    exec-class operations are expected to route to `kubectl_execute`.
-    """
-    if not ensure_kubectl_installed():
-        return kubectl_not_found_msg()
-
-    tokens, err = _normalize_kubectl_command(command)
-    if err:
-        return err
-
-    assert tokens is not None
-    intent = classify_command_intent("kubectl_readonly", shlex.join(tokens))
-    intent_err = _intent_message(intent, readonly=True)
-    if intent_err:
-        return intent_err
-
-    verb = intent.verb
-    readonly_verbs = _csv_to_set(Config.K8S_CLI_READONLY_VERBS)
-    if not Config.K8S_CLI_ALLOW_ALL_READ and verb not in readonly_verbs:
-        return (
-            f"❌ kubectl verb `{verb or 'unknown'}` is not allowed in kubectl_readonly. "
-            "Use `kubectl_execute` for mutating commands (approval required), or enable K8S_CLI_ALLOW_ALL_READ=1."
+    def pod_overview(self, *, namespace: str | None = None, all_namespaces: bool = False) -> ToolObservation:
+        commands, payload = self._run_json(["get", "pods", *self._namespace_args(namespace, all_namespaces=all_namespaces), "-o", "json"])
+        items = payload.get("items") if isinstance(payload, dict) else []
+        phase_counts: Counter[str] = Counter()
+        problem_pods: list[dict[str, Any]] = []
+        restart_heavy: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            metadata = item.get("metadata") or {}
+            status = item.get("status") or {}
+            phase = str(status.get("phase") or "Unknown")
+            namespace_name = str(metadata.get("namespace") or "")
+            pod_name = str(metadata.get("name") or "")
+            phase_counts[phase] += 1
+            restart_total = _container_restart_total(item)
+            waiting_reasons = []
+            for container_state in status.get("containerStatuses") or []:
+                if not isinstance(container_state, dict):
+                    continue
+                waiting = ((container_state.get("state") or {}).get("waiting") or {}).get("reason")
+                if waiting:
+                    waiting_reasons.append(str(waiting))
+            if phase not in {"Running", "Succeeded", "Completed"} or waiting_reasons:
+                problem_pods.append(
+                    {
+                        "namespace": namespace_name,
+                        "name": pod_name,
+                        "phase": phase,
+                        "node": str(status.get("nodeName") or ""),
+                        "restart_count": restart_total,
+                        "reasons": waiting_reasons[:4],
+                    }
+                )
+            elif restart_total >= 5:
+                restart_heavy.append(
+                    {
+                        "namespace": namespace_name,
+                        "name": pod_name,
+                        "restart_count": restart_total,
+                        "node": str(status.get("nodeName") or ""),
+                    }
+                )
+        summary = f"Observed {sum(phase_counts.values())} pods."
+        if problem_pods:
+            summary += f" {len(problem_pods)} pod(s) are not healthy."
+        if restart_heavy:
+            summary += f" {len(restart_heavy)} additional pod(s) have elevated restarts."
+        return ToolObservation(
+            family=self.family,
+            action="pod_overview",
+            summary=summary,
+            structured={
+                "phase_counts": dict(phase_counts),
+                "problem_pods": problem_pods[:40],
+                "restart_heavy_pods": restart_heavy[:30],
+            },
+            commands=commands,
+            raw_preview=truncate_text(str(problem_pods[:15] + restart_heavy[:15]), max_chars=2200),
         )
 
-    args = _build_kubectl_args(tokens)
-    return _command_result(args)
-
-
-@tool
-def kubectl_execute(command: str, reason: str = "") -> str:
-    """Run any kubectl command (mutating-capable).
-
-    IMPORTANT: This tool can change cluster state and should require explicit approval.
-    Read-only and sensitive-read commands are rejected here to keep generic execute
-    limited to known mutating operations.
-
-    Examples:
-    - apply -f deployment.yaml
-    - delete pod my-pod -n prod
-    - patch deployment web -n prod --type merge -p '{"spec":{"replicas":3}}'
-
-    When K8S_CLI_ALLOW_ALL_WRITE=1, verb allowlist checks are bypassed.
-    """
-    if not ensure_kubectl_installed():
-        return kubectl_not_found_msg()
-
-    tokens, err = _normalize_kubectl_command(command)
-    if err:
-        return err
-
-    assert tokens is not None
-    intent = classify_command_intent("kubectl_execute", shlex.join(tokens))
-    intent_err = _intent_message(intent, readonly=False)
-    if intent_err:
-        return intent_err
-
-    verb = intent.verb
-    write_verbs = _csv_to_set(Config.K8S_CLI_WRITE_ALLOWLIST_VERBS)
-    if not Config.K8S_CLI_ALLOW_ALL_WRITE and verb not in write_verbs:
-        return (
-            f"❌ kubectl verb `{verb or 'unknown'}` is not allowed in kubectl_execute. "
-            "Enable K8S_CLI_ALLOW_ALL_WRITE=1 or add verb to K8S_CLI_WRITE_ALLOWLIST_VERBS."
+    def workload_overview(self, *, namespace: str | None = None, all_namespaces: bool = False) -> ToolObservation:
+        kind_specs = [
+            ("deployments", "deployment"),
+            ("statefulsets", "statefulset"),
+            ("daemonsets", "daemonset"),
+        ]
+        commands: list[str] = []
+        unhealthy: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        for plural, label in kind_specs:
+            command_list, payload = self._run_json(["get", plural, *self._namespace_args(namespace, all_namespaces=all_namespaces), "-o", "json"])
+            commands.extend(command_list)
+            items = payload.get("items") if isinstance(payload, dict) else []
+            counts[label] = len(items)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                metadata = item.get("metadata") or {}
+                spec = item.get("spec") or {}
+                status = item.get("status") or {}
+                desired = int(spec.get("replicas") or status.get("desiredNumberScheduled") or 0)
+                ready = int(status.get("readyReplicas") or status.get("numberReady") or 0)
+                available = int(status.get("availableReplicas") or ready)
+                if desired and ready < desired:
+                    unhealthy.append(
+                        {
+                            "kind": label,
+                            "namespace": metadata.get("namespace"),
+                            "name": metadata.get("name"),
+                            "desired": desired,
+                            "ready": ready,
+                            "available": available,
+                        }
+                    )
+        summary = (
+            f"Observed {counts.get('deployment', 0)} deployments, "
+            f"{counts.get('statefulset', 0)} statefulsets, and {counts.get('daemonset', 0)} daemonsets."
+        )
+        if unhealthy:
+            summary += f" {len(unhealthy)} workload(s) are short of ready replicas."
+        return ToolObservation(
+            family=self.family,
+            action="workload_overview",
+            summary=summary,
+            structured={"counts": counts, "unhealthy_workloads": unhealthy[:40]},
+            commands=commands,
+            raw_preview=truncate_text(str(unhealthy[:20]), max_chars=1800),
         )
 
-    resolved_tokens, resolve_err = _autoresolve_namespace(tokens)
-    if resolve_err:
-        return resolve_err
-    assert resolved_tokens is not None
-
-    args = _build_kubectl_args(resolved_tokens)
-    command_text = shlex.join(args)
-
-    if Config.K8S_DRY_RUN:
-        return (
-            "🧪 DRY RUN enabled; no mutation executed.\n"
-            f"Planned command:\n```bash\n{command_text}\n```\n"
-            f"Reason: {reason or 'n/a'}"
+    def service_overview(self, *, namespace: str | None = None, all_namespaces: bool = False) -> ToolObservation:
+        commands, payload = self._run_json(["get", "svc,ingress", *self._namespace_args(namespace, all_namespaces=all_namespaces), "-o", "json"])
+        items = payload.get("items") if isinstance(payload, dict) else []
+        services: list[dict[str, Any]] = []
+        ingresses: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "").lower()
+            metadata = item.get("metadata") or {}
+            record = {
+                "namespace": metadata.get("namespace"),
+                "name": metadata.get("name"),
+            }
+            if kind == "service":
+                spec = item.get("spec") or {}
+                record["type"] = spec.get("type")
+                record["cluster_ip"] = spec.get("clusterIP")
+                services.append(record)
+            elif kind == "ingress":
+                status = item.get("status") or {}
+                lb = ((status.get("loadBalancer") or {}).get("ingress") or [])
+                record["load_balancer"] = lb[:2]
+                ingresses.append(record)
+        summary = f"Observed {len(services)} services and {len(ingresses)} ingresses."
+        return ToolObservation(
+            family=self.family,
+            action="service_overview",
+            summary=summary,
+            structured={"services": services[:60], "ingresses": ingresses[:60]},
+            commands=commands,
+            raw_preview=truncate_text(str({"services": services[:12], "ingresses": ingresses[:12]}), max_chars=1800),
         )
 
-    return _command_result(args, reason=reason)
+    def storage_overview(self, *, namespace: str | None = None, all_namespaces: bool = False) -> ToolObservation:
+        commands, payload = self._run_json(["get", "pvc,pv", *self._namespace_args(namespace, all_namespaces=all_namespaces), "-o", "json"])
+        items = payload.get("items") if isinstance(payload, dict) else []
+        pvcs: list[dict[str, Any]] = []
+        pvs: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "").lower()
+            metadata = item.get("metadata") or {}
+            status = item.get("status") or {}
+            record = {
+                "namespace": metadata.get("namespace"),
+                "name": metadata.get("name"),
+                "phase": status.get("phase"),
+            }
+            if kind == "persistentvolumeclaim":
+                pvcs.append(record)
+            elif kind == "persistentvolume":
+                pvs.append(record)
+        summary = f"Observed {len(pvcs)} PVCs and {len(pvs)} PVs."
+        return ToolObservation(
+            family=self.family,
+            action="storage_overview",
+            summary=summary,
+            structured={"pvcs": pvcs[:80], "pvs": pvs[:80]},
+            commands=commands,
+            raw_preview=truncate_text(str({"pvcs": pvcs[:15], "pvs": pvs[:15]}), max_chars=1800),
+        )
 
+    def event_overview(self, *, namespace: str | None = None, all_namespaces: bool = False) -> ToolObservation:
+        commands, payload = self._run_json(["get", "events", *self._namespace_args(namespace, all_namespaces=all_namespaces), "-o", "json"])
+        items = payload.get("items") if isinstance(payload, dict) else []
+        warnings: list[dict[str, Any]] = []
+        count_by_reason: Counter[str] = Counter()
+        for item in items[-200:]:
+            if not isinstance(item, dict):
+                continue
+            event_type = str(item.get("type") or "")
+            if event_type != "Warning":
+                continue
+            reason = str(item.get("reason") or "Unknown")
+            count_by_reason[reason] += 1
+            obj = item.get("involvedObject") or {}
+            warnings.append(
+                {
+                    "namespace": item.get("metadata", {}).get("namespace"),
+                    "reason": reason,
+                    "message": str(item.get("message") or "")[:240],
+                    "kind": obj.get("kind"),
+                    "name": obj.get("name"),
+                }
+            )
+        summary = f"Observed {sum(count_by_reason.values())} warning events."
+        return ToolObservation(
+            family=self.family,
+            action="event_overview",
+            summary=summary,
+            structured={"warning_count": sum(count_by_reason.values()), "top_reasons": dict(count_by_reason.most_common(12)), "warnings": warnings[:40]},
+            commands=commands,
+            raw_preview=truncate_text(str(warnings[:15]), max_chars=1800),
+        )
 
-def get_k8s_cli_tools() -> list:
-    """Return generic kubectl tools."""
-    return [kubectl_readonly, kubectl_execute]
+    def resource_details(self, *, kind: str, name: str, namespace: str = "") -> ToolObservation:
+        tokens = ["get", kind, name, "-o", "json"]
+        if namespace:
+            tokens.extend(["-n", namespace])
+        commands, payload = self._run_json(tokens)
+        metadata = payload.get("metadata") if isinstance(payload, dict) else {}
+        summary = f"Loaded {kind} `{name}`."
+        if namespace:
+            summary += f" Namespace: {namespace}."
+        return ToolObservation(
+            family=self.family,
+            action="resource_details",
+            summary=summary,
+            structured={"kind": kind, "name": name, "namespace": namespace, "resource": payload},
+            commands=commands,
+            raw_preview=truncate_text(str(payload), max_chars=2200),
+        )
+
+    def namespace_overview(self, *, namespace: str) -> ToolObservation:
+        pods = self.pod_overview(namespace=namespace)
+        workloads = self.workload_overview(namespace=namespace)
+        services = self.service_overview(namespace=namespace)
+        storage = self.storage_overview(namespace=namespace)
+        events = self.event_overview(namespace=namespace)
+        namespace_record = {
+            "namespace": namespace,
+            "pods": pods.structured,
+            "workloads": workloads.structured,
+            "services": services.structured,
+            "storage": storage.structured,
+            "events": events.structured,
+        }
+        return ToolObservation(
+            family=self.family,
+            action="namespace_overview",
+            summary=f"Collected a namespace-focused overview for `{namespace}`.",
+            structured=namespace_record,
+            commands=[*pods.commands, *workloads.commands, *services.commands, *storage.commands, *events.commands],
+            raw_preview=truncate_text(str(namespace_record), max_chars=2200),
+        )
+
+    def cluster_overview(self) -> ToolObservation:
+        namespaces = self.list_namespaces()
+        nodes = self.node_overview()
+        pods = self.pod_overview(all_namespaces=True)
+        workloads = self.workload_overview(all_namespaces=True)
+        services = self.service_overview(all_namespaces=True)
+        storage = self.storage_overview(all_namespaces=True)
+        events = self.event_overview(all_namespaces=True)
+        structured = {
+            "namespaces": namespaces.structured,
+            "nodes": nodes.structured,
+            "pods": pods.structured,
+            "workloads": workloads.structured,
+            "services": services.structured,
+            "storage": storage.structured,
+            "events": events.structured,
+        }
+        summary = (
+            f"Cluster overview: {nodes.structured.get('ready_count', 0)}/{nodes.structured.get('node_count', 0)} ready nodes, "
+            f"{len(pods.structured.get('problem_pods', []))} problematic pods, "
+            f"{len(workloads.structured.get('unhealthy_workloads', []))} unhealthy workloads, "
+            f"{events.structured.get('warning_count', 0)} warning events."
+        )
+        commands = [*namespaces.commands, *nodes.commands, *pods.commands, *workloads.commands, *services.commands, *storage.commands, *events.commands]
+        return ToolObservation(
+            family=self.family,
+            action="cluster_overview",
+            summary=summary,
+            structured=structured,
+            commands=commands,
+            raw_preview=truncate_text(str(structured), max_chars=2800),
+        )
+
+    def raw_read(self, command: str) -> ToolObservation:
+        tokens = shell_split(command)
+        if tokens and tokens[0] == "kubectl":
+            tokens = tokens[1:]
+        verb = first_non_flag(tokens, skip_value_flags=_GLOBAL_FLAG_NAMES)
+        if verb not in _READONLY_VERBS:
+            raise RuntimeError(f"`{command}` is not a recognized read-only kubectl command")
+        commands, payload = self._run(tokens)
+        preview = truncate_text(str(payload), max_chars=Config.TOOL_STRUCTURED_OUTPUT_MAX_CHARS)
+        summary = f"Executed read-only kubectl command `{command}`."
+        return ToolObservation(
+            family=self.family,
+            action="raw_read",
+            summary=summary,
+            structured={"command": command, "output": payload},
+            commands=commands,
+            raw_preview=preview,
+        )
+
+    def execute(self, command: str) -> ToolObservation:
+        tokens = shell_split(command)
+        if tokens and tokens[0] == "kubectl":
+            tokens = tokens[1:]
+        self._ensure_binary()
+        args = [*self._base_args(), *tokens]
+        if Config.K8S_DRY_RUN:
+            return ToolObservation(
+                family=self.family,
+                action="raw_write",
+                summary="Kubernetes dry-run mode is enabled; no mutating command was executed.",
+                structured={"command": " ".join(args), "dry_run": True},
+                commands=[" ".join(args)],
+                raw_preview="dry run",
+            )
+        result = run_subprocess(args, timeout_sec=Config.K8S_REQUEST_TIMEOUT_SEC + 20)
+        if not result.ok:
+            raise RuntimeError(format_error_summary(result))
+        return ToolObservation(
+            family=self.family,
+            action="raw_write",
+            summary=f"Executed mutating kubectl command `{command}` successfully.",
+            structured={"command": result.command, "stdout": result.stdout, "stderr": result.stderr},
+            commands=[result.command],
+            raw_preview=truncate_text(result.stdout or "(no output)", max_chars=2200),
+        )
