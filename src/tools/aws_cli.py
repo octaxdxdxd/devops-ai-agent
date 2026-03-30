@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import os
+import re
 import shutil
 from typing import Any
 
@@ -50,6 +52,42 @@ _MUTATING_OPERATION_PREFIXES = (
     "untag",
     "update",
 )
+_GLOBAL_AWS_FLAGS_WITH_VALUE = {
+    "--endpoint-url",
+    "--output",
+    "--query",
+    "--profile",
+    "--region",
+    "--ca-bundle",
+    "--cli-read-timeout",
+    "--cli-connect-timeout",
+    "--cli-binary-format",
+    "--cli-input-json",
+    "--cli-input-yaml",
+    "--color",
+}
+_GLOBAL_AWS_STANDALONE_FLAGS = {
+    "--debug",
+    "--no-verify-ssl",
+    "--no-paginate",
+    "--version",
+    "--no-sign-request",
+    "--no-cli-pager",
+    "--cli-auto-prompt",
+    "--no-cli-auto-prompt",
+}
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
+_HELP_OPTION_RE = re.compile(r"(--[a-z0-9][a-z0-9-]*)", re.IGNORECASE)
+_LAUNCH_TEMPLATE_ALLOWED_KEYS = {"LaunchTemplateId", "LaunchTemplateName", "Version"}
+
+
+@dataclass
+class AWSOperationSpec:
+    cli_version: str
+    service: str
+    operation: str
+    options: set[str]
+    help_text: str
 
 
 def _tag_name(tags: list[dict[str, Any]] | None) -> str:
@@ -64,6 +102,8 @@ def _tag_name(tags: list[dict[str, Any]] | None) -> str:
 class AWSConnector:
     def __init__(self) -> None:
         self.family = "aws"
+        self._cli_version_cache: str | None = None
+        self._operation_spec_cache: dict[tuple[str, str, str], AWSOperationSpec] = {}
 
     @staticmethod
     def _ensure_binary() -> None:
@@ -97,17 +137,176 @@ class AWSConnector:
         return regions[: max(1, int(Config.AWS_CLI_AUTO_REGION_FANOUT_MAX))]
 
     @staticmethod
+    def _contains_shell_syntax(tokens: list[str]) -> bool:
+        for token in tokens:
+            text = str(token or "")
+            if text in {"|", "||", "&&", ";", ">", ">>", "<", "<<", "&"}:
+                return True
+            if re.fullmatch(r"\d*(>>?|<<?)", text):
+                return True
+            if "$(" in text or text.startswith("<(") or "`" in text:
+                return True
+        return False
+
+    @staticmethod
     def _normalize_tokens(command: str) -> list[str]:
         tokens = shell_split(command)
+        if AWSConnector._contains_shell_syntax(tokens):
+            raise ValueError(
+                "Shell syntax is not allowed in AWS commands. Provide exactly one AWS CLI command without pipes, redirects, subshells, or process substitution."
+            )
         if tokens and tokens[0].lower() == "aws":
             tokens = tokens[1:]
-        if len(tokens) < 2:
-            raise ValueError("AWS command must include service and operation")
+        AWSConnector._command_components(tokens)
         return tokens
 
     @staticmethod
+    def _command_components(tokens: list[str]) -> tuple[int, str, str]:
+        index = 0
+        while index < len(tokens):
+            token = str(tokens[index] or "")
+            if token.startswith("-"):
+                flag = token.split("=", 1)[0].lower()
+                if flag in _GLOBAL_AWS_FLAGS_WITH_VALUE and "=" not in token:
+                    index += 2
+                else:
+                    index += 1
+                continue
+            service = token
+            if index + 1 >= len(tokens):
+                raise ValueError("AWS command must include both a service and an operation")
+            operation = str(tokens[index + 1] or "")
+            if operation.startswith("-"):
+                raise ValueError("AWS command must include both a service and an operation before service-specific flags")
+            return index, service.lower(), operation.lower()
+        raise ValueError("AWS command must include both a service and an operation")
+
+    @staticmethod
     def _service_and_operation(tokens: list[str]) -> tuple[str, str]:
-        return str(tokens[0] or "").lower(), str(tokens[1] or "").lower()
+        _, service, operation = AWSConnector._command_components(tokens)
+        return service, operation
+
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        return _ANSI_ESCAPE_RE.sub("", str(text or ""))
+
+    def _aws_cli_version(self) -> str:
+        if self._cli_version_cache:
+            return self._cli_version_cache
+        self._ensure_binary()
+        result = run_subprocess(["aws", "--version"], timeout_sec=10)
+        text = f"{result.stdout}\n{result.stderr}".strip()
+        match = re.search(r"aws-cli/([^\s]+)", text)
+        version = match.group(1) if match else "unknown"
+        self._cli_version_cache = version
+        return version
+
+    def _load_operation_spec(self, service: str, operation: str) -> AWSOperationSpec:
+        cli_version = self._aws_cli_version()
+        cache_key = (cli_version, service, operation)
+        cached = self._operation_spec_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        self._ensure_binary()
+        result = run_subprocess(["aws", service, operation, "help"], timeout_sec=max(10, Config.AWS_CLI_TIMEOUT_SEC))
+        help_text = self._strip_ansi((result.stdout or result.stderr or "").strip())
+        lowered = help_text.lower()
+        if (not result.ok and not help_text) or "invalid choice" in lowered or "aws: error" in lowered:
+            raise ValueError(f"`aws {service} {operation}` is not a valid command for the installed AWS CLI")
+
+        options = {item.lower() for item in _HELP_OPTION_RE.findall(help_text)}
+        spec = AWSOperationSpec(
+            cli_version=cli_version,
+            service=service,
+            operation=operation,
+            options=options,
+            help_text=help_text,
+        )
+        self._operation_spec_cache[cache_key] = spec
+        return spec
+
+    @staticmethod
+    def _extract_flag_values(tokens: list[str]) -> dict[str, list[str]]:
+        values: dict[str, list[str]] = {}
+        index = 0
+        while index < len(tokens):
+            token = str(tokens[index] or "")
+            if not token.startswith("--"):
+                index += 1
+                continue
+            if "=" in token:
+                flag, value = token.split("=", 1)
+                values.setdefault(flag.lower(), []).append(value)
+                index += 1
+                continue
+            flag = token.lower()
+            if index + 1 < len(tokens) and not str(tokens[index + 1] or "").startswith("--"):
+                values.setdefault(flag, []).append(str(tokens[index + 1]))
+                index += 2
+                continue
+            values.setdefault(flag, []).append("")
+            index += 1
+        return values
+
+    @staticmethod
+    def _validate_launch_template_value(value: str) -> None:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("`--launch-template` requires a value")
+        if text.startswith("{"):
+            return
+        if text.startswith("LaunchTemplate=") or text.startswith("LaunchTemplateSpecification="):
+            raise ValueError(
+                "`--launch-template` must use the documented shorthand syntax like `LaunchTemplateId=lt-...,Version=4` or a JSON object. Do not wrap it in `LaunchTemplate=` or `LaunchTemplateSpecification=`."
+            )
+        fields: dict[str, str] = {}
+        for segment in [item.strip() for item in text.split(",") if item.strip()]:
+            if "=" not in segment:
+                raise ValueError(
+                    "`--launch-template` must use comma-separated `key=value` pairs, for example `LaunchTemplateId=lt-...,Version=4`."
+                )
+            key, raw_value = segment.split("=", 1)
+            key = key.strip()
+            if key not in _LAUNCH_TEMPLATE_ALLOWED_KEYS:
+                raise ValueError(
+                    "`--launch-template` only accepts `LaunchTemplateId`, `LaunchTemplateName`, and `Version`."
+                )
+            fields[key] = raw_value.strip()
+        if "LaunchTemplateId" not in fields and "LaunchTemplateName" not in fields:
+            raise ValueError("`--launch-template` must include either `LaunchTemplateId` or `LaunchTemplateName`.")
+        if "Version" not in fields:
+            raise ValueError("`--launch-template` must include `Version`.")
+
+    @staticmethod
+    def _validate_launch_template_versions_value(value: str) -> None:
+        text = str(value or "").strip()
+        if text.startswith("$") and text not in {"$Latest", "$Default"}:
+            raise ValueError(
+                "`--versions` for `ec2 describe-launch-template-versions` accepts `$Latest`, `$Default`, or numeric versions. Use the exact AWS CLI casing from help."
+            )
+
+    def _validate_tokens_against_help(self, tokens: list[str]) -> tuple[str, str]:
+        start_index, service, operation = self._command_components(tokens)
+        spec = self._load_operation_spec(service, operation)
+        command_tokens = tokens[start_index + 2 :]
+        for token in command_tokens:
+            if not str(token or "").startswith("--"):
+                continue
+            flag = str(token).split("=", 1)[0].lower()
+            if flag not in spec.options and flag not in _GLOBAL_AWS_STANDALONE_FLAGS and flag not in _GLOBAL_AWS_FLAGS_WITH_VALUE:
+                raise ValueError(
+                    f"`{flag}` is not a documented option for `aws {service} {operation}` on the installed AWS CLI."
+                )
+
+        values = self._extract_flag_values(command_tokens)
+        if service == "autoscaling" and operation == "update-auto-scaling-group":
+            for value in values.get("--launch-template", []):
+                self._validate_launch_template_value(value)
+        if service == "ec2" and operation == "describe-launch-template-versions":
+            for value in values.get("--versions", []):
+                self._validate_launch_template_versions_value(value)
+        return service, operation
 
     @staticmethod
     def _has_region(tokens: list[str]) -> bool:
@@ -368,7 +567,7 @@ class AWSConnector:
 
     def raw_read(self, command: str, *, all_regions: bool = True) -> ToolObservation:
         tokens = self._normalize_tokens(command)
-        service, operation = self._service_and_operation(tokens)
+        service, operation = self._validate_tokens_against_help(tokens)
         if self._is_mutating(operation):
             raise RuntimeError(f"`{command}` is not a recognized read-only AWS command")
         commands, outputs = self._run_multi_region(tokens, force_all_regions=all_regions)
@@ -385,7 +584,7 @@ class AWSConnector:
 
     def execute(self, command: str) -> ToolObservation:
         tokens = self._normalize_tokens(command)
-        _, operation = self._service_and_operation(tokens)
+        _, operation = self._validate_tokens_against_help(tokens)
         if not self._is_mutating(operation):
             raise RuntimeError("AWS execute was called with a non-mutating command")
         if Config.AWS_CLI_DRY_RUN:
