@@ -6,7 +6,7 @@ import streamlit as st
 
 from ..config import Config
 from .chat import display_chat_messages, process_chat_turn
-from .session import initialize_session_state
+from .session import initialize_session_state, poll_autonomy_scan_job, reset_autonomy_scan_runtime, schedule_autonomy_scan
 from .sidebar import display_sidebar
 
 
@@ -18,6 +18,7 @@ def _top_toolbar() -> None:
         if st.button("New Chat", use_container_width=True):
             st.session_state.messages = []
             st.session_state.autonomy_last_scan = None
+            reset_autonomy_scan_runtime()
             try:
                 st.session_state.agent.clear_history()
             except Exception:
@@ -26,6 +27,7 @@ def _top_toolbar() -> None:
 
     with col2:
         if st.button("Run Health Scan", use_container_width=True):
+            reset_autonomy_scan_runtime()
             with st.spinner("Running Kubernetes health scan..."):
                 scan = st.session_state.agent.run_autonomous_scan(send_notifications=True)
                 st.session_state.autonomy_last_scan = scan
@@ -60,6 +62,8 @@ def main() -> None:
     )
 
     initialize_session_state()
+    poll_autonomy_scan_job()
+    schedule_autonomy_scan(force=False, send_notifications=True, source="idle")
     display_sidebar()
 
     st.title("AI Ops Kubernetes Assistant")

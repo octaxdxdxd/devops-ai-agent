@@ -7,7 +7,12 @@ import re
 import streamlit as st
 
 from ..config import Config
-from .session import convert_to_langchain_messages, get_message_content, get_message_trace_id
+from .session import (
+    convert_to_langchain_messages,
+    get_message_content,
+    get_message_trace_id,
+    schedule_autonomy_scan,
+)
 
 
 _STATUS_HISTORY_LIMIT = 8
@@ -239,4 +244,5 @@ def process_chat_turn() -> None:
                 st.caption(f"Trace ID: `{trace_id}`")
 
         st.session_state.messages.append({"role": "assistant", "content": assistant_content, "trace_id": trace_id})
+        schedule_autonomy_scan(force=True, send_notifications=True, source="post_turn")
         st.rerun()

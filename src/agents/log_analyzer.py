@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -42,6 +43,20 @@ class _NullContext:
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_scan_timestamp(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class LogAnalyzerAgent:
@@ -312,6 +327,20 @@ class LogAnalyzerAgent:
     ) -> str:
         """Augment prompt input with execution behavior hints when useful."""
         directives: list[str] = []
+        if operator_intent_state.is_following_proposed_plan():
+            approved_step = str(getattr(operator_intent_state, "pending_step_summary", "") or "").strip()
+            if getattr(operator_intent_state, "pending_step_stage", "") == "execute":
+                directives.append("The operator already approved the previously proposed next step.")
+                if approved_step:
+                    directives.append(f"Execute only this approved step now: {approved_step}")
+                directives.append(
+                    "Do not ask for approval again for the same step. Do not broaden scope or add extra write actions beyond the approved step without fresh approval."
+                )
+            else:
+                directives.append("The operator already approved the previously proposed targeted follow-up.")
+                if approved_step:
+                    directives.append(f"Continue this approved step now: {approved_step}")
+                directives.append("Do not restart broad cluster discovery unless the approved step explicitly needs it.")
         if Config.DEEP_INITIAL_INVESTIGATION and not chat_history and intent_mode == "incident_rca":
             directives.append(
                 "Perform a comprehensive read-only investigation before answering. "
@@ -415,7 +444,11 @@ class LogAnalyzerAgent:
         if self._autonomy is None or not Config.AUTONOMY_SCAN_ON_USER_TURN or self._approval.has_pending():
             return ""
 
-        scan = self.run_autonomous_scan(send_notifications=True)
+        scan = self.get_cached_autonomous_scan(
+            max_age_sec=max(0, int(getattr(Config, "AUTONOMY_ALERT_CACHE_MAX_AGE_SEC", 600)))
+        )
+        if not scan:
+            return ""
         if not scan.get("ok") or not scan.get("incident", {}).get("should_alert"):
             self._last_announced_incident_fingerprint = None
             return ""
@@ -423,16 +456,18 @@ class LogAnalyzerAgent:
         incident = scan.get("incident", {})
         notifications = scan.get("notifications", {})
         fingerprint = str(incident.get("fingerprint") or "")
+        observed_at = str(scan.get("completed_at") or incident.get("detected_at") or "").strip()
 
         should_show_banner = notification_was_sent(notifications)
         if should_show_banner and fingerprint and fingerprint != self._last_announced_incident_fingerprint:
             prefix = (
-                "🚨 Autonomous alert monitor detected an incident before handling your request.\n"
+                "🚨 Autonomous alert monitor had already detected an incident before handling your request.\n"
                 f"Severity: {incident.get('severity', 'unknown')} | "
                 f"Confidence: {incident.get('confidence_score', 0)}/100 | "
                 f"Impact: {incident.get('impact_score', 0)}/100\n"
-                f"Summary: {incident.get('issue_summary', '')}\n"
-                f"Notification result: {notifications}\n\n"
+                + f"Summary: {incident.get('issue_summary', '')}\n"
+                + (f"Observed at: {observed_at}\n" if observed_at else "")
+                + f"Notification result: {notifications}\n\n"
             )
         else:
             prefix = ""
@@ -715,21 +750,55 @@ class LogAnalyzerAgent:
             + "Reply `yes` to approve or `no` to cancel."
         )
 
-    def run_autonomous_scan(self, namespace: str | None = None, *, send_notifications: bool = True) -> dict:
-        """Run one autonomous incident scan and optionally send alerts."""
+    def _cache_autonomous_scan(self, scan: dict | None) -> dict:
+        stored = dict(scan or {})
+        if "completed_at" not in stored:
+            stored["completed_at"] = _utc_now_iso()
+        self.last_autonomous_scan = stored
+        return stored
+
+    def get_cached_autonomous_scan(self, *, max_age_sec: int | None = None) -> dict | None:
+        """Return the most recent autonomy scan if it is still fresh enough."""
+        scan = self.last_autonomous_scan
+        if not scan:
+            return None
+        if max_age_sec is None or max_age_sec <= 0:
+            return scan
+
+        incident = scan.get("incident", {}) if isinstance(scan, dict) else {}
+        completed_at = (
+            scan.get("completed_at")
+            or scan.get("collected_at")
+            or (incident.get("detected_at") if isinstance(incident, dict) else "")
+        )
+        dt = _parse_scan_timestamp(completed_at)
+        if dt is None:
+            return None
+        age_sec = (datetime.now(timezone.utc) - dt).total_seconds()
+        if age_sec > max_age_sec:
+            return None
+        return scan
+
+    def capture_autonomous_scan(self, namespace: str | None = None, *, send_notifications: bool = True) -> dict:
+        """Run one autonomous incident scan without mutating cached session state."""
         if self._autonomy is None:
-            result = {
+            return {
                 "ok": False,
                 "error": "Autonomous monitoring is disabled",
                 "incident": None,
                 "notifications": {},
+                "completed_at": _utc_now_iso(),
             }
-            self.last_autonomous_scan = result
-            return result
-
         result = self._autonomy.run_scan(namespace=namespace, send_notifications=send_notifications)
-        self.last_autonomous_scan = result
+        result = dict(result or {})
+        result.setdefault("completed_at", _utc_now_iso())
         return result
+
+    def run_autonomous_scan(self, namespace: str | None = None, *, send_notifications: bool = True) -> dict:
+        """Run one autonomous incident scan and cache the latest result."""
+        return self._cache_autonomous_scan(
+            self.capture_autonomous_scan(namespace=namespace, send_notifications=send_notifications)
+        )
 
     @staticmethod
     def format_autonomous_scan(scan: dict) -> str:
@@ -741,6 +810,7 @@ class LogAnalyzerAgent:
         self._incident_state.clear()
         self._operator_intent_state.clear()
         self._last_announced_incident_fingerprint = None
+        self.last_autonomous_scan = None
         self.last_trace_id = None
 
     @property

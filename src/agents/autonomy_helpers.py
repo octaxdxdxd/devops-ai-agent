@@ -10,8 +10,10 @@ def format_autonomous_scan(scan: dict) -> str:
 
     incident = scan.get("incident", {}) or {}
     notifications = scan.get("notifications", {}) or {}
+    completed_at = str(scan.get("completed_at") or incident.get("detected_at") or "").strip()
     lines = [
         "**Autonomous Alert Scan**",
+        f"- Completed at: {completed_at or 'unknown'}",
         f"- Severity: {incident.get('severity', 'unknown')}",
         f"- Confidence: {incident.get('confidence_score', 0)}/100",
         f"- Impact: {incident.get('impact_score', 0)}/100",

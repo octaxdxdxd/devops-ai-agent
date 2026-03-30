@@ -26,6 +26,59 @@ _RESOURCE_PATTERNS: dict[str, tuple[str, ...]] = {
     "ingress": (r"\bingress(?:es)?\s+([a-z0-9][a-z0-9\.-]*)\b",),
     "node": (r"\bnode(?:s)?\s+([a-z0-9][a-z0-9\.-]*)\b",),
 }
+_FOLLOW_UP_PROMPT_RE = re.compile(
+    r"would you like me to proceed(?:\s+with)?\s*(.+?)\?\s*\(yes/no\)",
+    re.IGNORECASE | re.DOTALL,
+)
+_RECOMMENDED_ACTION_RE = re.compile(
+    r"(?:recommended action:|i recommend the following actions:)\s*(.+?)(?:would you like me to proceed|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_FOLLOW_UP_EXECUTE_MARKERS = (
+    "drain",
+    "cordon",
+    "uncordon",
+    "terminate",
+    "restart",
+    "reboot",
+    "delete",
+    "remove",
+    "scale",
+    "increase",
+    "decrease",
+    "rollout",
+    "patch",
+    "apply",
+    "replace",
+    "update",
+    "modify",
+    "set desired capacity",
+    "desired capacity",
+    "evict",
+)
+_FOLLOW_UP_COLLECT_MARKERS = (
+    "check",
+    "checking",
+    "inspect",
+    "investigate",
+    "review",
+    "look at",
+    "collect",
+    "gather",
+    "verify",
+    "confirm",
+    "read",
+    "describe",
+    "list",
+    "show",
+)
+_FOLLOW_UP_NODE_MARKERS = ("node", "nodes", "ec2", "instance", "instances", "asg", "autoscaling", "cpu", "memory")
+_FOLLOW_UP_SERVICE_MARKERS = ("service", "services", "ingress", "load balancer", "target group", "alb", "nlb")
+_FOLLOW_UP_STORAGE_MARKERS = ("pvc", "pv", "volume", "storage")
+_FOLLOW_UP_WORKLOAD_MARKERS = ("deployment", "statefulset", "daemonset", "workload")
+_FOLLOW_UP_POD_MARKERS = ("pod", "pods", "container", "containers")
+_AFFIRMATIVE_REPLIES = ("yes", "y", "ok", "okay", "sure", "approve", "approved", "proceed", "do it", "run it", "go ahead")
+_NEGATIVE_REPLIES = ("no", "n", "cancel", "stop", "don't", "do not")
 
 
 @dataclass
@@ -161,6 +214,7 @@ class OperatorIntentState:
     pending_step_stage: str = ""
     pending_step_kind: str = ""
     awaiting_follow_up: bool = False
+    approved_proposed_plan: bool = False
 
     def clear(self) -> None:
         self.mode = "incident_response"
@@ -173,6 +227,7 @@ class OperatorIntentState:
         self.pending_step_stage = ""
         self.pending_step_kind = ""
         self.awaiting_follow_up = False
+        self.approved_proposed_plan = False
 
     def blocks_write_actions(self) -> bool:
         return self.execution_policy in {"no_write", "prepare_only"}
@@ -181,7 +236,14 @@ class OperatorIntentState:
         return False
 
     def is_following_proposed_plan(self) -> bool:
-        return False
+        return self.approved_proposed_plan and bool(self.pending_step_summary)
+
+    def allows_direct_write_execution(self) -> bool:
+        return (
+            self.execution_policy == "approved_follow_up"
+            and self.is_following_proposed_plan()
+            and self.pending_step_stage == "execute"
+        )
 
     def render_context_block(self) -> str:
         lines = [
@@ -193,6 +255,12 @@ class OperatorIntentState:
             lines.append(f"- Constraints: {', '.join(self.pinned_constraints)}")
         if self.last_user_instruction:
             lines.append(f"- Latest operator instruction: {self.last_user_instruction}")
+        if self.pending_step_summary:
+            lines.append(f"- Pending step: {self.pending_step_summary}")
+        if self.pending_step_kind:
+            lines.append(f"- Pending step kind: {self.pending_step_kind}")
+        if self.is_following_proposed_plan():
+            lines.append("- Approved follow-up plan is active for this turn.")
         return "\n".join(lines)
 def _clear_pending_step(operator_intent_state: OperatorIntentState) -> None:
     operator_intent_state.pending_step_summary = ""
@@ -200,6 +268,87 @@ def _clear_pending_step(operator_intent_state: OperatorIntentState) -> None:
     operator_intent_state.pending_step_stage = ""
     operator_intent_state.pending_step_kind = ""
     operator_intent_state.awaiting_follow_up = False
+    operator_intent_state.approved_proposed_plan = False
+
+
+def _normalize_reply(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    lowered = re.sub(r"[`'\"]", "", lowered)
+    lowered = re.sub(r"[.!?]+$", "", lowered)
+    return " ".join(lowered.split())
+
+
+def _matches_reply(text: str, prefixes: tuple[str, ...]) -> bool:
+    normalized = _normalize_reply(text)
+    return any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in prefixes)
+
+
+def _normalize_follow_up_summary(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    return cleaned.strip(" .")
+
+
+def _infer_follow_up_focus(summary: str, default_focus: str) -> str:
+    lowered = str(summary or "").lower()
+    if any(marker in lowered for marker in _FOLLOW_UP_NODE_MARKERS):
+        return "node"
+    if any(marker in lowered for marker in _FOLLOW_UP_SERVICE_MARKERS):
+        return "service"
+    if any(marker in lowered for marker in _FOLLOW_UP_STORAGE_MARKERS):
+        return "storage"
+    if any(marker in lowered for marker in _FOLLOW_UP_WORKLOAD_MARKERS):
+        return "workload"
+    if any(marker in lowered for marker in _FOLLOW_UP_POD_MARKERS):
+        return "pod"
+    return str(default_focus or "general") or "general"
+
+
+def _classify_follow_up_step(summary: str) -> tuple[str, str]:
+    lowered = str(summary or "").lower()
+    if any(marker in lowered for marker in _FOLLOW_UP_EXECUTE_MARKERS):
+        return "execute", "execute"
+    if any(marker in lowered for marker in _FOLLOW_UP_COLLECT_MARKERS):
+        return "collect", "collect"
+    return "collect", "collect"
+
+
+def _extract_follow_up_summary(final_text: str) -> str:
+    prompt_match = _FOLLOW_UP_PROMPT_RE.search(str(final_text or ""))
+    if prompt_match:
+        return _normalize_follow_up_summary(prompt_match.group(1))
+
+    block_match = _RECOMMENDED_ACTION_RE.search(str(final_text or ""))
+    if not block_match:
+        return ""
+
+    lines = [
+        re.sub(r"^[\-\*\d\.\)\s]+", "", line).strip()
+        for line in block_match.group(1).splitlines()
+        if str(line).strip()
+    ]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    return _normalize_follow_up_summary("; ".join(lines[:3]))
+
+
+def _extract_follow_up_step(final_text: str, turn_plan: Any) -> dict[str, str] | None:
+    text = str(final_text or "")
+    if "yes/no" not in text.lower() or "proceed" not in text.lower():
+        return None
+
+    summary = _extract_follow_up_summary(text)
+    if not summary:
+        return None
+
+    kind, stage = _classify_follow_up_step(summary)
+    default_focus = str(getattr(turn_plan, "focus", "general") or "general")
+    return {
+        "summary": summary,
+        "focus": _infer_follow_up_focus(summary, default_focus),
+        "kind": kind,
+        "stage": stage,
+    }
 
 
 def register_operator_follow_up(
@@ -209,11 +358,31 @@ def register_operator_follow_up(
     turn_plan: Any,
     approval_pending: bool = False,
 ) -> OperatorIntentState:
-    """Do not infer follow-up workflow state from assistant prose."""
-    del final_text, turn_plan, approval_pending
+    """Track proposed next-step follow-ups from assistant responses."""
+    if approval_pending:
+        _clear_pending_step(operator_intent_state)
+        operator_intent_state.mode = "incident_response"
+        operator_intent_state.execution_policy = "approval_required"
+        operator_intent_state.pinned_constraints = []
+        return operator_intent_state
+
+    follow_up = _extract_follow_up_step(final_text, turn_plan)
+    if follow_up is not None:
+        operator_intent_state.mode = "follow_up_action"
+        operator_intent_state.execution_policy = "approval_required"
+        operator_intent_state.pending_step_summary = follow_up["summary"]
+        operator_intent_state.pending_step_focus = follow_up["focus"]
+        operator_intent_state.pending_step_stage = follow_up["stage"]
+        operator_intent_state.pending_step_kind = follow_up["kind"]
+        operator_intent_state.awaiting_follow_up = True
+        operator_intent_state.approved_proposed_plan = False
+        operator_intent_state.pinned_constraints = []
+        return operator_intent_state
+
     _clear_pending_step(operator_intent_state)
     if operator_intent_state.mode == "follow_up_action":
         operator_intent_state.mode = "incident_response"
+        operator_intent_state.execution_policy = "approval_required"
         operator_intent_state.pinned_constraints = []
     return operator_intent_state
 
@@ -236,6 +405,31 @@ def update_operator_intent_state(
 
     if approval_pending:
         return operator_intent_state
+
+    if operator_intent_state.awaiting_follow_up:
+        if _matches_reply(text, _NEGATIVE_REPLIES):
+            operator_intent_state.mode = "incident_response"
+            operator_intent_state.execution_policy = "approval_required"
+            operator_intent_state.pinned_constraints = []
+            _clear_pending_step(operator_intent_state)
+            return operator_intent_state
+
+        if _matches_reply(text, _AFFIRMATIVE_REPLIES):
+            operator_intent_state.mode = "follow_up_action"
+            operator_intent_state.awaiting_follow_up = False
+            operator_intent_state.approved_proposed_plan = True
+            summary = str(operator_intent_state.pending_step_summary or "").strip()
+            if operator_intent_state.pending_step_stage == "execute":
+                operator_intent_state.execution_policy = "approved_follow_up"
+                operator_intent_state.pinned_constraints = (
+                    [f"Execute only this approved next step: {summary}"] if summary else []
+                )
+            else:
+                operator_intent_state.execution_policy = "approval_required"
+                operator_intent_state.pinned_constraints = (
+                    [f"Continue this approved next step: {summary}"] if summary else []
+                )
+            return operator_intent_state
 
     operator_intent_state.mode = "incident_response"
     operator_intent_state.execution_policy = "approval_required"

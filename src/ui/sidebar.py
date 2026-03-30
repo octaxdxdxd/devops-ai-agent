@@ -141,8 +141,20 @@ def display_sidebar() -> None:
         st.markdown("---")
         st.subheader("Autonomy")
         st.caption(f"Enabled: {Config.AUTONOMY_ENABLED}")
-        st.caption(f"Auto-scan on each turn: {Config.AUTONOMY_SCAN_ON_USER_TURN}")
+        st.caption(f"Background scan refresh enabled: {Config.AUTONOMY_SCAN_ON_USER_TURN}")
+        st.caption(f"Background refresh interval: {Config.AUTONOMY_BACKGROUND_SCAN_INTERVAL_SEC}s")
+        st.caption(f"Alert cache max age: {Config.AUTONOMY_ALERT_CACHE_MAX_AGE_SEC}s")
         st.caption(f"Scope: {Config.AUTONOMY_NAMESPACE}")
         st.caption(f"Event lookback: {Config.AUTONOMY_RECENT_MINUTES}m")
         st.caption(f"Pending grace: {Config.ALERT_PENDING_GRACE_MINUTES}m")
         st.caption(f"Critical event threshold: {Config.ALERT_CRITICAL_EVENT_MIN_COUNT}")
+        future = st.session_state.get("autonomy_scan_future")
+        if future is not None and not future.done():
+            st.caption("Background scan: running")
+        last_scan = st.session_state.get("autonomy_last_scan") or {}
+        completed_at = str(last_scan.get("completed_at") or "").strip()
+        if completed_at:
+            st.caption(f"Last completed scan: {completed_at}")
+        scan_error = str(st.session_state.get("autonomy_scan_last_error") or "").strip()
+        if scan_error:
+            st.caption(f"Last background scan error: {scan_error}")

@@ -61,6 +61,10 @@ def _operator_write_guard_message(operator_intent_state: OperatorIntentState, *,
     return None
 
 
+def _preapproved_follow_up_write_enabled(operator_intent_state: OperatorIntentState) -> bool:
+    return bool(operator_intent_state.allows_direct_write_execution())
+
+
 def _notify_status(status_callback: Callable[[str], None] | None, text: str) -> None:
     """Best-effort status updates for the UI layer."""
     if not callable(status_callback):
@@ -849,6 +853,9 @@ def handle_tool_calls(
             tool_args = resolved["args"]
             tool_intent = resolved["intent"]
             requires_approval = bool(resolved["requires_approval"])
+            preapproved_follow_up_write = requires_approval and _preapproved_follow_up_write_enabled(operator_intent_state)
+            if preapproved_follow_up_write:
+                requires_approval = False
             guard_message = (
                 _command_guard_message(requested_tool=original_name, intent=tool_intent)
                 if tool_intent is not None
@@ -1183,6 +1190,51 @@ def handle_tool_calls(
                     )
                 )
                 continue
+
+            if preapproved_follow_up_write and tw and trace_id:
+                tw.emit(
+                    {
+                        "trace_id": trace_id,
+                        "event": "tool.write_preapproved_follow_up",
+                        "tool": tool_name,
+                        "requested_tool": original_name,
+                        "args": tool_args,
+                    }
+                )
+
+            if preapproved_follow_up_write and tool_intent is not None and tool_intent.family == "aws" and tool_intent.is_mutating:
+                evidence_corpus = _build_evidence_corpus(messages)
+                grounding_issue = _validate_aws_write_grounding(str((tool_args or {}).get("command") or ""), evidence_corpus)
+                if grounding_issue is not None:
+                    unresolved, guard_msg = grounding_issue
+                    if tw and trace_id:
+                        tw.emit(
+                            {
+                                "trace_id": trace_id,
+                                "event": "tool.write_blocked_unverified_ids",
+                                "tool": tool_name,
+                                "unverified_identifiers": unresolved,
+                                "source": "preapproved_follow_up",
+                            }
+                        )
+                    tool_messages.append(ToolMessage(content=guard_msg, tool_call_id=tool_call_id))
+                    execution_records.append(
+                        ToolExecutionRecord(
+                            tool_name=tool_name,
+                            requested_tool=original_name,
+                            args=tool_args,
+                            semantic_key=semantic_signature,
+                            success=False,
+                            summary=guard_msg,
+                            capability=tool_intent.capability if tool_intent is not None else "",
+                            evidence_categories=_evidence_categories_for_call(
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                intent=tool_intent,
+                            ),
+                        )
+                    )
+                    continue
 
             if requires_approval:
                 operator_guard = _operator_write_guard_message(operator_intent_state, tool_name=tool_name)

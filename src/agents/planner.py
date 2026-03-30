@@ -518,6 +518,38 @@ def build_turn_plan(
     del chat_history  # The current heuristics rely on incident_state + current turn text.
 
     mode = intent.mode
+    if operator_intent_state.is_following_proposed_plan():
+        follow_up_focus = str(
+            getattr(operator_intent_state, "pending_step_focus", "") or incident_state.last_focus or "general"
+        )
+        follow_up_stage = str(getattr(operator_intent_state, "pending_step_stage", "") or "collect")
+        preferred_tools = list(dict.fromkeys(_preferred_tools_for_focus(follow_up_focus)))
+        if follow_up_stage == "execute":
+            preferred_tools.extend(["kubectl_execute", "helm_execute", "aws_cli_execute"])
+
+        notes = [
+            "Follow the previously proposed next step that the operator already approved.",
+            "Do not restart broad discovery unless the approved step explicitly requires it.",
+        ]
+        if getattr(operator_intent_state, "pending_step_summary", ""):
+            notes.append(f"Approved step: {operator_intent_state.pending_step_summary}")
+
+        return TurnPlan(
+            mode=mode,
+            stage=follow_up_stage,
+            focus=follow_up_focus,
+            continue_existing=True,
+            reset_existing_context=False,
+            prefer_cached_reads=True,
+            prefer_fresh_reads=False,
+            allow_broad_discovery=False,
+            required_categories=(),
+            preferred_tools=tuple(dict.fromkeys(preferred_tools)),
+            notes=tuple(notes),
+            requested_aspects=(),
+            objectives=(),
+        )
+
     focus = _detect_focus(user_input, incident_state)
     requested_aspects = _derive_requested_aspects(user_input, intent, focus)
     inventory_request = "inventory" in requested_aspects
