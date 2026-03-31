@@ -18,15 +18,18 @@ INTENT_SYSTEM_PROMPT = """\
 Classify the user's infrastructure query into exactly one category.
 
 Categories:
-- lookup: Simple data retrieval. Examples: list pods, show nodes, get logs, show events, what namespaces exist, describe deployment X, show ASGs, list instances, show EBS volumes, list load balancers, show secrets, what version, inspect certificates
-- diagnose: Troubleshooting, investigation, RCA. Examples: why is X failing, pod crashing, high latency, what's wrong, investigate issue, how are certificates managed
-- action: Modify infrastructure. Examples: scale X, restart X, delete X, apply manifest, update config, cordon node, drain node
-- explain: Analysis, insight, planning. Examples: what does X do, monthly cost, security posture, should we use spot instances, optimize
+- lookup: Simple data retrieval or resource inspection. Examples: list pods, show nodes, get logs, show events, what namespaces exist, describe deployment X, show ASGs, list instances, show EBS volumes, list load balancers, show secrets, what version, inspect certificates, what are the resource limits, show memory/CPU requests, what's the retention policy, what PVs exist, how many replicas, show ingresses, what domain names
+- diagnose: Troubleshooting a PROBLEM, investigation, RCA. Examples: why is X failing, pod crashing, high latency, what's wrong, investigate issue, why are pods pending, why can't I connect, error analysis
+- action: Modify infrastructure. Examples: scale X, restart X, delete X, apply manifest, update config, cordon node, drain node, change policy, patch resource
+- explain: Analysis, insight, planning, comparison, "how to" questions. Examples: what does X do, monthly cost, security posture, should we use spot instances, optimize, difference between X and Y, how can I improve, what would happen if, cost comparison, migration planning
 
 IMPORTANT:
-- Short affirmations like "yes", "do it", "go ahead", "sure" should be classified as "lookup" — the actual operation was already discussed in prior messages.
+- Short affirmations like "yes", "do it", "go ahead", "sure", "confirm" should repeat the previous intent from chat history — the actual operation was already discussed.
 - When in doubt between lookup and explain, prefer lookup — it will fetch data first.
-- Questions asking "what is" or "show me" or "list" are always lookup.
+- Questions asking "what is", "what are", "show me", "list", "how many", "do I have" are always lookup.
+- Questions asking about resource properties (limits, requests, policies, versions, sizes) are lookup.
+- Questions asking "why" or reporting symptoms are diagnose.
+- Questions about "how to" change something or asking for recommendations are explain.
 
 Output ONLY valid JSON:
 {"intent": "<category>", "resources": ["mentioned resources"], "namespaces": ["mentioned namespaces"]}"""

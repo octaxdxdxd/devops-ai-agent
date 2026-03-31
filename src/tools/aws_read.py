@@ -52,7 +52,7 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             start_date: Start date YYYY-MM-DD (default: 30 days ago)
             end_date: End date YYYY-MM-DD (default: today)
             granularity: DAILY, MONTHLY, or HOURLY
-            group_by: Dimension to group by: SERVICE, REGION, INSTANCE_TYPE, LINKED_ACCOUNT (empty = total)
+            group_by: Dimension to group by. Valid values: SERVICE, REGION, INSTANCE_TYPE, LINKED_ACCOUNT, USAGE_TYPE, PLATFORM, TENANCY, PURCHASE_TYPE, OPERATING_SYSTEM, DATABASE_ENGINE (empty = total cost). Note: RESOURCE_ID is NOT a valid dimension here.
         """
         return compress_output(
             aws.get_cost(

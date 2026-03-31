@@ -212,24 +212,30 @@ class AIOpsAgent:
         action.status = "executed"
 
         for cmd in action.commands:
-            tool_name = cmd.get("tool", "")
             display = cmd.get("display", str(cmd))
             cb(f"Executing: {display}")
 
-            if tool_name == "shell":
-                # Shell command (kubectl/aws)
-                shell_cmd = cmd.get("args", {}).get("command", cmd.get("display", ""))
-                if shell_cmd.startswith("kubectl"):
-                    result = self.k8s.execute_shell_command(shell_cmd)
-                else:
-                    result = f"ERROR: Only kubectl shell commands supported. Got: {shell_cmd}"
+            # New format: {"command": "kubectl ...", "display": "..."}
+            command_str = cmd.get("command", "")
+            if command_str:
+                result = self._run_approved_command(command_str)
             else:
-                result = self.tools.execute(tool_name, cmd.get("args", {}))
+                # Legacy format: {"tool": "...", "args": {...}, "display": "..."}
+                tool_name = cmd.get("tool", "")
+                if tool_name in ("shell", "k8s_run_kubectl"):
+                    legacy_cmd = cmd.get("args", {}).get("command", cmd.get("display", ""))
+                    if not legacy_cmd.startswith("kubectl"):
+                        legacy_cmd = f"kubectl {legacy_cmd}"
+                    result = self._run_approved_command(legacy_cmd)
+                elif tool_name:
+                    result = self.tools.execute(tool_name, cmd.get("args", {}))
+                else:
+                    result = f"ERROR: No command or tool specified in: {cmd}"
 
             self.tracer.step(
                 "tool_call", "action",
-                tool_name=tool_name or "shell",
-                tool_args=cmd.get("args"),
+                tool_name="kubectl",
+                tool_args=cmd,
                 tool_result_preview=result[:300],
             )
             results.append(f"**Command**: `{display}`\n```\n{result}\n```")
@@ -237,18 +243,23 @@ class AIOpsAgent:
         # Verification
         if action.verification:
             cb("Verifying change...")
-            v_tool = action.verification.get("tool", "")
-            v_args = action.verification.get("args", {})
-            if v_tool:
-                v_result = self.tools.execute(v_tool, v_args)
-                self.tracer.step(
-                    "verify", "action",
-                    tool_name=v_tool,
-                    tool_args=v_args,
-                    tool_result_preview=v_result[:300],
-                )
-                results.append(f"\n## Verification\n```\n{v_result}\n```")
-                action.status = "verified"
+            v_cmd = action.verification.get("command", "")
+            if v_cmd:
+                v_result = self._run_approved_command(v_cmd)
+            else:
+                # Legacy format: {"tool": "...", "args": {...}}
+                v_tool = action.verification.get("tool", "")
+                v_args = action.verification.get("args", {})
+                v_result = self.tools.execute(v_tool, v_args) if v_tool else "No verification command"
+
+            self.tracer.step(
+                "verify", "action",
+                tool_name="kubectl",
+                tool_args=action.verification,
+                tool_result_preview=v_result[:300],
+            )
+            results.append(f"\n## Verification\n```\n{v_result}\n```")
+            action.status = "verified"
 
         # Post-remediation analysis
         cb("Analyzing results...")
@@ -265,6 +276,20 @@ class AIOpsAgent:
         self.operator_intent_state.pending_step_kind = ""
 
         return "\n\n".join(results)
+
+    def _run_approved_command(self, command: str) -> str:
+        """Execute a user-approved kubectl command."""
+        import shlex
+        command = command.strip()
+        if command.startswith("kubectl "):
+            try:
+                parts = shlex.split(command)
+            except ValueError as exc:
+                return f"ERROR: Invalid command syntax: {exc}"
+            # parts[0] is 'kubectl', rest are args
+            return self.k8s.run(parts[1:])
+        else:
+            return f"ERROR: Only kubectl commands are supported for execution. Got: {command}"
 
     def _post_remediation_analysis(self, action: PendingAction, execution_output: str) -> str:
         """Quick LLM call to analyze whether the remediation worked."""

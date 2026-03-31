@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -14,8 +15,9 @@ from .base import StatusCallback, run_tool_loop
 
 log = logging.getLogger(__name__)
 
-DIAGNOSE_SYSTEM_PROMPT = """\
+_DIAGNOSE_SYSTEM_PROMPT_TEMPLATE = """\
 You are a senior SRE performing deep infrastructure investigation.
+Today's date is {today}.
 
 CRITICAL BEHAVIORAL RULES:
 - NEVER ask the user for confirmation before investigating. Just investigate.
@@ -23,7 +25,18 @@ CRITICAL BEHAVIORAL RULES:
 - If you can figure out the answer by calling tools, do it. Don't ask the user for info you can look up.
 - Present ALL data returned by tools accurately. Never drop items or records.
 
-INVESTIGATION PROTOCOL — follow this order:
+CONFIDENCE RULES:
+- NEVER say "I cannot directly..." or "I cannot retrieve..." if you have tools that can do it.
+- Be assertive. Use your tools confidently. Try alternative approaches before giving up.
+- When a tool fails, retry with corrected parameters before reporting failure to the user.
+
+ANSWER THE USER'S QUESTION FIRST:
+- If the user asks a specific data question (e.g. "what are the memory/CPU limits for each pod?"), ANSWER THAT EXACT QUESTION with the data they requested.
+- Do NOT default to an RCA format when the user is simply asking for information.
+- Only use the RCA investigation protocol when the user is reporting a PROBLEM or asking WHY something is happening.
+- Present the data the user asked for clearly and completely before offering any additional analysis.
+
+INVESTIGATION PROTOCOL — use this ONLY for problem/troubleshooting queries:
 1. SYMPTOM: Identify the exact symptom from the user's query.
 2. CONTEXT: Gather baseline data about the affected resource(s) — status, events, recent changes.
 3. BLAST RADIUS: Check what else is affected (other pods, related services, node conditions).
@@ -31,6 +44,10 @@ INVESTIGATION PROTOCOL — follow this order:
 5. DEPENDENCIES: Follow the dependency chain (service → deployment → pods → nodes → AWS resources).
 6. CORRELATE: Connect findings across Kubernetes and AWS where relevant.
 7. CONCLUDE: State the root cause with a clear evidence chain.
+
+RESOURCE DISCOVERY:
+- When looking for a specific resource, try MULTIPLE search strategies before giving up.
+- Search by namespace, by name, across all namespaces, by different labels.
 
 DATA RULES:
 - Every conclusion MUST cite specific tool output that supports it.
@@ -45,7 +62,16 @@ DATA RULES:
 - State limitations: "I checked region X" rather than "there are no resources".
 - Use aws_describe_service or k8s_run_kubectl for queries not covered by specific tools.
 
-OUTPUT FORMAT for final answer:
+COST QUERIES:
+- Today's date is {today}. Use this for any date calculations, never guess.
+- Valid group_by dimensions for aws_get_cost: SERVICE, REGION, INSTANCE_TYPE, LINKED_ACCOUNT, USAGE_TYPE.
+
+READ-ONLY ENFORCEMENT:
+- You are a READ-ONLY handler. You MUST NOT execute any mutating operations.
+- k8s_run_kubectl only allows read commands (get, describe, logs, etc.).
+- If a fix or change is needed, DESCRIBE what should be done and tell the user to request it as an action.
+
+OUTPUT FORMAT for RCA (only when investigating problems):
 ## Root Cause Analysis
 **Symptom**: [what was reported]
 **Root Cause**: [identified cause with evidence]
@@ -67,6 +93,9 @@ def handle_diagnose(
     """Handle a diagnostic / RCA query with structured investigation protocol."""
     cb = status_callback or (lambda _: None)
 
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    system_prompt = _DIAGNOSE_SYSTEM_PROMPT_TEMPLATE.format(today=today)
+
     # Build context preamble with topology if available
     context_parts = []
     if topology_cache:
@@ -83,7 +112,7 @@ def handle_diagnose(
         preamble = "\n\n".join(context_parts) + "\n\n"
 
     messages = [
-        SystemMessage(content=DIAGNOSE_SYSTEM_PROMPT),
+        SystemMessage(content=system_prompt),
         *chat_history[-6:],
         HumanMessage(content=f"{preamble}User query: {user_input}"),
     ]
@@ -100,5 +129,5 @@ def handle_diagnose(
         status_callback=status_callback,
         checkpoint_step=Config.DIAGNOSE_CHECKPOINT_STEP,
         original_query=user_input,
-        system_prompt=DIAGNOSE_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
     )

@@ -138,12 +138,22 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             max_chars=6000,
         )
 
+    # Read-only kubectl subcommands (whitelist).  Anything not listed
+    # here is considered a write / mutating operation and will be blocked.
+    _KUBECTL_READ_SUBCOMMANDS = frozenset({
+        "get", "describe", "logs", "top", "explain", "api-resources",
+        "api-versions", "version", "cluster-info", "config", "auth",
+        "diff", "events", "wait",
+    })
+
     @tool
     def k8s_run_kubectl(command: str) -> str:
-        """Run an arbitrary kubectl command for queries not covered by other tools.
+        """Run an arbitrary **read-only** kubectl command for queries not covered by other tools.
 
         The command string should NOT include the leading 'kubectl' — it is added automatically.
         Examples: 'get crd', 'api-resources', 'get networkpolicy -A', 'auth can-i list pods'.
+        WRITE operations (patch, delete, apply, create, scale, etc.) are blocked.
+        To modify resources, describe what change you want and let the user request it as an action.
 
         Args:
             command: kubectl arguments (without the leading 'kubectl')
@@ -159,6 +169,14 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
         dangerous = ["|", ">", "<", ";", "&", "$(", "`"]
         if any(d in command for d in dangerous):
             return "ERROR: Command contains potentially dangerous shell operators"
+        # Safety: block mutating commands — only read-only subcommands allowed
+        subcommand = parts[0].lower()
+        if subcommand not in _KUBECTL_READ_SUBCOMMANDS:
+            return (
+                f"ERROR: 'kubectl {subcommand}' is a mutating operation and is blocked in read-only mode. "
+                "To modify infrastructure, describe what change is needed and the user "
+                "can request it as an action (which goes through the approval flow)."
+            )
         return compress_output(k8s.run(parts))
 
     return [

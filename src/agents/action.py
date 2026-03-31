@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -19,21 +20,43 @@ from .base import StatusCallback, extract_token_usage
 
 log = logging.getLogger(__name__)
 
-ACTION_SYSTEM_PROMPT = """\
+_ACTION_SYSTEM_PROMPT_TEMPLATE = """\
 You are an infrastructure operations assistant that proposes safe changes.
+Today's date is {today}.
 
 WORKFLOW:
 1. Use read tools to understand the current state of the affected resources.
 2. Analyze what change is needed and assess risk.
 3. Call the 'propose_action' tool with your complete plan. NEVER execute changes directly.
 
+RESOURCE DISCOVERY:
+- When looking for a specific resource by name, try MULTIPLE search strategies:
+  1. Search by namespace matching the resource name (e.g. "nexus" → namespace "nexus")
+  2. Search across all namespaces with all_namespaces=True
+  3. Try the resource's parent (deployment, statefulset) not just pods
+- NEVER give up after a single failed search. Try at least 2-3 different approaches.
+- Use k8s_get_resources with namespace parameter, then try all_namespaces=True if no results.
+
+COMMAND FORMAT for propose_action:
+- commands_json must be valid JSON (use double quotes).
+- Each entry: {{"command": "kubectl ...", "display": "short description"}}
+- Every command MUST be a complete kubectl command starting with "kubectl".
+- Do NOT reference tool names. Write the actual kubectl commands.
+- Examples:
+  - {{"command": "kubectl patch pv foo -p '{{\\"spec\\":{{\\"persistentVolumeReclaimPolicy\\":\\"Retain\\"}}}}'", "display": "Set PV foo reclaim policy to Retain"}}
+  - {{"command": "kubectl scale deployment bar --replicas=3 -n prod", "display": "Scale bar to 3 replicas"}}
+  - {{"command": "kubectl rollout restart deployment baz -n staging", "display": "Rolling restart baz"}}
+- verification_command: a single kubectl command to check that the change worked.
+
 RULES:
 - Always investigate current state before proposing changes.
+- Be confident — don't say "I cannot" when you have tools to find the information.
 - Assess risk honestly: LOW (non-destructive, easily reversible), MEDIUM (service impact possible), HIGH (data loss risk or wide blast radius), CRITICAL (irreversible or affects production data).
-- Include exact commands/operations the user can review.
-- Include a verification step: what to check after execution to confirm success.
+- Include exact kubectl commands the user can review.
+- Include a verification command to confirm success after execution.
 - If the request is ambiguous or dangerous, explain concerns and ask for clarification instead of proposing.
-- Propose the MINIMAL change needed. Do not over-engineer."""
+- Propose the MINIMAL change needed. Do not over-engineer.
+- For pod restarts: prefer 'kubectl rollout restart' on the parent deployment/statefulset over deleting individual pods."""
 
 
 @dataclass
@@ -56,31 +79,29 @@ def _create_propose_action_tool(captured: list[dict]):
         commands_json: str,
         risk: str,
         expected_outcome: str,
-        verification_tool: str = "",
-        verification_args_json: str = "",
+        verification_command: str = "",
     ) -> str:
         """Propose an infrastructure change for user approval. Do NOT execute changes directly.
 
         Args:
             description: Clear description of what this action does and why
-            commands_json: JSON array of commands: [{"tool":"tool_name","args":{...},"display":"human-readable command"}]
+            commands_json: JSON array of kubectl commands. Each entry: {"command":"kubectl ...","display":"short description"}. Every command must start with 'kubectl'. Use double quotes for JSON.
             risk: Risk level: LOW, MEDIUM, HIGH, or CRITICAL
             expected_outcome: What should happen after successful execution
-            verification_tool: Tool name to run for post-execution verification (optional)
-            verification_args_json: JSON args for verification tool (optional)
+            verification_command: A kubectl command to verify success, e.g. 'kubectl get pv -o wide' (optional)
         """
         try:
             commands = json.loads(commands_json)
         except (json.JSONDecodeError, TypeError):
-            commands = [{"tool": "shell", "args": {}, "display": commands_json}]
+            # Fallback: try to fix single-quoted JSON from LLM
+            try:
+                commands = json.loads(commands_json.replace("'", '"'))
+            except Exception:
+                commands = [{"command": commands_json, "display": commands_json}]
 
         verification = None
-        if verification_tool:
-            try:
-                v_args = json.loads(verification_args_json) if verification_args_json else {}
-            except (json.JSONDecodeError, TypeError):
-                v_args = {}
-            verification = {"tool": verification_tool, "args": v_args}
+        if verification_command:
+            verification = {"command": verification_command.strip()}
 
         captured.append({
             "description": description,
@@ -126,8 +147,11 @@ def handle_action(
     if base_llm:
         llm_rebound = base_llm.bind_tools(all_tools)
 
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    system_prompt = _ACTION_SYSTEM_PROMPT_TEMPLATE.format(today=today)
+
     messages = [
-        SystemMessage(content=ACTION_SYSTEM_PROMPT),
+        SystemMessage(content=system_prompt),
         *chat_history[-4:],
         HumanMessage(content=user_input),
     ]
@@ -233,8 +257,8 @@ def _extract_actions_from_text(text: str) -> list[PendingAction]:
     for block in code_blocks:
         for line in block.strip().splitlines():
             line = line.strip()
-            if line and (line.startswith("kubectl") or line.startswith("aws")):
-                commands.append({"tool": "shell", "args": {"command": line}, "display": line})
+            if line and line.startswith("kubectl"):
+                commands.append({"command": line, "display": line})
 
     if commands:
         actions.append(PendingAction(
