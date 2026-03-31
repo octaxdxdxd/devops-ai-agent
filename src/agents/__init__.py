@@ -1,5 +1,8 @@
-"""Agent package exports."""
+"""Agent package — exposes the main AIOps orchestrator."""
 
-from .log_analyzer import LogAnalyzerAgent
+from .orchestrator import AIOpsAgent
 
-__all__ = ["LogAnalyzerAgent"]
+# Backward-compatible alias used by existing session.py
+LogAnalyzerAgent = AIOpsAgent
+
+__all__ = ["AIOpsAgent", "LogAnalyzerAgent"]

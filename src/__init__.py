@@ -1,6 +1,7 @@
 """
-AI Ops Agent with Streamlit UI
-Kubernetes diagnostics and incident response assistant
+AIOps Infrastructure Agent
+Evidence-grounded investigation, diagnostics, and approval-gated remediation
+for Kubernetes and AWS.
 """
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
 import re
 
 import streamlit as st
@@ -14,139 +12,6 @@ from ..config import Config
 
 
 _TRACE_SUFFIX_RE = re.compile(r"(?:\n\s*)*Trace ID:\s*`?([a-f0-9]{8,})`?\s*$", re.IGNORECASE)
-_AUTONOMY_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aiops-autonomy")
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _parse_iso_timestamp(value: str | None) -> datetime | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def _scan_completed_at(scan: dict | None) -> datetime | None:
-    payload = scan or {}
-    incident = payload.get("incident", {}) if isinstance(payload, dict) else {}
-    return _parse_iso_timestamp(
-        payload.get("completed_at")
-        or payload.get("collected_at")
-        or (incident.get("detected_at") if isinstance(incident, dict) else "")
-    )
-
-
-def _normalize_scan_result(scan: dict | None) -> dict:
-    payload = dict(scan or {})
-    payload.setdefault("completed_at", _utc_now_iso())
-    return payload
-
-
-def autonomy_scan_is_due(last_scan: dict | None, *, now: datetime | None = None) -> bool:
-    """Return True when the cached autonomous scan should be refreshed."""
-    if not Config.AUTONOMY_ENABLED or not Config.AUTONOMY_SCAN_ON_USER_TURN:
-        return False
-
-    interval_sec = max(30, int(getattr(Config, "AUTONOMY_BACKGROUND_SCAN_INTERVAL_SEC", 300)))
-    completed_at = _scan_completed_at(last_scan)
-    if completed_at is None:
-        return True
-
-    current_time = now or datetime.now(timezone.utc)
-    age_sec = (current_time - completed_at).total_seconds()
-    return age_sec >= interval_sec
-
-
-def reset_autonomy_scan_runtime() -> None:
-    """Clear any in-flight autonomy scan references from the current UI session."""
-    future = st.session_state.get("autonomy_scan_future")
-    if future is not None and hasattr(future, "cancel"):
-        try:
-            future.cancel()
-        except Exception:
-            pass
-    st.session_state.autonomy_scan_future = None
-    st.session_state.autonomy_scan_requested_at = None
-    st.session_state.autonomy_scan_last_error = None
-    st.session_state.autonomy_scan_source = None
-
-
-def _run_autonomy_scan_job(agent: LogAnalyzerAgent, namespace: str | None, send_notifications: bool) -> dict:
-    return agent.capture_autonomous_scan(namespace=namespace, send_notifications=send_notifications)
-
-
-def poll_autonomy_scan_job() -> None:
-    """Harvest a finished background autonomy scan into session state."""
-    future = st.session_state.get("autonomy_scan_future")
-    if future is None or not isinstance(future, Future):
-        return
-    if not future.done():
-        return
-
-    st.session_state.autonomy_scan_future = None
-    try:
-        scan = _normalize_scan_result(future.result())
-        st.session_state.autonomy_last_scan = scan
-        st.session_state.autonomy_scan_last_error = None
-        agent = st.session_state.get("agent")
-        if agent is not None:
-            try:
-                agent._cache_autonomous_scan(scan)
-            except Exception:
-                agent.last_autonomous_scan = scan
-    except Exception as exc:
-        st.session_state.autonomy_scan_last_error = str(exc)
-        scan = _normalize_scan_result(
-            {
-                "ok": False,
-                "error": str(exc),
-                "incident": None,
-                "notifications": {},
-            }
-        )
-        st.session_state.autonomy_last_scan = scan
-        agent = st.session_state.get("agent")
-        if agent is not None:
-            agent.last_autonomous_scan = scan
-
-
-def schedule_autonomy_scan(
-    *,
-    force: bool = False,
-    send_notifications: bool = True,
-    source: str = "auto",
-) -> bool:
-    """Schedule a background autonomy scan when the cached result is missing or stale."""
-    if not Config.AUTONOMY_ENABLED or not Config.AUTONOMY_SCAN_ON_USER_TURN:
-        return False
-
-    agent = st.session_state.get("agent")
-    if agent is None:
-        return False
-
-    future = st.session_state.get("autonomy_scan_future")
-    if isinstance(future, Future) and not future.done():
-        return False
-
-    last_scan = st.session_state.get("autonomy_last_scan")
-    if not force and not autonomy_scan_is_due(last_scan):
-        return False
-
-    st.session_state.autonomy_scan_future = _AUTONOMY_EXECUTOR.submit(
-        _run_autonomy_scan_job,
-        agent,
-        None,
-        send_notifications,
-    )
-    st.session_state.autonomy_scan_requested_at = _utc_now_iso()
-    st.session_state.autonomy_scan_last_error = None
-    st.session_state.autonomy_scan_source = source
-    return True
 
 
 def extract_trace_id_from_content(content: str) -> str | None:
@@ -200,8 +65,6 @@ def initialize_session_state() -> None:
         st.session_state.model_provider = Config.LLM_PROVIDER
     if "model_name" not in st.session_state:
         st.session_state.model_name = Config.get_active_model_name()
-    if "autonomy_last_scan" not in st.session_state:
-        st.session_state.autonomy_last_scan = None
     if "agent_status_text" not in st.session_state:
         st.session_state.agent_status_text = None
     if "model_provider_draft" not in st.session_state:
@@ -210,14 +73,6 @@ def initialize_session_state() -> None:
         st.session_state.model_name_draft = st.session_state.model_name
     if "model_settings_notice" not in st.session_state:
         st.session_state.model_settings_notice = None
-    if "autonomy_scan_future" not in st.session_state:
-        st.session_state.autonomy_scan_future = None
-    if "autonomy_scan_requested_at" not in st.session_state:
-        st.session_state.autonomy_scan_requested_at = None
-    if "autonomy_scan_last_error" not in st.session_state:
-        st.session_state.autonomy_scan_last_error = None
-    if "autonomy_scan_source" not in st.session_state:
-        st.session_state.autonomy_scan_source = None
 
 
 def apply_runtime_model_selection(provider: str, model_name: str | None = None) -> tuple[str, str]:
@@ -249,8 +104,6 @@ def apply_runtime_model_selection(provider: str, model_name: str | None = None) 
     st.session_state.model_provider_draft = selected_provider
     st.session_state.model_name_draft = applied_model
     st.session_state.agent_status_text = None
-    st.session_state.autonomy_last_scan = None
-    reset_autonomy_scan_runtime()
     return selected_provider, applied_model
 
 

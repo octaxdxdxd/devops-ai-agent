@@ -137,17 +137,6 @@ def display_sidebar() -> None:
             st.caption("Recent")
             for trace_id in recent_trace_ids[:12]:
                 st.code(trace_id)
-
-        st.markdown("---")
-        st.subheader("Autonomy")
-        st.caption(f"Enabled: {Config.AUTONOMY_ENABLED}")
-        st.caption(f"Background scan refresh enabled: {Config.AUTONOMY_SCAN_ON_USER_TURN}")
-        st.caption(f"Background refresh interval: {Config.AUTONOMY_BACKGROUND_SCAN_INTERVAL_SEC}s")
-        st.caption(f"Alert cache max age: {Config.AUTONOMY_ALERT_CACHE_MAX_AGE_SEC}s")
-        st.caption(f"Scope: {Config.AUTONOMY_NAMESPACE}")
-        st.caption(f"Event lookback: {Config.AUTONOMY_RECENT_MINUTES}m")
-        st.caption(f"Pending grace: {Config.ALERT_PENDING_GRACE_MINUTES}m")
-        st.caption(f"Critical event threshold: {Config.ALERT_CRITICAL_EVENT_MIN_COUNT}")
         future = st.session_state.get("autonomy_scan_future")
         if future is not None and not future.done():
             st.caption("Background scan: running")
