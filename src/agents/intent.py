@@ -14,6 +14,25 @@ from .base import extract_token_usage
 
 log = logging.getLogger(__name__)
 
+_CONFIRMATION_ONLY_INPUTS = {
+    "yes",
+    "y",
+    "yeah",
+    "yep",
+    "sure",
+    "ok",
+    "okay",
+    "confirm",
+    "go ahead",
+    "do it",
+    "do that",
+    "yeah do that",
+    "yes do that",
+    "sure do that",
+    "ok do that",
+    "okay do that",
+}
+
 INTENT_SYSTEM_PROMPT = """\
 Classify the user's infrastructure query into exactly one category.
 
@@ -24,12 +43,12 @@ Categories:
 - explain: Analysis, insight, planning, comparison, "how to" questions. Examples: what does X do, monthly cost, security posture, should we use spot instances, optimize, difference between X and Y, how can I improve, what would happen if, cost comparison, migration planning
 
 IMPORTANT:
-- Short affirmations like "yes", "do it", "go ahead", "sure", "confirm" should repeat the previous intent from chat history — the actual operation was already discussed.
 - When in doubt between lookup and explain, prefer lookup — it will fetch data first.
 - Questions asking "what is", "what are", "show me", "list", "how many", "do I have" are always lookup.
 - Questions asking about resource properties (limits, requests, policies, versions, sizes) are lookup.
 - Questions asking "why" or reporting symptoms are diagnose.
 - Questions about "how to" change something or asking for recommendations are explain.
+- Do not infer a mutating action from a short acknowledgement or confirmation. Action requires an explicit change request in the current user message.
 
 Output ONLY valid JSON:
 {"intent": "<category>", "resources": ["mentioned resources"], "namespaces": ["mentioned namespaces"]}"""
@@ -44,6 +63,14 @@ class IntentResult:
         self.namespaces = namespaces or []
 
 
+def _normalize_user_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").lower().strip())
+
+
+def _is_confirmation_only_input(text: str) -> bool:
+    return _normalize_user_text(text) in _CONFIRMATION_ONLY_INPUTS
+
+
 def classify_intent(
     user_input: str,
     llm,
@@ -53,10 +80,23 @@ def classify_intent(
 ) -> IntentResult:
     """Classify user intent with a single, cheap LLM call (~200 tokens)."""
 
+    if _is_confirmation_only_input(user_input):
+        tracer.step(
+            "intent",
+            "orchestrator",
+            input_summary=user_input[:200],
+            output_summary='{"intent":"lookup","resources":[],"namespaces":[]}',
+            llm_model=model_name,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=0,
+        )
+        return IntentResult(intent="lookup")
+
     messages = [
         SystemMessage(content=INTENT_SYSTEM_PROMPT),
     ]
-    # Include recent chat for follow-up context (e.g. user says "yes")
+    # Include recent chat for follow-up context.
     if chat_history:
         messages.extend(chat_history[-4:])
     messages.append(HumanMessage(content=user_input))

@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 import streamlit as st
 
+from ..agents.action import format_action_step_preview
+
 if TYPE_CHECKING:
     from ..agents.action import PendingAction
 
@@ -38,10 +40,19 @@ def _render_single_action(action: PendingAction) -> None:
 
         # Show commands
         if action.commands:
-            st.markdown("**Commands to execute:**")
+            st.markdown("**Steps to execute:**")
             for cmd in action.commands:
-                display = cmd.get("display", str(cmd))
-                st.code(display, language="bash")
+                label, preview, language = format_action_step_preview(cmd)
+                if label:
+                    st.caption(label)
+                st.code(preview, language=language)
+
+        if action.verification:
+            verification_label, verification_preview, verification_language = format_action_step_preview(action.verification)
+            st.markdown("**Verification:**")
+            if verification_label:
+                st.caption(verification_label)
+            st.code(verification_preview, language=verification_language)
 
         # Approval buttons
         col_approve, col_reject = st.columns(2)

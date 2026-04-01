@@ -22,7 +22,7 @@ from .base import StatusCallback, extract_token_usage
 from .intent import classify_intent
 from .lookup import handle_lookup
 from .diagnose import handle_diagnose
-from .action import handle_action, PendingAction
+from .action import PendingAction, format_action_step_preview, handle_action
 from .explain import handle_explain
 
 log = logging.getLogger(__name__)
@@ -177,8 +177,9 @@ class AIOpsAgent:
         cb("Planning action...")
         llm_with_tools = self._model_wrapper.get_llm_with_tools(self.tools.read_tools)
         read_tool_map = {t.name: t for t in self.tools.read_tools}
+        write_tool_map = {t.name: t for t in self.tools.write_tools}
         response_text, actions = handle_action(
-            user_input, history, llm_with_tools, read_tool_map,
+            user_input, history, llm_with_tools, read_tool_map, write_tool_map,
             self.model_name, self.tracer, cb,
         )
         self.pending_actions = actions
@@ -212,13 +213,14 @@ class AIOpsAgent:
         action.status = "executed"
 
         for cmd in action.commands:
-            display = cmd.get("display", str(cmd))
-            cb(f"Executing: {display}")
+            step_label, step_preview, step_language = format_action_step_preview(cmd)
+            cb(f"Executing: {step_label or step_preview}")
 
             # New format: {"command": "kubectl ...", "display": "..."}
             command_str = cmd.get("command", "")
             if command_str:
                 result = self._run_approved_command(command_str)
+                trace_tool_name = "kubectl"
             else:
                 # Legacy format: {"tool": "...", "args": {...}, "display": "..."}
                 tool_name = cmd.get("tool", "")
@@ -227,18 +229,26 @@ class AIOpsAgent:
                     if not legacy_cmd.startswith("kubectl"):
                         legacy_cmd = f"kubectl {legacy_cmd}"
                     result = self._run_approved_command(legacy_cmd)
+                    trace_tool_name = "kubectl"
                 elif tool_name:
                     result = self.tools.execute(tool_name, cmd.get("args", {}))
+                    trace_tool_name = tool_name
                 else:
                     result = f"ERROR: No command or tool specified in: {cmd}"
+                    trace_tool_name = "unknown"
 
             self.tracer.step(
                 "tool_call", "action",
-                tool_name="kubectl",
+                tool_name=trace_tool_name,
                 tool_args=cmd,
                 tool_result_preview=result[:300],
             )
-            results.append(f"**Command**: `{display}`\n```\n{result}\n```")
+            result_parts: list[str] = []
+            if step_label:
+                result_parts.append(f"**Step**: {step_label}")
+            result_parts.append(f"```{step_language}\n{step_preview}\n```")
+            result_parts.append(f"```\n{result}\n```")
+            results.append("\n".join(result_parts))
 
         # Verification
         if action.verification:
@@ -246,19 +256,28 @@ class AIOpsAgent:
             v_cmd = action.verification.get("command", "")
             if v_cmd:
                 v_result = self._run_approved_command(v_cmd)
+                trace_tool_name = "kubectl"
             else:
                 # Legacy format: {"tool": "...", "args": {...}}
                 v_tool = action.verification.get("tool", "")
                 v_args = action.verification.get("args", {})
                 v_result = self.tools.execute(v_tool, v_args) if v_tool else "No verification command"
+                trace_tool_name = v_tool or "unknown"
+
+            verification_label, verification_preview, verification_language = format_action_step_preview(action.verification)
 
             self.tracer.step(
                 "verify", "action",
-                tool_name="kubectl",
+                tool_name=trace_tool_name,
                 tool_args=action.verification,
                 tool_result_preview=v_result[:300],
             )
-            results.append(f"\n## Verification\n```\n{v_result}\n```")
+            verification_parts = ["\n## Verification"]
+            if verification_label:
+                verification_parts.append(f"**Step**: {verification_label}")
+            verification_parts.append(f"```{verification_language}\n{verification_preview}\n```")
+            verification_parts.append(f"```\n{v_result}\n```")
+            results.append("\n".join(verification_parts))
             action.status = "verified"
 
         # Post-remediation analysis
