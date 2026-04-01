@@ -7,7 +7,12 @@ import re
 import streamlit as st
 
 from ..config import Config
-from .session import convert_to_langchain_messages, get_message_content, get_message_trace_id
+from .approval import render_pending_actions, render_action_status
+from .session import (
+    convert_to_langchain_messages,
+    get_message_content,
+    get_message_trace_id,
+)
 
 
 _STATUS_HISTORY_LIMIT = 8
@@ -20,19 +25,32 @@ def display_chat_messages() -> None:
         st.markdown("- `Show current context, list namespaces, and report any crash loops`")
         st.markdown("- `Diagnose why service <name> is unreachable and propose safest remediation`")
         st.markdown("- `Correlate Kubernetes health with AWS signals for workload <name>`")
+        st.markdown("- `What is our monthly AWS cost breakdown by service?`")
+        st.markdown("- `Scale deployment nginx to 5 replicas in production`")
         st.markdown("---")
         return
 
-    for message in st.session_state.messages:
+    for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             content = get_message_content(message)
             if message["role"] == "assistant":
                 _render_message_content(content)
+                # Show action status for messages that had actions
+                action_statuses = message.get("action_statuses", [])
+                for action in action_statuses:
+                    render_action_status(action)
             else:
                 st.markdown(content)
             trace_id = get_message_trace_id(message)
             if trace_id and Config.TRACE_ENABLED:
                 st.caption(f"Trace ID: `{trace_id}`")
+
+    # Render pending approval buttons for the latest assistant message
+    agent = st.session_state.get("agent")
+    if agent and agent.pending_actions:
+        pending = [a for a in agent.pending_actions if a.status == "pending"]
+        if pending:
+            render_pending_actions(pending)
 
 
 _MARKDOWN_STRUCTURED_RE = re.compile(r"(?m)^\s*(#{1,6}\s|[-*]\s|\d+\.\s|>\s|\|.+\|)")
@@ -175,6 +193,19 @@ def _append_status_event(history: list[str], label: str) -> list[str]:
 
 def process_chat_turn() -> None:
     """Read user prompt, run the agent, and append the assistant response."""
+    # Handle pending action approval/rejection first
+    from .approval import handle_action_approval
+    action_result = handle_action_approval()
+    if action_result:
+        trace_id = getattr(st.session_state.agent, "last_trace_id", None)
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": action_result,
+            "trace_id": trace_id,
+        })
+        st.rerun()
+        return
+
     if prompt := st.chat_input("Ask about cluster health, pods, events, or remediation..."):
         user_message = {"role": "user", "content": prompt, "trace_id": None}
         st.session_state.messages.append(user_message)

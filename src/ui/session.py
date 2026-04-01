@@ -65,8 +65,6 @@ def initialize_session_state() -> None:
         st.session_state.model_provider = Config.LLM_PROVIDER
     if "model_name" not in st.session_state:
         st.session_state.model_name = Config.get_active_model_name()
-    if "autonomy_last_scan" not in st.session_state:
-        st.session_state.autonomy_last_scan = None
     if "agent_status_text" not in st.session_state:
         st.session_state.agent_status_text = None
     if "model_provider_draft" not in st.session_state:
@@ -106,7 +104,6 @@ def apply_runtime_model_selection(provider: str, model_name: str | None = None) 
     st.session_state.model_provider_draft = selected_provider
     st.session_state.model_name_draft = applied_model
     st.session_state.agent_status_text = None
-    st.session_state.autonomy_last_scan = None
     return selected_provider, applied_model
 
 

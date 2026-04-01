@@ -12,12 +12,11 @@ from .sidebar import display_sidebar
 
 def _top_toolbar() -> None:
     """Render primary actions in main content area."""
-    col1, col2, col3 = st.columns([1, 1, 4])
+    col1, col2 = st.columns([1, 5])
 
     with col1:
         if st.button("New Chat", use_container_width=True):
             st.session_state.messages = []
-            st.session_state.autonomy_last_scan = None
             try:
                 st.session_state.agent.clear_history()
             except Exception:
@@ -25,12 +24,6 @@ def _top_toolbar() -> None:
             st.rerun()
 
     with col2:
-        if st.button("Run Health Scan", use_container_width=True):
-            with st.spinner("Running Kubernetes health scan..."):
-                scan = st.session_state.agent.run_autonomous_scan(send_notifications=True)
-                st.session_state.autonomy_last_scan = scan
-
-    with col3:
         current_trace_id = getattr(st.session_state.get("agent", None), "last_trace_id", None)
         operator_intent = getattr(st.session_state.get("agent", None), "operator_intent_state", None)
         st.caption(
@@ -53,7 +46,7 @@ def _top_toolbar() -> None:
 def main() -> None:
     """Main Streamlit application routine."""
     st.set_page_config(
-        page_title="AI Ops K8s Assistant",
+        page_title="AIOps Agent",
         page_icon="",
         layout="wide",
         initial_sidebar_state="collapsed",
@@ -62,14 +55,10 @@ def main() -> None:
     initialize_session_state()
     display_sidebar()
 
-    st.title("AI Ops Kubernetes Assistant")
-    st.caption("Tool-first diagnostics and approval-gated remediation for Kubernetes and AWS.")
+    st.title("AIOps Infrastructure Agent")
+    st.caption("Evidence-grounded investigation, diagnostics, and approval-gated remediation for Kubernetes & AWS.")
     _top_toolbar()
     st.markdown("---")
-
-    if st.session_state.autonomy_last_scan:
-        with st.expander("Latest Automated Health Scan", expanded=False):
-            st.markdown(st.session_state.agent.format_autonomous_scan(st.session_state.autonomy_last_scan))
 
     display_chat_messages()
     process_chat_turn()
