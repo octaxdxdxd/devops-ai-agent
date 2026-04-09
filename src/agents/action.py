@@ -6,6 +6,7 @@ import ast
 import json
 import logging
 import re
+import shlex
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import tool as langchain_tool
 
 from ..config import Config
+from ..tools.command_preview import render_action_step_preview, render_tool_call_preview
 from ..tracing.tracer import Tracer
 from .base import StatusCallback, extract_token_usage
 
@@ -46,6 +48,7 @@ Allowed write tools for proposal steps:
 Rules:
 - Propose the minimum effective change.
 - Prefer `kubectl rollout restart` on a parent workload over deleting a pod directly.
+- Do not repeat the same read tool call with identical arguments. If a path stays empty or errors, switch discovery paths or state the uncertainty.
 - Risk must be LOW, MEDIUM, HIGH, or CRITICAL.
 - After proposing, summarize briefly without placeholders or fill-in-the-blank notes."""
 
@@ -54,6 +57,7 @@ _PLACEHOLDER_RE = re.compile(
     r"\b(?:placeholder|replace[-_ ]?me|fill[-_ ]?me|example[-_ ]?(?:name|id))\b",
     re.IGNORECASE,
 )
+_SHELL_OPERATOR_TOKENS = ("&&", "||", "|", ">", "<", ";", "&", "$(", "`", "\n", "\r")
 
 
 @dataclass
@@ -69,6 +73,25 @@ class PendingAction:
 
 def _contains_placeholder(value: str) -> bool:
     return bool(_PLACEHOLDER_RE.search(str(value or "")))
+
+
+def _validate_single_kubectl_command(command: str, field_name: str) -> str | None:
+    text = str(command or "").strip()
+    if not text:
+        return f"{field_name} must not be empty."
+    if _contains_placeholder(text):
+        return f"{field_name} contains a placeholder."
+    if not text.startswith("kubectl "):
+        return f"{field_name} must start with 'kubectl '."
+    if any(token in text for token in _SHELL_OPERATOR_TOKENS):
+        return f"{field_name} must be a single kubectl command without shell operators."
+    try:
+        parts = shlex.split(text)
+    except ValueError as exc:
+        return f"{field_name} has invalid shell syntax: {exc}"
+    if not parts or parts[0] != "kubectl":
+        return f"{field_name} must start with 'kubectl '."
+    return None
 
 
 def _normalize_action_step(raw_step: object) -> dict:
@@ -114,21 +137,7 @@ def _format_tool_step(tool_name: str, args: dict) -> str:
 
 def format_action_step_preview(step: dict) -> tuple[str, str, str]:
     """Return a human label, code/text preview, and syntax hint for one action step."""
-    display = str(step.get("display", "") or "").strip()
-    command = str(step.get("command", "") or "").strip()
-    if command:
-        label = display if display and display != command else ""
-        return label, command, "bash"
-
-    tool_name = str(step.get("tool", "") or "").strip()
-    if tool_name:
-        preview = _format_tool_step(tool_name, step.get("args", {}))
-        label = display if display and display != preview else ""
-        return label, preview, "text"
-
-    preview = display or str(step)
-    language = "bash" if preview.startswith("kubectl ") else "text"
-    return "", preview, language
+    return render_action_step_preview(step)
 
 
 def _parse_proposed_steps(commands_json: str) -> list[dict]:
@@ -181,8 +190,9 @@ def _validate_proposed_steps(steps: list[dict], allowed_write_tool_names: set[st
         if command and tool_name:
             return f"step {index} must use either 'command' or 'tool', not both."
         if command:
-            if not command.startswith("kubectl "):
-                return f"step {index} command must start with 'kubectl '."
+            command_error = _validate_single_kubectl_command(command, f"step {index} command")
+            if command_error:
+                return command_error
             continue
         if tool_name:
             if tool_name not in allowed_write_tool_names:
@@ -198,11 +208,7 @@ def _validate_verification_command(verification_command: str) -> str | None:
     command = verification_command.strip()
     if not command:
         return None
-    if _contains_placeholder(command):
-        return "verification_command contains a placeholder."
-    if not command.startswith("kubectl "):
-        return "verification_command must start with 'kubectl '."
-    return None
+    return _validate_single_kubectl_command(command, "verification_command")
 
 
 def _create_propose_action_tool(captured: list[dict], allowed_write_tool_names: set[str]):
@@ -266,11 +272,11 @@ def handle_action(
 ) -> tuple[str, list[PendingAction]]:
     """Handle an action request. Returns (response_text, pending_actions)."""
     cb = status_callback or (lambda _: None)
-    cb("Planning infrastructure change...")
 
     # Capture proposals from the LLM
     captured_proposals: list[dict] = []
     propose_tool = _create_propose_action_tool(captured_proposals, set(write_tool_map))
+    tool_result_cache: dict[str, str] = {}
 
     # Give the LLM read tools + the propose_action tool
     all_tools = list(read_tool_map.values()) + [propose_tool]
@@ -331,18 +337,33 @@ def handle_action(
             if not tool:
                 result = f"Unknown tool: {tool_name}"
             else:
-                cb(f"Running {tool_name}...")
-                t1 = time.monotonic()
-                try:
-                    result = str(tool.invoke(tool_args))
-                except Exception as exc:
-                    result = f"Tool error: {exc}"
+                cache_key = ""
+                cache_hit = False
+                if tool_name != "propose_action":
+                    cache_key = json.dumps({"tool": tool_name, "args": tool_args}, sort_keys=True, default=str)
+                    cache_hit = cache_key in tool_result_cache
+                if cache_hit:
+                    result = tool_result_cache[cache_key]
+                else:
+                    if tool_name == "propose_action":
+                        cb("Preparing approval request...")
+                    else:
+                        _, preview, _ = render_tool_call_preview(tool_name, tool_args)
+                        cb(preview)
+                    t1 = time.monotonic()
+                    try:
+                        result = str(tool.invoke(tool_args))
+                    except Exception as exc:
+                        result = f"Tool error: {exc}"
+                    if cache_key:
+                        tool_result_cache[cache_key] = result
                 tracer.step(
                     "tool_call", "action",
                     tool_name=tool_name,
                     tool_args=tool_args,
                     tool_result_preview=result[:300],
-                    duration_ms=int((time.monotonic() - t1) * 1000),
+                    duration_ms=0 if cache_hit else int((time.monotonic() - t1) * 1000),
+                    output_summary="cache hit" if cache_hit else "",
                 )
 
             messages.append(ToolMessage(content=result, tool_call_id=tool_id))

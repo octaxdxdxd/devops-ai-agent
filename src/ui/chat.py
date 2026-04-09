@@ -183,12 +183,27 @@ def _append_status_event(history: list[str], label: str) -> list[str]:
     clean_label = str(label or "").strip()
     if not clean_label:
         return history
-    if history and history[-1] == clean_label:
+    if history and _status_signature(history[-1]) == _status_signature(clean_label):
         return history
     updated = [*history, clean_label]
     if len(updated) > _STATUS_HISTORY_LIMIT:
         updated = updated[-_STATUS_HISTORY_LIMIT:]
     return updated
+
+
+def _status_signature(label: str) -> str:
+    normalized = str(label or "").strip().lower().replace("…", "...")
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"^(running|executing|verifying|cached):\s*", "", normalized)
+    normalized = normalized.strip(" .")
+    return normalized
+
+
+def _format_status_event(item: str) -> str:
+    text = str(item or "").strip()
+    if text.startswith(("kubectl ", "aws ")):
+        return f"- `{text}`"
+    return f"- {text}"
 
 
 def process_chat_turn() -> None:
@@ -224,7 +239,7 @@ def process_chat_turn() -> None:
                         activity_placeholder.caption("Live activity will appear here.")
                         return
                     activity_placeholder.markdown(
-                        "**Live activity**\n" + "\n".join(f"- {item}" for item in status_events)
+                        "**Live activity**\n" + "\n".join(_format_status_event(item) for item in status_events)
                     )
 
                 render_activity()

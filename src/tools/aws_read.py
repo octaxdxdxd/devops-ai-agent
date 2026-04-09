@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import re
+
 from langchain_core.tools import tool
 
 from ..infra.aws_client import AWSClient
 from .output import compress_output, compress_json_output
+
+_READ_ONLY_AWS_OPERATION_RE = re.compile(r"^(describe|get|list|lookup|head|batch_get)_", re.IGNORECASE)
+
+
+def _is_read_only_aws_operation(operation: str) -> bool:
+    return bool(_READ_ONLY_AWS_OPERATION_RE.match(str(operation or "").strip()))
 
 
 def create_aws_read_tools(aws: AWSClient) -> list:
@@ -27,7 +35,7 @@ def create_aws_read_tools(aws: AWSClient) -> list:
 
     @tool
     def aws_describe_service(service: str, operation: str, params_json: str = "", region: str = "") -> str:
-        """Call any AWS describe/list/get API. Use for services not covered by other tools.
+        """Call any AWS read-only describe/list/get style API. Use for services not covered by other tools.
 
         Args:
             service: AWS service name (e.g. 'rds', 'elbv2', 'lambda', 'ecs', 'eks', 'elasticache')
@@ -35,6 +43,11 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             params_json: Optional JSON object of API parameters e.g. '{"DBInstanceIdentifier":"mydb"}'
             region: Optional AWS region override (e.g. 'us-east-1', 'eu-west-1'). Empty = use default region.
         """
+        if not _is_read_only_aws_operation(operation):
+            return (
+                f"ERROR: AWS read-only tool blocked non-read operation '{operation}'. "
+                "Use an approval-gated write tool instead."
+            )
         import json as _json
         params = _json.loads(params_json) if params_json.strip() else None
         return compress_output(aws.describe_service(service, operation, params, region=region or None))

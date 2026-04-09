@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ from .base import StatusCallback, extract_token_usage
 from .intent import classify_intent
 from .lookup import handle_lookup
 from .diagnose import handle_diagnose
-from .action import PendingAction, format_action_step_preview, handle_action
+from .action import PendingAction, _validate_single_kubectl_command, format_action_step_preview, handle_action
 from .explain import handle_explain
 
 log = logging.getLogger(__name__)
@@ -210,11 +211,12 @@ class AIOpsAgent:
         self.last_trace_id = trace_id
 
         results: list[str] = []
+        had_error = False
         action.status = "executed"
 
         for cmd in action.commands:
             step_label, step_preview, step_language = format_action_step_preview(cmd)
-            cb(f"Executing: {step_label or step_preview}")
+            cb(step_preview)
 
             # New format: {"command": "kubectl ...", "display": "..."}
             command_str = cmd.get("command", "")
@@ -243,6 +245,8 @@ class AIOpsAgent:
                 tool_args=cmd,
                 tool_result_preview=result[:300],
             )
+            if result.startswith("ERROR:"):
+                had_error = True
             result_parts: list[str] = []
             if step_label:
                 result_parts.append(f"**Step**: {step_label}")
@@ -252,7 +256,8 @@ class AIOpsAgent:
 
         # Verification
         if action.verification:
-            cb("Verifying change...")
+            verification_label, verification_preview, verification_language = format_action_step_preview(action.verification)
+            cb(verification_preview)
             v_cmd = action.verification.get("command", "")
             if v_cmd:
                 v_result = self._run_approved_command(v_cmd)
@@ -264,21 +269,22 @@ class AIOpsAgent:
                 v_result = self.tools.execute(v_tool, v_args) if v_tool else "No verification command"
                 trace_tool_name = v_tool or "unknown"
 
-            verification_label, verification_preview, verification_language = format_action_step_preview(action.verification)
-
             self.tracer.step(
                 "verify", "action",
                 tool_name=trace_tool_name,
                 tool_args=action.verification,
                 tool_result_preview=v_result[:300],
             )
+            if v_result.startswith("ERROR:"):
+                had_error = True
             verification_parts = ["\n## Verification"]
             if verification_label:
                 verification_parts.append(f"**Step**: {verification_label}")
             verification_parts.append(f"```{verification_language}\n{verification_preview}\n```")
             verification_parts.append(f"```\n{v_result}\n```")
             results.append("\n".join(verification_parts))
-            action.status = "verified"
+            if not had_error:
+                action.status = "verified"
 
         # Post-remediation analysis
         cb("Analyzing results...")
@@ -287,7 +293,10 @@ class AIOpsAgent:
         if analysis:
             results.append(f"\n## Post-Execution Analysis\n{analysis}")
 
-        trace = self.tracer.finish("action_executed")
+        if had_error:
+            action.status = "failed"
+
+        trace = self.tracer.finish("action_failed" if had_error else "action_executed")
         if trace:
             self.trace_store.save(trace)
 
@@ -298,17 +307,13 @@ class AIOpsAgent:
 
     def _run_approved_command(self, command: str) -> str:
         """Execute a user-approved kubectl command."""
-        import shlex
         command = command.strip()
-        if command.startswith("kubectl "):
-            try:
-                parts = shlex.split(command)
-            except ValueError as exc:
-                return f"ERROR: Invalid command syntax: {exc}"
-            # parts[0] is 'kubectl', rest are args
-            return self.k8s.run(parts[1:])
-        else:
-            return f"ERROR: Only kubectl commands are supported for execution. Got: {command}"
+        command_error = _validate_single_kubectl_command(command, "approved command")
+        if command_error:
+            return f"ERROR: {command_error}"
+        parts = shlex.split(command)
+        # parts[0] is 'kubectl', rest are args
+        return self.k8s.run(parts[1:])
 
     def _post_remediation_analysis(self, action: PendingAction, execution_output: str) -> str:
         """Quick LLM call to analyze whether the remediation worked."""

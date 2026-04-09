@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from ..tools.command_preview import render_tool_call_preview
 from ..tracing.tracer import Tracer
 
 log = logging.getLogger(__name__)
 
 StatusCallback = Callable[[str], None]
+
+
+def _tool_cache_key(tool_name: str, tool_args: Any) -> str:
+    payload = {"tool": str(tool_name or "").strip(), "args": tool_args or {}}
+    return json.dumps(payload, sort_keys=True, default=str)
 
 
 def extract_token_usage(response: AIMessage) -> tuple[int, int]:
@@ -46,6 +53,7 @@ def run_tool_loop(
     Returns the final text response from the LLM.
     """
     cb = status_callback or (lambda _: None)
+    tool_result_cache: dict[str, str] = {}
 
     for step in range(max_steps):
         t0 = time.monotonic()
@@ -83,20 +91,30 @@ def run_tool_loop(
             tool = tool_map.get(tool_name)
             if not tool:
                 result = f"Unknown tool: {tool_name}"
+                cache_hit = False
             else:
-                cb(f"Running {tool_name}...")
-                t1 = time.monotonic()
-                try:
-                    result = str(tool.invoke(tool_args))
-                except Exception as exc:
-                    result = f"Tool error: {exc}"
-                tool_ms = int((time.monotonic() - t1) * 1000)
+                cache_key = _tool_cache_key(tool_name, tool_args)
+                cache_hit = cache_key in tool_result_cache
+                if cache_hit:
+                    result = tool_result_cache[cache_key]
+                    tool_ms = 0
+                else:
+                    _, preview, _ = render_tool_call_preview(tool_name, tool_args)
+                    cb(preview)
+                    t1 = time.monotonic()
+                    try:
+                        result = str(tool.invoke(tool_args))
+                    except Exception as exc:
+                        result = f"Tool error: {exc}"
+                    tool_ms = int((time.monotonic() - t1) * 1000)
+                    tool_result_cache[cache_key] = result
                 tracer.step(
                     "tool_call",
                     handler_name,
                     tool_name=tool_name,
                     tool_args=tool_args,
                     tool_result_preview=result[:300],
+                    output_summary="cache hit" if cache_hit else "",
                     duration_ms=tool_ms,
                 )
 

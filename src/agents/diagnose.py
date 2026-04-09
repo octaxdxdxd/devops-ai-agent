@@ -22,6 +22,7 @@ Rules:
 - Investigate directly with tools; do not ask the user for permission for read-only checks.
 - Answer the user’s exact question first. Only switch into RCA mode when they report a problem or ask why something is happening.
 - Try multiple discovery paths before giving up: namespace, name, labels, parent resources, and AWS region.
+- Do not repeat the same tool call with identical arguments. If the same path stays empty or errors, note that evidence and move to a different path.
 - Every conclusion must be tied to specific evidence from tool output.
 - Separate confirmed facts from hypotheses and call out what is still unknown.
 - For AWS, be region-aware. For load balancers, check both `elbv2` and `elb` when relevant.
@@ -73,7 +74,6 @@ def handle_diagnose(
         HumanMessage(content=f"{preamble}User query: {user_input}"),
     ]
 
-    cb("Starting investigation...")
     return run_tool_loop(
         messages=messages,
         llm_with_tools=llm_with_tools,

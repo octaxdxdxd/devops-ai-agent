@@ -34,7 +34,7 @@ class Trace:
     total_tokens_in: int = 0
     total_tokens_out: int = 0
     total_duration_ms: int = 0
-    outcome: str = ""          # answered | action_proposed | action_executed | escalated | error
+    outcome: str = ""          # answered | action_proposed | action_executed | action_failed | escalated | error
     started_at: str = ""
     completed_at: str = ""
 

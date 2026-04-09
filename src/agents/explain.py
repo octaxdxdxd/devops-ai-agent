@@ -24,6 +24,7 @@ Rules:
 - Do the lookup work yourself; do not ask the user for permission for read-only checks.
 - Base the answer on real tool output, not guesses.
 - If a query is empty or errors, try the obvious fix: other namespaces, labels, parents, or AWS regions.
+- Do not repeat the same tool call with identical arguments. If repeated paths stay empty or error, explain the uncertainty instead of restating the same evidence.
 - For AWS, be region-aware. For load balancers, check both `elbv2` and `elb` when relevant.
 - For cost questions, use {today} for date math; "recent" means the last 30 days.
 - Quantify where possible and say what data is missing if the picture is incomplete.
@@ -70,7 +71,6 @@ def handle_explain(
         HumanMessage(content=f"{preamble}User question: {user_input}"),
     ]
 
-    cb("Analyzing...")
     return run_tool_loop(
         messages=messages,
         llm_with_tools=llm_with_tools,
