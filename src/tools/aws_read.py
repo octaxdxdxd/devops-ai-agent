@@ -53,6 +53,58 @@ def create_aws_read_tools(aws: AWSClient) -> list:
         return compress_output(aws.describe_service(service, operation, params, region=region or None))
 
     @tool
+    def aws_audit_cloudtrail(
+        principal: str = "",
+        event_name_exact: str = "",
+        event_name_prefix: str = "",
+        event_source: str = "",
+        resource_type: str = "",
+        resource_name: str = "",
+        contains_text: str = "",
+        start_time: str = "",
+        end_time: str = "",
+        max_events: int = 200,
+        include_raw_event: bool = False,
+        region: str = "",
+    ) -> str:
+        """Search CloudTrail event history with deterministic pagination and client-side filtering.
+
+        Use this for CloudTrail/event-history/audit questions, especially when searching by user,
+        delete-style event prefixes, or deleted resources. The tool handles username case variants,
+        exact-match CloudTrail semantics, and paginates until it has enough matching events.
+
+        Args:
+            principal: Optional principal/user identifier, such as an email, username, or session name.
+            event_name_exact: Optional exact CloudTrail EventName filter, e.g. 'DeleteVpc'.
+            event_name_prefix: Optional client-side EventName prefix filter, e.g. 'Delete'.
+            event_source: Optional exact event source, e.g. 'ec2.amazonaws.com'.
+            resource_type: Optional resource type filter, e.g. 'AWS::EC2::VPC'.
+            resource_name: Optional resource name/id filter, e.g. 'vpc-abc123'.
+            contains_text: Optional case-insensitive text filter against the raw CloudTrail event.
+            start_time: Optional start time in ISO-8601 or YYYY-MM-DD.
+            end_time: Optional end time in ISO-8601 or YYYY-MM-DD.
+            max_events: Maximum matched events to return (default 200, hard max 500).
+            include_raw_event: Whether to include parsed raw CloudTrail event JSON in the result.
+            region: Optional AWS region override. Empty uses the configured/default region.
+        """
+        return compress_output(
+            aws.audit_cloudtrail(
+                principal=principal,
+                event_name_exact=event_name_exact,
+                event_name_prefix=event_name_prefix,
+                event_source=event_source,
+                resource_type=resource_type,
+                resource_name=resource_name,
+                contains_text=contains_text,
+                start_time=start_time or None,
+                end_time=end_time or None,
+                max_events=max_events,
+                include_raw_event=include_raw_event,
+                region=region or None,
+            )
+        )
+
+    @tool
     def aws_get_cost(
         start_date: str = "",
         end_date: str = "",
@@ -146,6 +198,7 @@ def create_aws_read_tools(aws: AWSClient) -> list:
     return [
         aws_describe_instances,
         aws_describe_service,
+        aws_audit_cloudtrail,
         aws_get_cost,
         aws_get_cloudwatch_metrics,
         aws_get_alarms,

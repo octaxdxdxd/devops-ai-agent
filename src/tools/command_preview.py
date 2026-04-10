@@ -94,6 +94,51 @@ def _render_aws_describe_service(args: dict) -> str:
     )
 
 
+def _render_aws_audit_cloudtrail(args: dict) -> str:
+    parts = ["aws", "cloudtrail", "lookup-events"]
+    region = str(args.get("region", "") or "").strip()
+    start_time = str(args.get("start_time", "") or "").strip()
+    end_time = str(args.get("end_time", "") or "").strip()
+    principal = str(args.get("principal", "") or "").strip()
+    event_name_exact = str(args.get("event_name_exact", "") or "").strip()
+    event_source = str(args.get("event_source", "") or "").strip()
+    resource_name = str(args.get("resource_name", "") or "").strip()
+    resource_type = str(args.get("resource_type", "") or "").strip()
+
+    _append_arg(parts, "--region", region)
+    _append_arg(parts, "--start-time", start_time)
+    _append_arg(parts, "--end-time", end_time)
+
+    lookup_attribute = ""
+    if principal:
+        lookup_attribute = f"AttributeKey=Username,AttributeValue={principal}"
+    elif event_name_exact:
+        lookup_attribute = f"AttributeKey=EventName,AttributeValue={event_name_exact}"
+    elif event_source:
+        lookup_attribute = f"AttributeKey=EventSource,AttributeValue={event_source}"
+    elif resource_name:
+        lookup_attribute = f"AttributeKey=ResourceName,AttributeValue={resource_name}"
+    elif resource_type:
+        lookup_attribute = f"AttributeKey=ResourceType,AttributeValue={resource_type}"
+    _append_arg(parts, "--lookup-attributes", lookup_attribute)
+    try:
+        max_results = int(args.get("max_events", 200) or 200)
+    except (TypeError, ValueError):
+        max_results = 200
+    _append_arg(parts, "--max-results", min(max(max_results, 1), 50))
+
+    filters: list[str] = []
+    event_name_prefix = str(args.get("event_name_prefix", "") or "").strip()
+    contains_text = str(args.get("contains_text", "") or "").strip()
+    if event_name_prefix:
+        filters.append(f"event_name_prefix={event_name_prefix}")
+    if contains_text:
+        filters.append(f"contains_text={contains_text}")
+    if filters:
+        return f"{' '.join(parts)}  # client-side filters: {', '.join(filters)}"
+    return " ".join(parts)
+
+
 def _render_aws_list_resources(args: dict) -> str:
     params: dict[str, object] = {}
     resource_filters = _parse_json_arg(args.get("resource_type_filters_json"))
@@ -308,6 +353,7 @@ def _preview_for_tool(tool_name: str, args: dict) -> str:
     mapping = {
         "aws_describe_instances": lambda: _render_aws_describe_instances(args),
         "aws_describe_service": lambda: _render_aws_describe_service(args),
+        "aws_audit_cloudtrail": lambda: _render_aws_audit_cloudtrail(args),
         "aws_get_cost": lambda: _render_aws_get_cost(args),
         "aws_get_cloudwatch_metrics": lambda: _render_aws_get_cloudwatch_metrics(args),
         "aws_get_alarms": lambda: _render_aws_get_alarms(args),

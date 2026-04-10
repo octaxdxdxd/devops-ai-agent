@@ -21,7 +21,7 @@ from ..tools.output import compress_output
 from ..tracing import Tracer, TraceStore
 from .base import StatusCallback, extract_token_usage
 from .intent import classify_intent
-from .lookup import handle_lookup
+from .lookup import handle_lookup, select_lookup_tools
 from .diagnose import handle_diagnose
 from .action import PendingAction, _validate_single_kubectl_command, format_action_step_preview, handle_action
 from .explain import handle_explain
@@ -158,8 +158,9 @@ class AIOpsAgent:
 
     def _handle_lookup(self, user_input: str, history: list, cb: StatusCallback) -> str:
         cb("Looking up data...")
-        llm_with_tools = self._model_wrapper.get_llm_with_tools(self.tools.read_tools)
-        tool_map = {t.name: t for t in self.tools.read_tools}
+        selected_tools = select_lookup_tools(user_input, history, self.tools.read_tools)
+        llm_with_tools = self._model_wrapper.get_llm_with_tools(selected_tools)
+        tool_map = {t.name: t for t in selected_tools}
         return handle_lookup(
             user_input, history, llm_with_tools, tool_map,
             self.model_name, self.tracer, cb,

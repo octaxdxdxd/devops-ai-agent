@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
+from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -12,6 +14,26 @@ from ..tracing.tracer import Tracer
 from .base import StatusCallback, run_tool_loop
 
 log = logging.getLogger(__name__)
+
+_CLOUDTRAIL_KEYWORDS = (
+    "cloudtrail",
+    "event history",
+    "lookup events",
+    "lookupevents",
+    "audit trail",
+    "audit log",
+)
+_CLOUDTRAIL_AUDIT_PATTERNS = (
+    "deleted by",
+    "created by",
+    "modified by",
+    "updated by",
+    "who deleted",
+    "who created",
+    "who changed",
+    "who modified",
+)
+_PRINCIPAL_HINT_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
 
 _LOOKUP_SYSTEM_PROMPT_TEMPLATE = """\
 You are an infrastructure lookup assistant. The user wants specific data from Kubernetes or AWS.
@@ -23,6 +45,10 @@ Rules:
 - Do not repeat the same tool call with identical arguments. If a path is empty or errors twice, switch strategy or answer with uncertainty.
 - Show all returned items that matter; do not silently drop rows or records.
 - For AWS, be region-aware. For load balancers, check both `elbv2` and `elb` when relevant.
+- For CloudTrail/event-history/audit questions, use `aws_audit_cloudtrail` instead of `aws_describe_service`.
+- CloudTrail `Username` and `EventName` lookups are exact-match server-side, and CloudTrail accepts only one lookup attribute per request.
+- For delete-style CloudTrail searches, use `event_name_prefix="Delete"` rather than assuming CloudTrail supports `Delete*` or partial `EventName` matching.
+- If a CloudTrail search is empty, report the region and principal variants that were checked.
 - For cost questions, use {today} for date math; "recent" means the last 30 days.
 - This handler is read-only. If the user wants a change, direct them to the action flow.
 
@@ -30,6 +56,49 @@ Presentation:
 - Answer the exact question directly.
 - Use markdown tables for tabular results.
 - If something is empty, say where you checked."""
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def is_cloudtrail_lookup_query(user_input: str, chat_history: list | None = None) -> bool:
+    combined_parts = [str(user_input or "")]
+    for message in (chat_history or [])[-6:]:
+        combined_parts.append(_message_text(message))
+    text = " ".join(combined_parts).lower()
+
+    if any(keyword in text for keyword in _CLOUDTRAIL_KEYWORDS):
+        return True
+    if any(pattern in text for pattern in _CLOUDTRAIL_AUDIT_PATTERNS) and (
+        "aws" in text or "resource" in text or bool(_PRINCIPAL_HINT_RE.search(text))
+    ):
+        return True
+    if "event name" in text and any(token in text for token in ("delete", "create", "update")):
+        return True
+    return False
+
+
+def select_lookup_tools(user_input: str, chat_history: list, read_tools: list) -> list:
+    if not is_cloudtrail_lookup_query(user_input, chat_history):
+        return read_tools
+
+    wanted = {"aws_audit_cloudtrail", "aws_get_caller_identity"}
+    selected = [tool for tool in read_tools if getattr(tool, "name", "") in wanted]
+    return selected or read_tools
 
 
 def handle_lookup(
