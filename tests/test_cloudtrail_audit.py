@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.agents.lookup import select_lookup_tools
 from src.infra.aws_client import AWSClient
@@ -42,6 +43,7 @@ def _build_aws_client(
     factory = _FakeClientFactory(responses, fallback_region=region)
     client.session = None
     client.region = region
+    client._status_callback = None
     client._client = factory
     client._safe = lambda fn, *args, **kwargs: fn(*args, **kwargs)
     return client, factory
@@ -257,6 +259,168 @@ def test_audit_cloudtrail_filters_exact_event_name() -> None:
 
     assert payload["matched_event_count"] == 1
     assert payload["events"][0]["event_name"] == "DeleteVpc"
+
+
+def test_audit_cloudtrail_prefers_selective_lookup_before_principal_scan() -> None:
+    client, factory = _build_aws_client(
+        [
+            {"Events": []},
+            {
+                "Events": [
+                    _cloudtrail_event(
+                        "evt-1",
+                        "PutRule",
+                        "devops.interns",
+                        event_time="2026-04-10T06:00:00Z",
+                        event_source="events.amazonaws.com",
+                        resource_type="AWS::Events::Rule",
+                        resource_name="kill-tagless-resources-rule",
+                    )
+                ]
+            },
+        ]
+    )
+
+    payload = json.loads(
+        client.audit_cloudtrail(
+            principal="devops.interns",
+            event_name_exact="PutRule",
+            event_source="events.amazonaws.com",
+            resource_name="kill-tagless-resources-rule",
+            max_events=10,
+            region="us-east-1",
+        )
+    )
+
+    assert payload["matched_event_count"] == 1
+    assert payload["lookup_attempts"][0]["mode"] == "primary_selective_lookup"
+    assert factory.cloudtrail.calls[0]["LookupAttributes"][0] == {
+        "AttributeKey": "ResourceName",
+        "AttributeValue": "kill-tagless-resources-rule",
+    }
+
+
+def test_audit_cloudtrail_caps_principal_lookup_pagination() -> None:
+    responses = [{"Events": []}]
+    for page in range(4):
+        page_events = [
+            _cloudtrail_event(
+                f"evt-{page}-{index}",
+                "DescribeRules",
+                "someone-else",
+                event_time="2026-04-10T06:00:00Z",
+                event_source="events.amazonaws.com",
+                resource_type="AWS::Events::Rule",
+                resource_name="kill-tagless-resources-rule",
+            )
+            for index in range(50)
+        ]
+        response = {"Events": page_events}
+        if page < 3:
+            response["NextToken"] = f"token-{page + 1}"
+        else:
+            response["NextToken"] = "token-stop"
+        responses.append(response)
+
+    client, factory = _build_aws_client(responses)
+
+    payload = json.loads(
+        client.audit_cloudtrail(
+            principal="devops.interns",
+            resource_name="kill-tagless-resources-rule",
+            max_events=20,
+            region="us-east-1",
+        )
+    )
+
+    principal_attempt = next(
+        attempt for attempt in payload["lookup_attempts"] if attempt["mode"] == "principal_lookup"
+    )
+
+    assert factory.cloudtrail.calls[0]["LookupAttributes"][0] == {
+        "AttributeKey": "ResourceName",
+        "AttributeValue": "kill-tagless-resources-rule",
+    }
+    assert principal_attempt["raw_events_scanned"] == 200
+    assert principal_attempt["scan_limited"] is True
+    assert len(factory.cloudtrail.calls) == 5
+
+
+def test_audit_cloudtrail_caps_broad_event_source_scans_with_client_side_filters() -> None:
+    responses: list[dict] = []
+    for page in range(5):
+        page_events = [
+            _cloudtrail_event(
+                f"evt-{page}-{index}",
+                "DeleteBucket",
+                "someone-else",
+                event_time="2026-04-10T06:00:00Z",
+                event_source="s3.amazonaws.com",
+                resource_type="AWS::S3::Bucket",
+                resource_name=f"bucket-{page}-{index}",
+            )
+            for index in range(50)
+        ]
+        response = {"Events": page_events}
+        if page < 4:
+            response["NextToken"] = f"token-{page + 1}"
+        responses.append(response)
+
+    client, factory = _build_aws_client(responses)
+    updates: list[str] = []
+    client._status_callback = updates.append
+
+    payload = json.loads(
+        client.audit_cloudtrail(
+            event_source="s3.amazonaws.com",
+            event_name_prefix="Delete",
+            contains_text="aiops",
+            max_events=20,
+            region="us-east-1",
+        )
+    )
+
+    attempt = payload["lookup_attempts"][0]
+    assert attempt["mode"] == "primary_lookup"
+    assert attempt["scan_limited"] is True
+    assert attempt["raw_events_scanned"] == 200
+    assert len(factory.cloudtrail.calls) == 4
+    assert any("CloudTrail scan in us-east-1" in update for update in updates)
+
+
+def test_audit_cloudtrail_time_limits_slow_scans() -> None:
+    client, factory = _build_aws_client(
+        [
+            {
+                "Events": [
+                    _cloudtrail_event(
+                        "evt-1",
+                        "DeleteBucket",
+                        "someone-else",
+                        event_time="2026-04-10T06:00:00Z",
+                        event_source="s3.amazonaws.com",
+                        resource_type="AWS::S3::Bucket",
+                        resource_name="bucket-1",
+                    )
+                ],
+                "NextToken": "token-2",
+            }
+        ]
+    )
+
+    with patch("src.infra.aws_client.time.monotonic", side_effect=[0.0, 31.0, 31.0]):
+        payload = json.loads(
+            client.audit_cloudtrail(
+                event_source="s3.amazonaws.com",
+                max_events=20,
+                region="us-east-1",
+            )
+        )
+
+    attempt = payload["lookup_attempts"][0]
+    assert attempt["time_limited"] is True
+    assert attempt["pages"] == 1
+    assert len(factory.cloudtrail.calls) == 1
 
 
 def test_audit_cloudtrail_falls_back_to_unfiltered_scan_for_raw_identity_match() -> None:

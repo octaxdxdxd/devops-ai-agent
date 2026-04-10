@@ -26,6 +26,7 @@ Rules:
 - Every conclusion must be tied to specific evidence from tool output.
 - Separate confirmed facts from hypotheses and call out what is still unknown.
 - For AWS, be region-aware. For load balancers, check both `elbv2` and `elb` when relevant.
+- For CloudTrail, prefer selective filters such as exact event names, resource names, or usernames. Avoid broad EventSource/resource-type scans over long windows unless the user explicitly asks for audit-history spelunking.
 - This handler is read-only. If a fix is needed, describe it and point the user to the action flow.
 
 OUTPUT FORMAT for RCA (only when investigating problems):

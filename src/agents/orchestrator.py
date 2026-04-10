@@ -102,6 +102,7 @@ class AIOpsAgent:
         """Process a user query: classify → route → handle → return response text."""
         cb = status_callback or (lambda _: None)
         self.pending_actions = []
+        self.aws.set_status_callback(cb)
 
         # Start trace
         trace_id = self.tracer.start(user_input)
@@ -153,6 +154,8 @@ class AIOpsAgent:
                 self.tracer.step("error", "orchestrator", error=str(exc))
                 self.trace_store.save(trace)
             return f"Agent encountered an error: {exc}"
+        finally:
+            self.aws.clear_status_callback()
 
     # ── Handler dispatch ─────────────────────────────────────────────────
 

@@ -50,7 +50,46 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             )
         import json as _json
         params = _json.loads(params_json) if params_json.strip() else None
+        if (
+            str(service or "").strip().lower() == "events"
+            and str(operation or "").strip().lower() == "list_rules"
+            and isinstance(params, dict)
+            and str(params.get("NamePrefix", "") or "").strip() == ""
+        ):
+            params = {key: value for key, value in params.items() if key != "NamePrefix"}
         return compress_output(aws.describe_service(service, operation, params, region=region or None))
+
+    @tool
+    def aws_inspect_lambda_schedules(
+        name_hints_json: str = "",
+        regions_json: str = "",
+        lookback_days: int = 35,
+        include_disabled: bool = False,
+    ) -> str:
+        """Inspect EventBridge scheduled rules that target Lambda functions.
+
+        Use this for questions about how often a Lambda runs, when it last ran, and when it will run next.
+        This tool inspects EventBridge schedules plus CloudWatch Logs/Metrics. It does not use CloudTrail.
+        If recent invocation history is weak or inconsistent, `next_run_time` is returned as null with unknown confidence.
+
+        Args:
+            name_hints_json: JSON array of non-empty name fragments, e.g. '["kill-tagless-resources","tagless"]'
+            regions_json: Optional JSON array of AWS regions to inspect, e.g. '["us-east-1","eu-central-1"]'
+            lookback_days: How many days of logs/metrics to check for the last run (default 35)
+            include_disabled: Whether to include disabled EventBridge rules
+        """
+        import json as _json
+
+        name_hints = _json.loads(name_hints_json) if name_hints_json.strip() else []
+        regions = _json.loads(regions_json) if regions_json.strip() else []
+        return compress_output(
+            aws.inspect_lambda_schedules(
+                name_hints=name_hints,
+                regions=regions,
+                lookback_days=lookback_days,
+                include_disabled=include_disabled,
+            )
+        )
 
     @tool
     def aws_audit_cloudtrail(
@@ -198,6 +237,7 @@ def create_aws_read_tools(aws: AWSClient) -> list:
     return [
         aws_describe_instances,
         aws_describe_service,
+        aws_inspect_lambda_schedules,
         aws_audit_cloudtrail,
         aws_get_cost,
         aws_get_cloudwatch_metrics,

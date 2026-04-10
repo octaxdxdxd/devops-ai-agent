@@ -97,6 +97,7 @@ class Config:
     DIAGNOSE_MAX_STEPS: int = _env_int("DIAGNOSE_MAX_STEPS", 15)
     DIAGNOSE_CHECKPOINT_STEP: int = _env_int("DIAGNOSE_CHECKPOINT_STEP", 7)
     LOOKUP_MAX_STEPS: int = _env_int("LOOKUP_MAX_STEPS", 8)
+    LOOKUP_CHECKPOINT_STEP: int = _env_int("LOOKUP_CHECKPOINT_STEP", 3)
     EXPLAIN_MAX_STEPS: int = _env_int("EXPLAIN_MAX_STEPS", 10)
     ACTION_MAX_STEPS: int = _env_int("ACTION_MAX_STEPS", 8)
 

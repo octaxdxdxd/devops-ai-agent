@@ -139,6 +139,24 @@ def _render_aws_audit_cloudtrail(args: dict) -> str:
     return " ".join(parts)
 
 
+def _render_aws_inspect_lambda_schedules(args: dict) -> str:
+    hints = _parse_json_arg(args.get("name_hints_json"))
+    regions = _parse_json_arg(args.get("regions_json"))
+    hint_list = [str(item or "").strip() for item in (hints or []) if str(item or "").strip()]
+    region_list = [str(item or "").strip() for item in (regions or []) if str(item or "").strip()]
+
+    first_region = region_list[0] if region_list else "<default-region>"
+    first_hint = hint_list[0] if hint_list else "<name-hint>"
+    parts = ["aws", "events", "list-rules", "--region", _quote(first_region), "--name-prefix", _quote(first_hint)]
+
+    notes: list[str] = ["then events list-targets-by-rule", "logs start-query/get-query-results", "cloudwatch get-metric-statistics"]
+    if len(region_list) > 1:
+        notes.append(f"regions={','.join(region_list)}")
+    if len(hint_list) > 1:
+        notes.append(f"hints={','.join(hint_list)}")
+    return f"{' '.join(parts)}  # {', '.join(notes)}"
+
+
 def _render_aws_list_resources(args: dict) -> str:
     params: dict[str, object] = {}
     resource_filters = _parse_json_arg(args.get("resource_type_filters_json"))
@@ -353,6 +371,7 @@ def _preview_for_tool(tool_name: str, args: dict) -> str:
     mapping = {
         "aws_describe_instances": lambda: _render_aws_describe_instances(args),
         "aws_describe_service": lambda: _render_aws_describe_service(args),
+        "aws_inspect_lambda_schedules": lambda: _render_aws_inspect_lambda_schedules(args),
         "aws_audit_cloudtrail": lambda: _render_aws_audit_cloudtrail(args),
         "aws_get_cost": lambda: _render_aws_get_cost(args),
         "aws_get_cloudwatch_metrics": lambda: _render_aws_get_cloudwatch_metrics(args),
