@@ -21,10 +21,11 @@ from ..tools.output import compress_output
 from ..tracing import Tracer, TraceStore
 from .base import StatusCallback, extract_token_usage
 from .intent import classify_intent
-from .lookup import handle_lookup, select_lookup_tools
+from .lookup import handle_lookup
 from .diagnose import handle_diagnose
 from .action import PendingAction, _validate_single_kubectl_command, format_action_step_preview, handle_action
 from .explain import handle_explain
+from .read_policy import classify_read_scope, select_read_tools
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +120,22 @@ class AIOpsAgent:
             self.tracer.current_trace.intent = intent
             cb(f"Intent: {intent}")
 
+            if intent_result.needs_clarification:
+                clarification = (
+                    intent_result.clarification_prompt.strip()
+                    or "Please restate the resource, problem, or next step you want me to work on."
+                )
+                self.tracer.step(
+                    "selector",
+                    "orchestrator",
+                    input_summary=user_input[:200],
+                    output_summary="blocked_for_clarification",
+                )
+                trace = self.tracer.finish("answered")
+                if trace:
+                    self.trace_store.save(trace)
+                return clarification
+
             self.operator_intent_state.last_user_instruction = user_input[:200]
             self.operator_intent_state.pending_step_kind = intent
 
@@ -159,23 +176,54 @@ class AIOpsAgent:
 
     # ── Handler dispatch ─────────────────────────────────────────────────
 
+    def _select_read_tools(self, user_input: str, history: list):
+        llm = self._model_wrapper.get_llm()
+        scope = classify_read_scope(user_input, history, llm, self.model_name, self.tracer)
+        return select_read_tools(
+            user_input,
+            history,
+            self.tools.k8s_read_tools,
+            self.tools.aws_read_tools,
+            scope=scope,
+        )
+
     def _handle_lookup(self, user_input: str, history: list, cb: StatusCallback) -> str:
         cb("Looking up data...")
-        selected_tools = select_lookup_tools(user_input, history, self.tools.read_tools)
-        llm_with_tools = self._model_wrapper.get_llm_with_tools(selected_tools)
-        tool_map = {t.name: t for t in selected_tools}
+        selection = self._select_read_tools(user_input, history)
+        capability_families = ["Kubernetes" if family == "k8s" else "AWS" for family in selection.capability_families]
+        llm_with_tools = (
+            self._model_wrapper.get_llm_with_tools(selection.tools)
+            if selection.tools
+            else self._model_wrapper.get_llm()
+        )
+        tool_map = {t.name: t for t in selection.tools}
         return handle_lookup(
             user_input, history, llm_with_tools, tool_map,
             self.model_name, self.tracer, cb,
+            capability_prompt=selection.capability_prompt,
+            require_live_inspection=selection.require_live_inspection,
+            available_capability_families=capability_families,
+            insufficient_tool_names=selection.insufficient_tool_names,
+            specialization=selection.specialization,
         )
 
     def _handle_diagnose(self, user_input: str, history: list, cb: StatusCallback) -> str:
         cb("Starting investigation...")
-        llm_with_tools = self._model_wrapper.get_llm_with_tools(self.tools.read_tools)
-        tool_map = {t.name: t for t in self.tools.read_tools}
+        selection = self._select_read_tools(user_input, history)
+        capability_families = ["Kubernetes" if family == "k8s" else "AWS" for family in selection.capability_families]
+        llm_with_tools = (
+            self._model_wrapper.get_llm_with_tools(selection.tools)
+            if selection.tools
+            else self._model_wrapper.get_llm()
+        )
+        tool_map = {t.name: t for t in selection.tools}
         return handle_diagnose(
             user_input, history, llm_with_tools, tool_map,
             self.model_name, self.tracer, self.topology_cache, cb,
+            capability_prompt=selection.capability_prompt,
+            require_live_inspection=selection.require_live_inspection,
+            available_capability_families=capability_families,
+            insufficient_tool_names=selection.insufficient_tool_names,
         )
 
     def _handle_action(self, user_input: str, history: list, cb: StatusCallback) -> str:
@@ -195,11 +243,21 @@ class AIOpsAgent:
 
     def _handle_explain(self, user_input: str, history: list, cb: StatusCallback) -> str:
         cb("Analyzing...")
-        llm_with_tools = self._model_wrapper.get_llm_with_tools(self.tools.read_tools)
-        tool_map = {t.name: t for t in self.tools.read_tools}
+        selection = self._select_read_tools(user_input, history)
+        capability_families = ["Kubernetes" if family == "k8s" else "AWS" for family in selection.capability_families]
+        llm_with_tools = (
+            self._model_wrapper.get_llm_with_tools(selection.tools)
+            if selection.tools
+            else self._model_wrapper.get_llm()
+        )
+        tool_map = {t.name: t for t in selection.tools}
         return handle_explain(
             user_input, history, llm_with_tools, tool_map,
             self.model_name, self.tracer, self.topology_cache, cb,
+            capability_prompt=selection.capability_prompt,
+            require_live_inspection=selection.require_live_inspection,
+            available_capability_families=capability_families,
+            insufficient_tool_names=selection.insufficient_tool_names,
         )
 
     # ── Action execution (post-approval) ─────────────────────────────────

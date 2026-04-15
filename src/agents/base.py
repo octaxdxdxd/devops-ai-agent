@@ -34,6 +34,44 @@ def extract_token_usage(response: AIMessage) -> tuple[int, int]:
     return usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
 
 
+def _is_data_bearing_tool_result(result: str) -> bool:
+    text = str(result or "").strip()
+    if not text or text == "(empty output)":
+        return False
+    if text.startswith("ERROR:") or text.startswith("Tool error:") or text.startswith("Unknown tool:"):
+        return False
+    lowered = text.lower()
+    if lowered.startswith("no resources found"):
+        return False
+    return True
+
+
+def _tool_policy_retry_message(original_query: str, capability_families: list[str]) -> str:
+    families = ", ".join(capability_families) if capability_families else "the bound read tools"
+    return (
+        "This request requires live inspection before you answer.\n\n"
+        f"Available capability families in this turn: {families}.\n"
+        f"Original query: {original_query}\n\n"
+        "Call a relevant bound read tool first, then answer from the tool output. "
+        "Do not claim a tool family is unavailable if it is bound in this turn. "
+        "If the obvious path is empty, try an alternate namespace, label, parent resource, or region before answering. "
+        "Only answer without a tool call if no bound tool can answer the question or every relevant tool failed, and say that explicitly."
+    )
+
+
+def _allows_explicit_no_tool_answer(text: str) -> bool:
+    lowered = str(text or "").lower()
+    required_phrases = (
+        "no bound tool can answer",
+        "none of the bound tools can answer",
+        "none of the available tools can answer",
+        "every relevant tool failed",
+        "all relevant tools failed",
+        "the bound tools cannot answer",
+    )
+    return any(phrase in lowered for phrase in required_phrases)
+
+
 def run_tool_loop(
     *,
     messages: list,
@@ -47,6 +85,9 @@ def run_tool_loop(
     checkpoint_step: int | None = None,
     original_query: str = "",
     system_prompt: str = "",
+    require_relevant_tool_call_before_answer: bool = False,
+    available_capability_families: list[str] | None = None,
+    insufficient_tool_names: set[str] | None = None,
 ) -> str:
     """Shared tool-calling loop used by diagnose, explain, and lookup handlers.
 
@@ -54,6 +95,10 @@ def run_tool_loop(
     """
     cb = status_callback or (lambda _: None)
     tool_result_cache: dict[str, str] = {}
+    capability_families = available_capability_families or []
+    insufficient_names = set(insufficient_tool_names or set())
+    has_sufficient_tool_call = False
+    forced_tool_retry_sent = False
 
     for step in range(max_steps):
         t0 = time.monotonic()
@@ -79,11 +124,28 @@ def run_tool_loop(
         messages.append(response)
 
         # If no tool calls, LLM has produced a final answer
-        if not response.tool_calls:
-            return (response.content or "").strip()
+        tool_calls = list(getattr(response, "tool_calls", []) or [])
+
+        if not tool_calls:
+            final_text = (response.content or "").strip()
+            if require_relevant_tool_call_before_answer and tool_map and not has_sufficient_tool_call:
+                if not forced_tool_retry_sent:
+                    cb("Requesting live inspection...")
+                    retry_message = _tool_policy_retry_message(original_query, capability_families)
+                    tracer.step("checkpoint", handler_name, output_summary=retry_message[:300])
+                    messages.append(HumanMessage(content=retry_message))
+                    forced_tool_retry_sent = True
+                    continue
+                if _allows_explicit_no_tool_answer(final_text):
+                    return final_text
+                return (
+                    "I wasn’t able to complete a live inspection with the bound read tools. "
+                    "Please retry the request."
+                )
+            return final_text
 
         # Execute each tool call
-        for tc in response.tool_calls:
+        for tc in tool_calls:
             tool_name = tc["name"]
             tool_args = tc["args"]
             tool_id = tc.get("id", tool_name)
@@ -92,6 +154,7 @@ def run_tool_loop(
             if not tool:
                 result = f"Unknown tool: {tool_name}"
                 cache_hit = False
+                tool_ms = 0
             else:
                 cache_key = _tool_cache_key(tool_name, tool_args)
                 cache_hit = cache_key in tool_result_cache
@@ -117,6 +180,8 @@ def run_tool_loop(
                     output_summary="cache hit" if cache_hit else "",
                     duration_ms=tool_ms,
                 )
+                if tool_name not in insufficient_names and _is_data_bearing_tool_result(result):
+                    has_sufficient_tool_call = True
 
             messages.append(ToolMessage(content=result, tool_call_id=tool_id))
 

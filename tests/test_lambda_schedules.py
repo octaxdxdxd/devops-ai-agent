@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from src.agents.lookup import select_lookup_tools
+from src.agents.read_policy import ReadScopeResult, select_read_tools
 from src.infra.aws_client import AWSClient
 from src.tools.aws_read import create_aws_read_tools
 from src.tools.command_preview import render_tool_call_preview
@@ -483,17 +483,14 @@ def test_inspect_lambda_schedules_splits_primary_and_related_matches() -> None:
 
 
 def test_schedule_lookup_tool_selection_excludes_cloudtrail() -> None:
-    tools = create_aws_read_tools(_ToolAWS())
-    selected = select_lookup_tools(
-        (
-            "i have a lambda kill tagless resources in my aws account "
-            "and I want to know how frequent it runs, when did it do its last run "
-            "and when will it run next"
-        ),
+    selected = select_read_tools(
+        "i have a lambda kill tagless resources in my aws account and i want to know how frequent it runs",
         [],
-        tools,
+        [],
+        create_aws_read_tools(_ToolAWS()),
+        scope=ReadScopeResult(backend="aws", specialization="schedule", confidence="high"),
     )
-    names = {tool.name for tool in selected}
+    names = {tool.name for tool in selected.tools}
 
     assert "aws_inspect_lambda_schedules" in names
     assert "aws_audit_cloudtrail" not in names

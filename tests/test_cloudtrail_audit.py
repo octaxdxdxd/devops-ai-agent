@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.agents.lookup import select_lookup_tools
+from src.agents.read_policy import ReadScopeResult, select_read_tools
 from src.infra.aws_client import AWSClient
 from src.tools.aws_read import create_aws_read_tools
 from src.tools.command_preview import render_tool_call_preview
@@ -509,13 +509,15 @@ def test_cloudtrail_lookup_queries_use_the_dedicated_audit_toolset() -> None:
         SimpleNamespace(name="aws_get_cost"),
     ]
 
-    selected = select_lookup_tools(
+    selected = select_read_tools(
         "show me all aws resources deleted by octavian.popov@endava.com in the last 5 days",
         [],
+        [],
         tools,
+        scope=ReadScopeResult(backend="aws", specialization="cloudtrail", confidence="high"),
     )
 
-    assert [tool.name for tool in selected] == ["aws_audit_cloudtrail", "aws_get_caller_identity"]
+    assert [tool.name for tool in selected.tools] == ["aws_audit_cloudtrail"]
 
 
 def test_trace_regression_april_9_delete_query_returns_deleted_vpc() -> None:

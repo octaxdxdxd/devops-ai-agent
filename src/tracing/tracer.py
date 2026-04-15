@@ -11,7 +11,7 @@ from uuid import uuid4
 @dataclass
 class TraceStep:
     timestamp: str = ""
-    step_type: str = ""       # intent | tool_call | llm_call | approval | verify | error | checkpoint
+    step_type: str = ""       # intent | selector | tool_call | llm_call | approval | verify | error | checkpoint
     handler: str = ""         # lookup | diagnose | action | explain | orchestrator | health_scan
     input_summary: str = ""
     output_summary: str = ""

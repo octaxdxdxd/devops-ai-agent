@@ -29,6 +29,8 @@ Rules:
 - For CloudTrail, prefer selective filters such as exact event names, resource names, or usernames. Avoid broad EventSource/resource-type scans over long windows unless the user explicitly asks for audit-history spelunking.
 - This handler is read-only. If a fix is needed, describe it and point the user to the action flow.
 
+{capability_prompt}
+
 OUTPUT FORMAT for RCA (only when investigating problems):
 ## Root Cause Analysis
 **Symptom**: [what was reported]
@@ -47,12 +49,19 @@ def handle_diagnose(
     tracer: Tracer,
     topology_cache: TopologyCache | None = None,
     status_callback: StatusCallback | None = None,
+    capability_prompt: str = "",
+    require_live_inspection: bool = False,
+    available_capability_families: list[str] | None = None,
+    insufficient_tool_names: set[str] | None = None,
 ) -> str:
     """Handle a diagnostic / RCA query with structured investigation protocol."""
     cb = status_callback or (lambda _: None)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    system_prompt = _DIAGNOSE_SYSTEM_PROMPT_TEMPLATE.format(today=today)
+    system_prompt = _DIAGNOSE_SYSTEM_PROMPT_TEMPLATE.format(
+        today=today,
+        capability_prompt=capability_prompt.strip() or "Capabilities in this turn:\n- No live read tools are bound.",
+    )
 
     # Build context preamble with topology if available
     context_parts = []
@@ -87,4 +96,7 @@ def handle_diagnose(
         checkpoint_step=Config.DIAGNOSE_CHECKPOINT_STEP,
         original_query=user_input,
         system_prompt=system_prompt,
+        require_relevant_tool_call_before_answer=require_live_inspection,
+        available_capability_families=available_capability_families,
+        insufficient_tool_names=insufficient_tool_names,
     )

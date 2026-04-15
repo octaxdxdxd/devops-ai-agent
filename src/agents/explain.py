@@ -30,6 +30,8 @@ Rules:
 - Quantify where possible and say what data is missing if the picture is incomplete.
 - This handler is read-only. If a change is needed, explain it and point the user to the action flow.
 
+{capability_prompt}
+
 Presentation:
 - Answer the user’s actual question first.
 - Be concise, structured, and explicit about important evidence."""
@@ -44,12 +46,19 @@ def handle_explain(
     tracer: Tracer,
     topology_cache: TopologyCache | None = None,
     status_callback: StatusCallback | None = None,
+    capability_prompt: str = "",
+    require_live_inspection: bool = False,
+    available_capability_families: list[str] | None = None,
+    insufficient_tool_names: set[str] | None = None,
 ) -> str:
     """Handle an analysis/explanation query. Fewer steps than diagnose."""
     cb = status_callback or (lambda _: None)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    system_prompt = _EXPLAIN_SYSTEM_PROMPT_TEMPLATE.format(today=today)
+    system_prompt = _EXPLAIN_SYSTEM_PROMPT_TEMPLATE.format(
+        today=today,
+        capability_prompt=capability_prompt.strip() or "Capabilities in this turn:\n- No live read tools are bound.",
+    )
 
     context_parts = []
     if topology_cache:
@@ -82,4 +91,7 @@ def handle_explain(
         status_callback=status_callback,
         system_prompt=system_prompt,
         original_query=user_input,
+        require_relevant_tool_call_before_answer=require_live_inspection,
+        available_capability_families=available_capability_families,
+        insufficient_tool_names=insufficient_tool_names,
     )

@@ -3,51 +3,16 @@
 from __future__ import annotations
 
 import logging
-import re
 from datetime import datetime, timezone
-from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..config import Config
 from ..tracing.tracer import Tracer
 from .base import StatusCallback, run_tool_loop
+from .read_policy import ReadScopeResult, select_read_tools
 
 log = logging.getLogger(__name__)
-
-_CLOUDTRAIL_KEYWORDS = (
-    "cloudtrail",
-    "event history",
-    "lookup events",
-    "lookupevents",
-    "audit trail",
-    "audit log",
-)
-_CLOUDTRAIL_AUDIT_PATTERNS = (
-    "deleted by",
-    "created by",
-    "modified by",
-    "updated by",
-    "who deleted",
-    "who created",
-    "who changed",
-    "who modified",
-)
-_PRINCIPAL_HINT_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
-_SCHEDULE_LOOKUP_PATTERNS = (
-    "how frequent",
-    "how often",
-    "last run",
-    "last ran",
-    "when will it run next",
-    "when does it run next",
-    "run next",
-    "runs every",
-    "schedule",
-    "cron",
-    "eventbridge",
-    "lambda runs",
-)
 
 _LOOKUP_SYSTEM_PROMPT_TEMPLATE = """\
 You are an infrastructure lookup assistant. The user wants specific data from Kubernetes or AWS.
@@ -71,79 +36,24 @@ Rules:
 - For cost questions, use {today} for date math; "recent" means the last 30 days.
 - This handler is read-only. If the user wants a change, direct them to the action flow.
 
+{capability_prompt}
+
 Presentation:
 - Answer the exact question directly.
 - Use markdown tables for tabular results.
 - If something is empty, say where you checked."""
 
 
-def _message_text(message: Any) -> str:
-    content = getattr(message, "content", message)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if text:
-                    parts.append(str(text))
-            elif isinstance(item, str):
-                parts.append(item)
-        return "\n".join(parts)
-    return str(content or "")
-
-
-def is_cloudtrail_lookup_query(user_input: str, chat_history: list | None = None) -> bool:
-    combined_parts = [str(user_input or "")]
-    for message in (chat_history or [])[-6:]:
-        combined_parts.append(_message_text(message))
-    text = " ".join(combined_parts).lower()
-
-    if any(keyword in text for keyword in _CLOUDTRAIL_KEYWORDS):
-        return True
-    if any(pattern in text for pattern in _CLOUDTRAIL_AUDIT_PATTERNS) and (
-        "aws" in text or "resource" in text or bool(_PRINCIPAL_HINT_RE.search(text))
-    ):
-        return True
-    if "event name" in text and any(token in text for token in ("delete", "create", "update")):
-        return True
-    return False
-
-
-def is_schedule_lookup_query(user_input: str, chat_history: list | None = None) -> bool:
-    combined_parts = [str(user_input or "")]
-    for message in (chat_history or [])[-6:]:
-        combined_parts.append(_message_text(message))
-    text = " ".join(combined_parts).lower()
-
-    if any(pattern in text for pattern in _SCHEDULE_LOOKUP_PATTERNS):
-        return True
-    if "lambda" in text and any(token in text for token in ("frequency", "next run", "last run", "scheduled")):
-        return True
-    return False
-
-
 def select_lookup_tools(user_input: str, chat_history: list, read_tools: list) -> list:
-    is_schedule_query = is_schedule_lookup_query(user_input, chat_history)
-    is_cloudtrail_query = is_cloudtrail_lookup_query(user_input, chat_history)
-
-    if is_schedule_query and not is_cloudtrail_query:
-        wanted = {"aws_inspect_lambda_schedules", "aws_get_caller_identity"}
-        selected = [tool for tool in read_tools if getattr(tool, "name", "") in wanted]
-        return selected or read_tools
-
-    if is_cloudtrail_query and not is_schedule_query:
-        wanted = {"aws_audit_cloudtrail", "aws_get_caller_identity"}
-        selected = [tool for tool in read_tools if getattr(tool, "name", "") in wanted]
-        return selected or read_tools
-
-    if is_cloudtrail_query and is_schedule_query:
-        wanted = {"aws_inspect_lambda_schedules", "aws_audit_cloudtrail", "aws_get_caller_identity"}
-        selected = [tool for tool in read_tools if getattr(tool, "name", "") in wanted]
-        return selected or read_tools
-
-    return read_tools
+    k8s_tools = [tool for tool in read_tools if getattr(tool, "name", "").startswith("k8s_")]
+    aws_tools = [tool for tool in read_tools if getattr(tool, "name", "").startswith("aws_")]
+    return select_read_tools(
+        user_input,
+        chat_history,
+        k8s_tools,
+        aws_tools,
+        scope=ReadScopeResult(backend="mixed", specialization="none", confidence="low"),
+    ).tools
 
 
 def handle_lookup(
@@ -154,11 +64,19 @@ def handle_lookup(
     model_name: str,
     tracer: Tracer,
     status_callback: StatusCallback | None = None,
+    capability_prompt: str = "",
+    require_live_inspection: bool = False,
+    available_capability_families: list[str] | None = None,
+    insufficient_tool_names: set[str] | None = None,
+    specialization: str = "none",
 ) -> str:
     """Handle a simple data retrieval query. Typically 1-2 tool calls."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    system_prompt = _LOOKUP_SYSTEM_PROMPT_TEMPLATE.format(today=today)
-    if is_schedule_lookup_query(user_input, chat_history) and not is_cloudtrail_lookup_query(user_input, chat_history):
+    system_prompt = _LOOKUP_SYSTEM_PROMPT_TEMPLATE.format(
+        today=today,
+        capability_prompt=capability_prompt.strip() or "Capabilities in this turn:\n- No live read tools are bound.",
+    )
+    if specialization == "schedule":
         system_prompt += (
             "\n\nSchedule-specific rules:\n"
             "- Call `aws_inspect_lambda_schedules` first.\n"
@@ -187,4 +105,7 @@ def handle_lookup(
         checkpoint_step=Config.LOOKUP_CHECKPOINT_STEP,
         system_prompt=system_prompt,
         original_query=user_input,
+        require_relevant_tool_call_before_answer=require_live_inspection,
+        available_capability_families=available_capability_families,
+        insufficient_tool_names=insufficient_tool_names,
     )

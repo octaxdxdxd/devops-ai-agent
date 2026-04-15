@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -13,25 +12,6 @@ from ..tracing.tracer import Tracer
 from .base import extract_token_usage
 
 log = logging.getLogger(__name__)
-
-_CONFIRMATION_ONLY_INPUTS = {
-    "yes",
-    "y",
-    "yeah",
-    "yep",
-    "sure",
-    "ok",
-    "okay",
-    "confirm",
-    "go ahead",
-    "do it",
-    "do that",
-    "yeah do that",
-    "yes do that",
-    "sure do that",
-    "ok do that",
-    "okay do that",
-}
 
 INTENT_SYSTEM_PROMPT = """\
 Classify the user's infrastructure query into exactly one category.
@@ -48,27 +28,41 @@ IMPORTANT:
 - Questions asking about resource properties (limits, requests, policies, versions, sizes) are lookup.
 - Questions asking "why" or reporting symptoms are diagnose.
 - Questions about "how to" change something or asking for recommendations are explain.
+- Do not infer a concrete target, backend, or action from vague acknowledgements like "yes continue", "go on", or "check it".
+- If the current user turn is too vague to route safely, set `needs_clarification` to true and provide a one-sentence `clarification_prompt` asking the user to restate the resource, problem, or next step.
+- Use only the user's messages as conversation context for routing. Ignore assistant messages when deciding intent.
 - Do not infer a mutating action from a short acknowledgement or confirmation. Action requires an explicit change request in the current user message.
 
 Output ONLY valid JSON:
-{"intent": "<category>", "resources": ["mentioned resources"], "namespaces": ["mentioned namespaces"]}"""
+{"intent": "<category>", "resources": ["mentioned resources"], "namespaces": ["mentioned namespaces"], "needs_clarification": false, "clarification_prompt": ""}"""
 
 
 class IntentResult:
-    __slots__ = ("intent", "resources", "namespaces")
+    __slots__ = ("intent", "resources", "namespaces", "needs_clarification", "clarification_prompt")
 
-    def __init__(self, intent: str, resources: list[str] | None = None, namespaces: list[str] | None = None):
+    def __init__(
+        self,
+        intent: str,
+        resources: list[str] | None = None,
+        namespaces: list[str] | None = None,
+        needs_clarification: bool = False,
+        clarification_prompt: str = "",
+    ):
         self.intent = intent
         self.resources = resources or []
         self.namespaces = namespaces or []
+        self.needs_clarification = needs_clarification
+        self.clarification_prompt = clarification_prompt or ""
 
 
-def _normalize_user_text(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text or "").lower().strip())
-
-
-def _is_confirmation_only_input(text: str) -> bool:
-    return _normalize_user_text(text) in _CONFIRMATION_ONLY_INPUTS
+def _recent_user_messages(chat_history: list | None, limit: int = 4) -> list:
+    recent: list = []
+    for message in chat_history or []:
+        role = getattr(message, "type", "") or getattr(message, "role", "")
+        if str(role).lower() not in {"human", "user"}:
+            continue
+        recent.append(message)
+    return recent[-limit:]
 
 
 def classify_intent(
@@ -80,25 +74,12 @@ def classify_intent(
 ) -> IntentResult:
     """Classify user intent with a single, cheap LLM call (~200 tokens)."""
 
-    if _is_confirmation_only_input(user_input):
-        tracer.step(
-            "intent",
-            "orchestrator",
-            input_summary=user_input[:200],
-            output_summary='{"intent":"lookup","resources":[],"namespaces":[]}',
-            llm_model=model_name,
-            tokens_in=0,
-            tokens_out=0,
-            duration_ms=0,
-        )
-        return IntentResult(intent="lookup")
-
     messages = [
         SystemMessage(content=INTENT_SYSTEM_PROMPT),
     ]
-    # Include recent chat for follow-up context.
+    # Use only prior user-authored context for routing.
     if chat_history:
-        messages.extend(chat_history[-4:])
+        messages.extend(_recent_user_messages(chat_history))
     messages.append(HumanMessage(content=user_input))
 
     t0 = time.monotonic()
@@ -144,6 +125,8 @@ def _parse_intent(raw: str) -> IntentResult:
             intent=intent,
             resources=data.get("resources", []),
             namespaces=data.get("namespaces", []),
+            needs_clarification=bool(data.get("needs_clarification", False)),
+            clarification_prompt=str(data.get("clarification_prompt", "") or ""),
         )
     except (json.JSONDecodeError, AttributeError):
         pass

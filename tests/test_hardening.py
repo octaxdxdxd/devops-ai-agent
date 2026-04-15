@@ -6,6 +6,8 @@ from langchain_core.messages import HumanMessage
 
 from src.agents.action import PendingAction, _create_propose_action_tool, format_action_step_preview
 from src.agents.base import run_tool_loop
+from src.agents.diagnose import handle_diagnose
+from src.agents.explain import handle_explain
 from src.agents.orchestrator import AIOpsAgent
 from src.tools.aws_read import create_aws_read_tools
 from src.tracing.tracer import Tracer
@@ -34,6 +36,14 @@ class _FakeLLM:
         return self.responses.pop(0)
 
 
+class _StaticLLM:
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def invoke(self, messages):
+        return _FakeResponse(self._content)
+
+
 class _CountingTool:
     def __init__(self, result: str) -> None:
         self.result = result
@@ -60,6 +70,14 @@ class _DummyTools:
     def execute(self, tool_name: str, args: dict) -> str:
         self.calls.append((tool_name, dict(args)))
         return self.result
+
+
+class _DummyAWSStatus:
+    def set_status_callback(self, cb) -> None:
+        self.callback = cb
+
+    def clear_status_callback(self) -> None:
+        self.callback = None
 
 
 def test_aws_describe_service_blocks_mutating_operations_in_read_tool() -> None:
@@ -180,3 +198,191 @@ def test_execute_action_marks_failed_and_uses_failed_trace_outcome() -> None:
     ]
     assert "ERROR: boom" in result
     assert store.saved[0].outcome == "action_failed"
+
+
+def test_process_query_requests_clarification_for_ambiguous_acknowledgement() -> None:
+    class _ModelWrapper:
+        def __init__(self):
+            self.llm = _StaticLLM(
+                '{"intent":"lookup","resources":[],"namespaces":[],"needs_clarification":true,'
+                '"clarification_prompt":"Please restate the resource, problem, or next step you want me to continue with."}'
+            )
+
+        def get_llm(self):
+            return self.llm
+
+        def get_llm_with_tools(self, tools):  # pragma: no cover
+            raise AssertionError("Handler/tool selection should not run for ambiguous acknowledgements")
+
+    store = _DummyStore()
+    agent = object.__new__(AIOpsAgent)
+    agent._model_wrapper = _ModelWrapper()
+    agent.model_name = "test-model"
+    agent.pending_actions = []
+    agent.tracer = Tracer()
+    agent.trace_store = store
+    agent.last_trace_id = None
+    agent.aws = _DummyAWSStatus()
+    agent.operator_intent_state = SimpleNamespace(
+        last_user_instruction="",
+        pending_step_kind="",
+        pending_step_summary="",
+    )
+
+    result = agent.process_query("yes continue", chat_history=[], status_callback=lambda _: None)
+
+    assert "Please restate" in result
+    assert store.saved[0].outcome == "answered"
+    selector_steps = [step for step in store.saved[0].steps if step.step_type == "selector"]
+    assert len(selector_steps) == 1
+    assert selector_steps[0].output_summary == "blocked_for_clarification"
+
+
+def test_run_tool_loop_retries_when_read_handler_answers_without_tools() -> None:
+    fake_tool = _CountingTool("statefulset yaml")
+    llm = _FakeLLM(
+        [
+            _FakeResponse(content="I cannot inspect Kubernetes from here."),
+            _FakeResponse(
+                tool_calls=[
+                    {
+                        "name": "k8s_get_resource_yaml",
+                        "args": {"kind": "statefulset", "name": "jenkins", "namespace": "jenkins"},
+                        "id": "call-1",
+                    }
+                ]
+            ),
+            _FakeResponse(content="No explicit nodeAffinity is present."),
+        ]
+    )
+
+    result = run_tool_loop(
+        messages=[HumanMessage(content="what node affinity does jenkins have")],
+        llm_with_tools=llm,
+        tool_map={"k8s_get_resource_yaml": fake_tool},
+        max_steps=4,
+        handler_name="lookup",
+        model_name="test-model",
+        tracer=Tracer(),
+        original_query="what node affinity does jenkins have",
+        require_relevant_tool_call_before_answer=True,
+        available_capability_families=["Kubernetes"],
+        insufficient_tool_names={"aws_get_caller_identity"},
+    )
+
+    assert result == "No explicit nodeAffinity is present."
+    assert fake_tool.calls == [{"kind": "statefulset", "name": "jenkins", "namespace": "jenkins"}]
+
+
+def test_run_tool_loop_does_not_count_aws_identity_as_sufficient_for_k8s_lookup() -> None:
+    fake_identity_tool = _CountingTool('{"Arn":"arn:aws:iam::123456789012:user/test"}')
+    fake_k8s_tool = _CountingTool("statefulset yaml")
+    llm = _FakeLLM(
+        [
+            _FakeResponse(tool_calls=[{"name": "aws_get_caller_identity", "args": {}, "id": "call-1"}]),
+            _FakeResponse(content="I only have AWS tools here."),
+            _FakeResponse(
+                tool_calls=[
+                    {
+                        "name": "k8s_get_resource_yaml",
+                        "args": {"kind": "statefulset", "name": "jenkins", "namespace": "jenkins"},
+                        "id": "call-2",
+                    }
+                ]
+            ),
+            _FakeResponse(content="No explicit nodeAffinity is present."),
+        ]
+    )
+
+    result = run_tool_loop(
+        messages=[HumanMessage(content="what node affinity does jenkins have")],
+        llm_with_tools=llm,
+        tool_map={
+            "aws_get_caller_identity": fake_identity_tool,
+            "k8s_get_resource_yaml": fake_k8s_tool,
+        },
+        max_steps=5,
+        handler_name="lookup",
+        model_name="test-model",
+        tracer=Tracer(),
+        original_query="what node affinity does jenkins have",
+        require_relevant_tool_call_before_answer=True,
+        available_capability_families=["Kubernetes"],
+        insufficient_tool_names={"aws_get_caller_identity"},
+    )
+
+    assert result == "No explicit nodeAffinity is present."
+    assert fake_identity_tool.calls == [{}]
+    assert fake_k8s_tool.calls == [{"kind": "statefulset", "name": "jenkins", "namespace": "jenkins"}]
+
+
+def test_handle_diagnose_inherits_tool_first_enforcement() -> None:
+    fake_tool = _CountingTool("pod output")
+    llm = _FakeLLM(
+        [
+            _FakeResponse(content="I cannot inspect Kubernetes from here."),
+            _FakeResponse(
+                tool_calls=[
+                    {
+                        "name": "k8s_get_resources",
+                        "args": {"kind": "pod", "namespace": "jenkins", "name": "", "label_selector": "", "all_namespaces": False},
+                        "id": "call-1",
+                    }
+                ]
+            ),
+            _FakeResponse(content="Jenkins is pending."),
+        ]
+    )
+
+    result = handle_diagnose(
+        "why is jenkins pending?",
+        [],
+        llm,
+        {"k8s_get_resources": fake_tool},
+        "test-model",
+        Tracer(),
+        topology_cache=None,
+        capability_prompt="Capabilities in this turn:\n- Kubernetes read tools available.",
+        require_live_inspection=True,
+        available_capability_families=["Kubernetes"],
+        insufficient_tool_names={"aws_get_caller_identity"},
+    )
+
+    assert result == "Jenkins is pending."
+    assert fake_tool.calls == [{"kind": "pod", "namespace": "jenkins", "name": "", "label_selector": "", "all_namespaces": False}]
+
+
+def test_handle_explain_inherits_tool_first_enforcement() -> None:
+    fake_tool = _CountingTool("usage output")
+    llm = _FakeLLM(
+        [
+            _FakeResponse(content="I only have AWS tools available."),
+            _FakeResponse(
+                tool_calls=[
+                    {
+                        "name": "k8s_get_resource_usage",
+                        "args": {"resource_type": "pods", "namespace": "jenkins", "name": ""},
+                        "id": "call-1",
+                    }
+                ]
+            ),
+            _FakeResponse(content="Current usage is available now."),
+        ]
+    )
+
+    result = handle_explain(
+        "show me current pod usage in jenkins",
+        [],
+        llm,
+        {"k8s_get_resource_usage": fake_tool},
+        "test-model",
+        Tracer(),
+        topology_cache=None,
+        capability_prompt="Capabilities in this turn:\n- Kubernetes read tools available.",
+        require_live_inspection=True,
+        available_capability_families=["Kubernetes"],
+        insufficient_tool_names={"aws_get_caller_identity"},
+    )
+
+    assert result == "Current usage is available now."
+    assert fake_tool.calls == [{"resource_type": "pods", "namespace": "jenkins", "name": ""}]
