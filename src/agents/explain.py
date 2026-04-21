@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..config import Config
-from ..infra.topology import TopologyCache
 from ..tracing.tracer import Tracer
 from .base import StatusCallback, run_tool_loop
-
-log = logging.getLogger(__name__)
 
 _EXPLAIN_SYSTEM_PROMPT_TEMPLATE = """\
 You are an infrastructure analyst providing clear, accurate explanations and insights.
@@ -44,7 +40,6 @@ def handle_explain(
     tool_map: dict,
     model_name: str,
     tracer: Tracer,
-    topology_cache: TopologyCache | None = None,
     status_callback: StatusCallback | None = None,
     capability_prompt: str = "",
     require_live_inspection: bool = False,
@@ -60,24 +55,10 @@ def handle_explain(
         capability_prompt=capability_prompt.strip() or "Capabilities in this turn:\n- No live read tools are bound.",
     )
 
-    context_parts = []
-    if topology_cache:
-        cb("Loading infrastructure topology...")
-        try:
-            topo = topology_cache.get()
-            summary = topo.to_summary(max_nodes=30, max_edges=20)
-            context_parts.append(f"Current infrastructure topology:\n{summary}")
-        except Exception as exc:
-            log.warning("Topology build failed: %s", exc)
-
-    preamble = ""
-    if context_parts:
-        preamble = "\n\n".join(context_parts) + "\n\n"
-
     messages = [
         SystemMessage(content=system_prompt),
         *chat_history[-4:],
-        HumanMessage(content=f"{preamble}User question: {user_input}"),
+        HumanMessage(content=f"User question: {user_input}"),
     ]
 
     return run_tool_loop(

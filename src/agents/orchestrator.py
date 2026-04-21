@@ -14,7 +14,6 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from ..config import Config
 from ..infra.k8s_client import K8sClient
 from ..infra.aws_client import AWSClient
-from ..infra.topology import TopologyBuilder, TopologyCache
 from ..models import get_model
 from ..tools.registry import ToolRegistry
 from ..tools.output import compress_output
@@ -76,10 +75,6 @@ class AIOpsAgent:
 
         # Tools
         self.tools = ToolRegistry(self.k8s, self.aws)
-
-        # Topology
-        builder = TopologyBuilder(self.k8s, self.aws)
-        self.topology_cache = TopologyCache(builder, ttl_seconds=300)
 
         # Tracing
         self.tracer = Tracer()
@@ -219,7 +214,7 @@ class AIOpsAgent:
         tool_map = {t.name: t for t in selection.tools}
         return handle_diagnose(
             user_input, history, llm_with_tools, tool_map,
-            self.model_name, self.tracer, self.topology_cache, cb,
+            self.model_name, self.tracer, cb,
             capability_prompt=selection.capability_prompt,
             require_live_inspection=selection.require_live_inspection,
             available_capability_families=capability_families,
@@ -253,7 +248,7 @@ class AIOpsAgent:
         tool_map = {t.name: t for t in selection.tools}
         return handle_explain(
             user_input, history, llm_with_tools, tool_map,
-            self.model_name, self.tracer, self.topology_cache, cb,
+            self.model_name, self.tracer, cb,
             capability_prompt=selection.capability_prompt,
             require_live_inspection=selection.require_live_inspection,
             available_capability_families=capability_families,
@@ -512,4 +507,3 @@ class AIOpsAgent:
         self.pending_actions = []
         self.last_trace_id = None
         self.operator_intent_state = OperatorIntentState()
-        self.topology_cache.invalidate()

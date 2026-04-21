@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..config import Config
-from ..infra.topology import TopologyCache
 from ..tracing.tracer import Tracer
 from .base import StatusCallback, run_tool_loop
-
-log = logging.getLogger(__name__)
 
 _DIAGNOSE_SYSTEM_PROMPT_TEMPLATE = """\
 You are a senior SRE performing deep infrastructure investigation.
@@ -47,7 +43,6 @@ def handle_diagnose(
     tool_map: dict,
     model_name: str,
     tracer: Tracer,
-    topology_cache: TopologyCache | None = None,
     status_callback: StatusCallback | None = None,
     capability_prompt: str = "",
     require_live_inspection: bool = False,
@@ -63,25 +58,10 @@ def handle_diagnose(
         capability_prompt=capability_prompt.strip() or "Capabilities in this turn:\n- No live read tools are bound.",
     )
 
-    # Build context preamble with topology if available
-    context_parts = []
-    if topology_cache:
-        cb("Building infrastructure topology...")
-        try:
-            topo = topology_cache.get()
-            summary = topo.to_summary(max_nodes=40, max_edges=25)
-            context_parts.append(f"Current infrastructure topology:\n{summary}")
-        except Exception as exc:
-            log.warning("Topology build failed: %s", exc)
-
-    preamble = ""
-    if context_parts:
-        preamble = "\n\n".join(context_parts) + "\n\n"
-
     messages = [
         SystemMessage(content=system_prompt),
         *chat_history[-6:],
-        HumanMessage(content=f"{preamble}User query: {user_input}"),
+        HumanMessage(content=f"User query: {user_input}"),
     ]
 
     return run_tool_loop(

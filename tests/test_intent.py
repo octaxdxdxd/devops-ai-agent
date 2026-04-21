@@ -47,3 +47,27 @@ def test_explicit_action_still_uses_classifier() -> None:
     assert result.intent == "action"
     assert result.resources == ["pod"]
     assert result.namespaces == ["nexus"]
+
+
+def test_fenced_json_classifier_output_is_parsed() -> None:
+    result = classify_intent(
+        user_input="why are there duplicate dead pods after my instances restarted",
+        llm=_StaticLLM(
+            '```json\n'
+            '{'
+            '"intent":"diagnose",'
+            '"resources":["pods","instances"],'
+            '"namespaces":["all"],'
+            '"needs_clarification":false,'
+            '"clarification_prompt":""'
+            '}\n'
+            '```'
+        ),
+        model_name="test-model",
+        tracer=Tracer(),
+        chat_history=[],
+    )
+
+    assert result.intent == "diagnose"
+    assert result.resources == ["pods", "instances"]
+    assert result.namespaces == ["all"]
