@@ -15,6 +15,7 @@ from ..tracing.tracer import Tracer
 log = logging.getLogger(__name__)
 
 StatusCallback = Callable[[str], None]
+FinalAnswerFeedback = Callable[[str, dict[str, Any]], str | None]
 
 
 def _tool_cache_key(tool_name: str, tool_args: Any) -> str:
@@ -88,6 +89,8 @@ def run_tool_loop(
     require_relevant_tool_call_before_answer: bool = False,
     available_capability_families: list[str] | None = None,
     insufficient_tool_names: set[str] | None = None,
+    min_sufficient_tool_calls_before_answer: int = 0,
+    final_answer_feedback: FinalAnswerFeedback | None = None,
 ) -> str:
     """Shared tool-calling loop used by diagnose, explain, and lookup handlers.
 
@@ -99,6 +102,8 @@ def run_tool_loop(
     insufficient_names = set(insufficient_tool_names or set())
     has_sufficient_tool_call = False
     forced_tool_retry_sent = False
+    sufficient_tool_call_count = 0
+    sufficient_tool_call_keys: set[str] = set()
 
     for step in range(max_steps):
         t0 = time.monotonic()
@@ -142,6 +147,37 @@ def run_tool_loop(
                     "I wasn’t able to complete a live inspection with the bound read tools. "
                     "Please retry the request."
                 )
+            if (
+                min_sufficient_tool_calls_before_answer > 0
+                and tool_map
+                and sufficient_tool_call_count < min_sufficient_tool_calls_before_answer
+                and not forced_tool_retry_sent
+            ):
+                retry_message = (
+                    f"This investigation needs deeper evidence before you conclude. "
+                    f"So far you have only gathered {sufficient_tool_call_count} relevant data-bearing tool result(s). "
+                    f"Continue investigating with additional, non-duplicative tool calls until you can support the conclusion."
+                )
+                cb("Continuing investigation...")
+                tracer.step("checkpoint", handler_name, output_summary=retry_message[:300])
+                messages.append(HumanMessage(content=retry_message))
+                forced_tool_retry_sent = True
+                continue
+            if final_answer_feedback and step < max_steps - 1:
+                feedback = final_answer_feedback(
+                    final_text,
+                    {
+                        "step": step + 1,
+                        "max_steps": max_steps,
+                        "has_sufficient_tool_call": has_sufficient_tool_call,
+                        "sufficient_tool_call_count": sufficient_tool_call_count,
+                    },
+                )
+                if feedback:
+                    cb("Continuing investigation...")
+                    tracer.step("checkpoint", handler_name, output_summary=feedback[:300])
+                    messages.append(HumanMessage(content=feedback))
+                    continue
             return final_text
 
         # Execute each tool call
@@ -182,6 +218,9 @@ def run_tool_loop(
                 )
                 if tool_name not in insufficient_names and _is_data_bearing_tool_result(result):
                     has_sufficient_tool_call = True
+                    if cache_key not in sufficient_tool_call_keys:
+                        sufficient_tool_call_keys.add(cache_key)
+                        sufficient_tool_call_count += 1
 
             messages.append(ToolMessage(content=result, tool_call_id=tool_id))
 

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from langchain_core.messages import HumanMessage
 
+import src.agents.orchestrator as orchestrator_module
 from src.agents.action import PendingAction, _create_propose_action_tool, format_action_step_preview
 from src.agents.base import run_tool_loop
 from src.agents.diagnose import handle_diagnose
@@ -78,6 +79,17 @@ class _DummyAWSStatus:
 
     def clear_status_callback(self) -> None:
         self.callback = None
+
+
+class _DummyModelWrapper:
+    def __init__(self, llm) -> None:
+        self.llm = llm
+
+    def get_llm(self):
+        return self.llm
+
+    def get_llm_with_tools(self, tools):
+        return self.llm
 
 
 def test_aws_describe_service_blocks_mutating_operations_in_read_tool() -> None:
@@ -384,3 +396,99 @@ def test_handle_explain_inherits_tool_first_enforcement() -> None:
 
     assert result == "Current usage is available now."
     assert fake_tool.calls == [{"resource_type": "pods", "namespace": "jenkins", "name": ""}]
+
+
+def test_run_tool_loop_reopens_incomplete_investigation_before_returning() -> None:
+    fake_tool = _CountingTool("resource details")
+    llm = _FakeLLM(
+        [
+            _FakeResponse(tool_calls=[{"name": "k8s_get_namespaces", "args": {}, "id": "call-1"}]),
+            _FakeResponse(content="## Root Cause Analysis\n**Symptom**: pods are failing"),
+            _FakeResponse(tool_calls=[{"name": "k8s_get_namespaces", "args": {"all_namespaces": True}, "id": "call-2"}]),
+            _FakeResponse(
+                content=(
+                    "## Root Cause Analysis\n"
+                    "**Symptom**: pods are failing\n"
+                    "**Root Cause**: node churn\n"
+                    "**Evidence Chain**: confirmed by tool output\n"
+                    "**Recommended Next Steps**: restart the workload\n"
+                    "**Exact Fix**: use a typed restart action"
+                )
+            ),
+        ]
+    )
+
+    result = run_tool_loop(
+        messages=[HumanMessage(content="why are pods failing")],
+        llm_with_tools=llm,
+        tool_map={"k8s_get_namespaces": fake_tool},
+        max_steps=5,
+        handler_name="diagnose",
+        model_name="test-model",
+        tracer=Tracer(),
+        final_answer_feedback=lambda text, meta: (
+            "Continue investigating until you include an Exact Fix."
+            if "exact fix" not in text.lower()
+            else None
+        ),
+    )
+
+    assert "**Exact Fix**: use a typed restart action" in result
+    assert fake_tool.calls == [{}, {"all_namespaces": True}]
+
+
+def test_maybe_plan_fix_from_diagnosis_creates_pending_action() -> None:
+    original_handle_action = orchestrator_module.handle_action
+    captured_statuses: list[str] = []
+
+    try:
+        orchestrator_module.handle_action = lambda *args, **kwargs: (
+            "Planned remediation",
+            [
+                PendingAction(
+                    id="p1",
+                    description="Restart deployment safely",
+                    commands=[
+                        {
+                            "tool": "k8s_restart_workload_safely",
+                            "args": {"kind": "deployment", "name": "api", "namespace": "prod"},
+                        }
+                    ],
+                    risk="MEDIUM",
+                    expected_outcome="Deployment recovers",
+                )
+            ],
+        )
+
+        agent = object.__new__(AIOpsAgent)
+        agent.tools = SimpleNamespace(
+            read_tools=[SimpleNamespace(name="k8s_get_resources")],
+            write_tools=[SimpleNamespace(name="k8s_restart_workload_safely")],
+        )
+        agent._model_wrapper = _DummyModelWrapper(object())
+        agent.model_name = "test-model"
+        agent.tracer = Tracer()
+        agent.pending_actions = []
+        agent.operator_intent_state = SimpleNamespace(pending_step_summary="", pending_step_kind="")
+
+        diagnosis = (
+            "## Root Cause Analysis\n"
+            "**Symptom**: pods are failing\n"
+            "**Root Cause**: bad rollout\n"
+            "**Evidence Chain**: rollout history and events\n"
+            "**Recommended Next Steps**: restart the deployment safely\n"
+            "**Exact Fix**: restart deployment api in prod"
+        )
+
+        note = agent._maybe_plan_fix_from_diagnosis(
+            "why is api failing",
+            [],
+            diagnosis,
+            captured_statuses.append,
+        )
+    finally:
+        orchestrator_module.handle_action = original_handle_action
+
+    assert "Proposed Fix" in note
+    assert agent.pending_actions[0].description == "Restart deployment safely"
+    assert captured_statuses == ["Planning remediation from RCA..."]

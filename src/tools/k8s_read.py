@@ -5,6 +5,7 @@ from __future__ import annotations
 from langchain_core.tools import tool
 
 from ..infra.k8s_client import K8sClient
+from ..policy import guard_k8s_read_tool
 from .output import compress_output
 
 
@@ -28,6 +29,13 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             label_selector: Label filter e.g. 'app=nginx,tier=frontend'
             all_namespaces: Set True to search across all namespaces
         """
+        policy_error = guard_k8s_read_tool(
+            "k8s_get_resources",
+            namespace=namespace,
+            all_namespaces=all_namespaces,
+        )
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(
             k8s.get_resources(
                 kind,
@@ -47,6 +55,9 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             name: Resource name
             namespace: K8s namespace (empty = default)
         """
+        policy_error = guard_k8s_read_tool("k8s_describe_resource", namespace=namespace)
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(
             k8s.describe(kind, name, namespace or None),
             max_lines=80,
@@ -70,6 +81,9 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             tail_lines: Number of lines from the end (default 100)
             since: Time duration like '5m', '1h', '30s'
         """
+        policy_error = guard_k8s_read_tool("k8s_get_pod_logs", namespace=namespace)
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(
             k8s.get_logs(pod, namespace or None, container or None, tail_lines, since or None)
         )
@@ -87,6 +101,13 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             field_selector: Filter e.g. 'involvedObject.name=my-pod' or 'type=Warning'
             all_namespaces: Set True to get events from all namespaces
         """
+        policy_error = guard_k8s_read_tool(
+            "k8s_get_events",
+            namespace=namespace,
+            all_namespaces=all_namespaces,
+        )
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(
             k8s.get_events(namespace or None, field_selector or None, all_namespaces=all_namespaces)
         )
@@ -100,6 +121,9 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             namespace: K8s namespace (empty = default, ignored for nodes)
             name: Specific pod or node name (empty = all)
         """
+        policy_error = guard_k8s_read_tool("k8s_get_resource_usage", namespace=namespace)
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(k8s.top(resource_type, namespace or None, name or None))
 
     @tool
@@ -111,6 +135,9 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             name: Resource name
             namespace: K8s namespace (empty = default)
         """
+        policy_error = guard_k8s_read_tool("k8s_get_rollout_history", namespace=namespace)
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(k8s.rollout_history(kind, name, namespace or None))
 
     @tool
@@ -132,6 +159,9 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             name: Resource name
             namespace: K8s namespace (empty = default)
         """
+        policy_error = guard_k8s_read_tool("k8s_get_resource_yaml", namespace=namespace)
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(
             k8s.get_resource_yaml(kind, name, namespace or None),
             max_lines=100,
@@ -158,6 +188,9 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
         Args:
             command: kubectl arguments (without the leading 'kubectl')
         """
+        policy_error = guard_k8s_read_tool("k8s_run_kubectl", command=command)
+        if policy_error:
+            return f"ERROR: {policy_error}"
         import shlex as _shlex
         try:
             parts = _shlex.split(command.strip())

@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import tool as langchain_tool
 
 from ..config import Config
+from ..policy import guard_k8s_read_tool, guard_k8s_write_tool, guard_tool_invocation
 from ..tools.command_preview import render_action_step_preview, render_tool_call_preview
 from ..tracing.tracer import Tracer
 from .base import StatusCallback, extract_token_usage
@@ -38,6 +39,7 @@ Proposal format:
   - `{{"command":"kubectl ...","display":"kubectl ..."}}`
   - `{{"tool":"actual_write_tool_name","args":{{...}},"display":"operator-facing summary"}}`
 - Read tools are for investigation only. Do not put read tools like `aws_describe_service` or `k8s_get_resources` into `commands_json`.
+- Prefer typed write tools over raw `kubectl` commands whenever a matching tool exists.
 - Use real names you discovered. Never use placeholders like `<name>`, `REPLACE_ME`, or "replace this".
 - If Kubernetes cannot do the change, use the right AWS/K8s write tool instead of inventing a kubectl resource.
 - Add a `verification_command` when a kubectl check makes sense.
@@ -193,11 +195,17 @@ def _validate_proposed_steps(steps: list[dict], allowed_write_tool_names: set[st
             command_error = _validate_single_kubectl_command(command, f"step {index} command")
             if command_error:
                 return command_error
+            policy_error = guard_k8s_write_tool("approved_kubectl_command", command=command)
+            if policy_error:
+                return f"step {index}: {policy_error}"
             continue
         if tool_name:
             if tool_name not in allowed_write_tool_names:
                 allowed = ", ".join(sorted(allowed_write_tool_names)) or "no write tools available"
                 return f"step {index} tool '{tool_name}' is not an allowed write tool. Allowed tools: {allowed}."
+            policy_error = guard_tool_invocation(tool_name, step.get("args", {}), write=True)
+            if policy_error:
+                return f"step {index}: {policy_error}"
             continue
         return f"step {index} must include either 'command' or 'tool'."
 
@@ -208,7 +216,10 @@ def _validate_verification_command(verification_command: str) -> str | None:
     command = verification_command.strip()
     if not command:
         return None
-    return _validate_single_kubectl_command(command, "verification_command")
+    syntax_error = _validate_single_kubectl_command(command, "verification_command")
+    if syntax_error:
+        return syntax_error
+    return guard_k8s_read_tool("verification_command", command=command)
 
 
 def _create_propose_action_tool(captured: list[dict], allowed_write_tool_names: set[str]):

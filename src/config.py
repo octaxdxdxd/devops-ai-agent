@@ -63,6 +63,8 @@ class Config:
     K8S_DEFAULT_NAMESPACE: str = _env("K8S_DEFAULT_NAMESPACE", "default")
     K8S_CLI_ALLOW_ALL_READ: bool = _env_bool("K8S_CLI_ALLOW_ALL_READ", True)
     K8S_CLI_ALLOW_ALL_WRITE: bool = _env_bool("K8S_CLI_ALLOW_ALL_WRITE", False)
+    K8S_ALLOWED_NAMESPACES: str = _env("K8S_ALLOWED_NAMESPACES")
+    K8S_BLOCKED_NAMESPACES: str = _env("K8S_BLOCKED_NAMESPACES")
 
     # ── AWS ──────────────────────────────────────────────────────────────
     AWS_CLI_ENABLED: bool = _env_bool("AWS_CLI_ENABLED", True)
@@ -70,6 +72,8 @@ class Config:
     AWS_CLI_ALLOW_ALL_WRITE: bool = _env_bool("AWS_CLI_ALLOW_ALL_WRITE", False)
     AWS_CLI_PROFILE: str = _env("AWS_CLI_PROFILE")
     AWS_CLI_DEFAULT_REGION: str = _env("AWS_CLI_DEFAULT_REGION")
+    AWS_ALLOWED_REGIONS: str = _env("AWS_ALLOWED_REGIONS")
+    AWS_BLOCKED_REGIONS: str = _env("AWS_BLOCKED_REGIONS")
 
     # ── Safety ───────────────────────────────────────────────────────────
     COMMAND_SAFETY_POSTURE: str = _env("COMMAND_SAFETY_POSTURE", "approval_required")
@@ -112,6 +116,9 @@ class Config:
             raise ValueError("OPENAI_API_KEY is required when using the OpenAI provider")
         if provider == "openrouter" and not cls.OPENROUTER_API_KEY:
             raise ValueError("OPENROUTER_API_KEY is required when using the OpenRouter provider")
+        posture = str(cls.COMMAND_SAFETY_POSTURE or "approval_required").strip().lower()
+        if posture not in {"approval_required", "read_only"}:
+            raise ValueError("COMMAND_SAFETY_POSTURE must be 'approval_required' or 'read_only'")
 
     @classmethod
     def get_active_model_name(cls) -> str:

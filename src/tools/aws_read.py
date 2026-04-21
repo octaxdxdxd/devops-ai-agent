@@ -7,6 +7,7 @@ import re
 from langchain_core.tools import tool
 
 from ..infra.aws_client import AWSClient
+from ..policy import guard_aws_read_tool
 from .output import compress_output, compress_json_output
 
 _READ_ONLY_AWS_OPERATION_RE = re.compile(r"^(describe|get|list|lookup|head|batch_get)_", re.IGNORECASE)
@@ -28,6 +29,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             instance_ids_json: Optional JSON array of instance IDs e.g. '["i-abc123"]'
             region: Optional AWS region override (e.g. 'us-east-1'). Empty = use default region.
         """
+        policy_error = guard_aws_read_tool("aws_describe_instances", region=region, service="ec2", operation="describe_instances")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         import json as _json
         filters = _json.loads(filters_json) if filters_json.strip() else None
         ids = _json.loads(instance_ids_json) if instance_ids_json.strip() else None
@@ -43,6 +47,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             params_json: Optional JSON object of API parameters e.g. '{"DBInstanceIdentifier":"mydb"}'
             region: Optional AWS region override (e.g. 'us-east-1', 'eu-west-1'). Empty = use default region.
         """
+        policy_error = guard_aws_read_tool("aws_describe_service", region=region, service=service, operation=operation)
+        if policy_error:
+            return f"ERROR: {policy_error}"
         if not _is_read_only_aws_operation(operation):
             return (
                 f"ERROR: AWS read-only tool blocked non-read operation '{operation}'. "
@@ -82,6 +89,15 @@ def create_aws_read_tools(aws: AWSClient) -> list:
 
         name_hints = _json.loads(name_hints_json) if name_hints_json.strip() else []
         regions = _json.loads(regions_json) if regions_json.strip() else []
+        for raw_region in regions or [""]:
+            policy_error = guard_aws_read_tool(
+                "aws_inspect_lambda_schedules",
+                region=str(raw_region or ""),
+                service="events",
+                operation="list_rules",
+            )
+            if policy_error:
+                return f"ERROR: {policy_error}"
         return compress_output(
             aws.inspect_lambda_schedules(
                 name_hints=name_hints,
@@ -126,6 +142,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             include_raw_event: Whether to include parsed raw CloudTrail event JSON in the result.
             region: Optional AWS region override. Empty uses the configured/default region.
         """
+        policy_error = guard_aws_read_tool("aws_audit_cloudtrail", region=region, service="cloudtrail", operation="lookup_events")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(
             aws.audit_cloudtrail(
                 principal=principal,
@@ -158,6 +177,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             granularity: DAILY, MONTHLY, or HOURLY
             group_by: Dimension to group by. Valid values: SERVICE, REGION, INSTANCE_TYPE, LINKED_ACCOUNT, USAGE_TYPE, PLATFORM, TENANCY, PURCHASE_TYPE, OPERATING_SYSTEM, DATABASE_ENGINE (empty = total cost). Note: RESOURCE_ID is NOT a valid dimension here.
         """
+        policy_error = guard_aws_read_tool("aws_get_cost", service="ce", operation="get_cost_and_usage")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(
             aws.get_cost(
                 start_date=start_date or None,
@@ -186,6 +208,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             stat: Statistic: Average, Sum, Maximum, Minimum, SampleCount
             hours: How many hours of data to fetch (default 1)
         """
+        policy_error = guard_aws_read_tool("aws_get_cloudwatch_metrics", service="cloudwatch", operation="get_metric_statistics")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         import json as _json
         dims = _json.loads(dimensions_json) if dimensions_json.strip() else None
         return compress_output(
@@ -199,6 +224,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
         Args:
             state: Filter by state: OK, ALARM, INSUFFICIENT_DATA (empty = all)
         """
+        policy_error = guard_aws_read_tool("aws_get_alarms", service="cloudwatch", operation="describe_alarms")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_json_output(aws.get_alarms(state=state or None))
 
     @tool
@@ -209,6 +237,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
             vpc_id: Filter by VPC ID (empty = all VPCs)
             group_ids_json: JSON array of SG IDs e.g. '["sg-abc123"]'
         """
+        policy_error = guard_aws_read_tool("aws_describe_security_groups", service="ec2", operation="describe_security_groups")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         import json as _json
         ids = _json.loads(group_ids_json) if group_ids_json.strip() else None
         return compress_json_output(aws.describe_security_groups(vpc_id=vpc_id or None, group_ids=ids))
@@ -216,6 +247,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
     @tool
     def aws_get_iam_summary() -> str:
         """Get IAM account summary showing user/role/policy counts and security settings."""
+        policy_error = guard_aws_read_tool("aws_get_iam_summary", service="iam", operation="get_account_summary")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(aws.get_iam_summary())
 
     @tool
@@ -225,6 +259,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
         Args:
             resource_type_filters_json: JSON array of resource type filters e.g. '["ec2:instance","rds:db"]' (empty = all types)
         """
+        policy_error = guard_aws_read_tool("aws_list_resources", service="resourcegroupstaggingapi", operation="get_resources")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         import json as _json
         filters = _json.loads(resource_type_filters_json) if resource_type_filters_json.strip() else None
         return compress_json_output(aws.list_resources(resource_type_filters=filters))
@@ -232,6 +269,9 @@ def create_aws_read_tools(aws: AWSClient) -> list:
     @tool
     def aws_get_caller_identity() -> str:
         """Get the current AWS identity (account, user/role ARN). Useful to verify AWS access."""
+        policy_error = guard_aws_read_tool("aws_get_caller_identity", service="sts", operation="get_caller_identity")
+        if policy_error:
+            return f"ERROR: {policy_error}"
         return compress_output(aws.get_caller_identity())
 
     return [

@@ -15,6 +15,7 @@ from ..config import Config
 from ..infra.k8s_client import K8sClient
 from ..infra.aws_client import AWSClient
 from ..models import get_model
+from ..policy import guard_k8s_write_tool
 from ..tools.registry import ToolRegistry
 from ..tools.output import compress_output
 from ..tracing import Tracer, TraceStore
@@ -179,6 +180,7 @@ class AIOpsAgent:
             history,
             self.tools.k8s_read_tools,
             self.tools.aws_read_tools,
+            extra_tools=self.tools.correlation_read_tools,
             scope=scope,
         )
 
@@ -212,7 +214,7 @@ class AIOpsAgent:
             else self._model_wrapper.get_llm()
         )
         tool_map = {t.name: t for t in selection.tools}
-        return handle_diagnose(
+        response = handle_diagnose(
             user_input, history, llm_with_tools, tool_map,
             self.model_name, self.tracer, cb,
             capability_prompt=selection.capability_prompt,
@@ -220,6 +222,10 @@ class AIOpsAgent:
             available_capability_families=capability_families,
             insufficient_tool_names=selection.insufficient_tool_names,
         )
+        follow_up = self._maybe_plan_fix_from_diagnosis(user_input, history, response, cb)
+        if follow_up:
+            return response.rstrip() + "\n\n" + follow_up
+        return response
 
     def _handle_action(self, user_input: str, history: list, cb: StatusCallback) -> str:
         cb("Planning action...")
@@ -368,6 +374,9 @@ class AIOpsAgent:
         command_error = _validate_single_kubectl_command(command, "approved command")
         if command_error:
             return f"ERROR: {command_error}"
+        policy_error = guard_k8s_write_tool("approved_kubectl_command", command=command)
+        if policy_error:
+            return f"ERROR: {policy_error}"
         parts = shlex.split(command)
         # parts[0] is 'kubectl', rest are args
         return self.k8s.run(parts[1:])
@@ -398,6 +407,53 @@ class AIOpsAgent:
             return (resp.content or "").strip()
         except Exception as exc:
             return f"Post-execution analysis failed: {exc}"
+
+    def _maybe_plan_fix_from_diagnosis(
+        self,
+        user_input: str,
+        history: list,
+        diagnosis: str,
+        cb: StatusCallback,
+    ) -> str:
+        if not self.tools.write_tools:
+            return ""
+        diagnosis_text = str(diagnosis or "").strip()
+        if not diagnosis_text:
+            return ""
+
+        lower = diagnosis_text.lower()
+        required_markers = ("root cause analysis", "root cause", "recommended next steps", "exact fix")
+        if not all(marker in lower for marker in required_markers):
+            return ""
+        if any(phrase in lower for phrase in ("no safe fix", "cannot safely propose", "exact fix**: none")):
+            return ""
+
+        cb("Planning remediation from RCA...")
+        llm_with_tools = self._model_wrapper.get_llm_with_tools(self.tools.read_tools)
+        read_tool_map = {t.name: t for t in self.tools.read_tools}
+        write_tool_map = {t.name: t for t in self.tools.write_tools}
+        planning_prompt = (
+            "Based on this completed RCA, propose the minimum safe remediation for operator approval. "
+            "Use a typed write tool when possible. If there is no safe change to propose, say so and do not create an action.\n\n"
+            f"Original operator request:\n{user_input}\n\n"
+            f"Completed RCA:\n{diagnosis_text}"
+        )
+        response_text, actions = handle_action(
+            planning_prompt,
+            history,
+            llm_with_tools,
+            read_tool_map,
+            write_tool_map,
+            self.model_name,
+            self.tracer,
+            cb,
+        )
+        if not actions:
+            return ""
+        self.pending_actions = actions
+        self.operator_intent_state.pending_step_summary = actions[0].description[:100]
+        self.operator_intent_state.pending_step_kind = "action_pending_approval"
+        return "## Proposed Fix\nA concrete remediation plan is attached below for approval."
 
     def reject_action(self, action_id: str) -> None:
         action = self._find_pending_action(action_id)

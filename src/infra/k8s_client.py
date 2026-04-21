@@ -151,6 +151,25 @@ class K8sClient:
             namespace=namespace or self.namespace,
         )
 
+    def get_resource_json(self, kind: str, name: str, namespace: str | None = None) -> dict | list | str:
+        ns = None if kind in {"node", "nodes", "namespace", "namespaces", "pv", "persistentvolume", "persistentvolumes"} else (namespace or self.namespace)
+        return self.run_json(["get", kind, name], namespace=ns)
+
+    def list_resources_json(
+        self,
+        kind: str,
+        namespace: str | None = None,
+        label_selector: str | None = None,
+        all_namespaces: bool = False,
+    ) -> dict | list | str:
+        args = ["get", kind]
+        if label_selector:
+            args.extend(["-l", label_selector])
+        if all_namespaces:
+            args.append("--all-namespaces")
+        ns = None if all_namespaces else (namespace or self.namespace)
+        return self.run_json(args, namespace=ns)
+
     # ── write operations ─────────────────────────────────────────────────
 
     def scale(self, kind: str, name: str, replicas: int, namespace: str | None = None) -> str:
@@ -221,6 +240,59 @@ class K8sClient:
         args.append("--")
         args.extend(shlex.split(command))
         return self.run(args, namespace=namespace or self.namespace, timeout=30)
+
+    def rollout_status(self, kind: str, name: str, namespace: str | None = None, timeout_seconds: int = 300) -> str:
+        return self.run(
+            ["rollout", "status", f"{kind}/{name}", f"--timeout={timeout_seconds}s"],
+            namespace=namespace or self.namespace,
+            timeout=timeout_seconds + 30,
+        )
+
+    def restart_workload_safely(
+        self,
+        kind: str,
+        name: str,
+        namespace: str | None = None,
+        *,
+        timeout_seconds: int = 300,
+    ) -> str:
+        history = self.rollout_history(kind, name, namespace or self.namespace)
+        if history.startswith("ERROR:"):
+            return history
+        restart_result = self.rollout_restart(kind, name, namespace or self.namespace)
+        if restart_result.startswith("ERROR:"):
+            return restart_result
+        status_result = self.rollout_status(kind, name, namespace or self.namespace, timeout_seconds=timeout_seconds)
+        return "\n".join([
+            f"Precheck rollout history:\n{history}",
+            f"Restart result:\n{restart_result}",
+            f"Rollout status:\n{status_result}",
+        ])
+
+    def cleanup_terminated_pods(
+        self,
+        phases: list[str],
+        namespace: str | None = None,
+        *,
+        all_namespaces: bool = False,
+    ) -> str:
+        scoped_namespace = None if all_namespaces else (namespace or self.namespace)
+        summary: list[str] = []
+        for phase in phases:
+            selector = f"status.phase={phase}"
+            before = self.run(
+                ["get", "pods", "--field-selector", selector, "--no-headers"],
+                namespace=scoped_namespace,
+            )
+            before_count = 0 if before.startswith("ERROR: No resources found") or before == "No resources found" else len([line for line in before.splitlines() if line.strip()])
+            delete_args = ["delete", "pods", "--field-selector", selector, "--ignore-not-found"]
+            if all_namespaces:
+                delete_args.append("--all-namespaces")
+                delete_result = self.run(delete_args, namespace=None)
+            else:
+                delete_result = self.run(delete_args, namespace=scoped_namespace)
+            summary.append(f"{phase}: matched={before_count}\n{delete_result}")
+        return "\n\n".join(summary)
 
     # ── convenience: execute a safe, pre-approved shell command ──────────
 

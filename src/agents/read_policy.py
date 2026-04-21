@@ -228,6 +228,7 @@ def select_read_tools(
     k8s_tools: list,
     aws_tools: list,
     *,
+    extra_tools: list | None = None,
     scope: ReadScopeResult | None = None,
 ) -> ReadToolSelection:
     resolved_scope = scope or ReadScopeResult()
@@ -253,7 +254,7 @@ def select_read_tools(
         selected_k8s = list(k8s_tools)
         selected_aws = [tool for tool in aws_tools if getattr(tool, "name", "") != "aws_get_caller_identity"]
 
-    selected_tools = [*selected_k8s, *selected_aws]
+    selected_tools = [*selected_k8s, *selected_aws, *(extra_tools or [])]
     capability_families: list[str] = []
     if selected_k8s:
         capability_families.append("k8s")

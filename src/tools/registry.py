@@ -7,6 +7,7 @@ import logging
 from ..config import Config
 from ..infra.k8s_client import K8sClient
 from ..infra.aws_client import AWSClient
+from .correlation_read import create_correlation_read_tools
 from .k8s_read import create_k8s_read_tools
 from .k8s_write import create_k8s_write_tools
 from .aws_read import create_aws_read_tools
@@ -27,6 +28,7 @@ class ToolRegistry:
         self.k8s_write_tools: list = []
         self.aws_read_tools: list = []
         self.aws_write_tools: list = []
+        self.correlation_read_tools: list = []
 
         if k8s.available():
             self.k8s_read_tools = create_k8s_read_tools(k8s)
@@ -42,8 +44,12 @@ class ToolRegistry:
         else:
             log.warning("AWS credentials not available — AWS tools disabled")
 
+        if self.k8s_read_tools and self.aws_read_tools:
+            self.correlation_read_tools = create_correlation_read_tools(k8s, aws)
+            log.info("Correlation tools loaded: %d read", len(self.correlation_read_tools))
+
         # Aggregated views
-        self.read_tools = self.k8s_read_tools + self.aws_read_tools
+        self.read_tools = self.k8s_read_tools + self.aws_read_tools + self.correlation_read_tools
         self.write_tools = self.k8s_write_tools + self.aws_write_tools
         self.all_tools = self.read_tools + self.write_tools
 

@@ -74,6 +74,15 @@ def _render_aws_update_auto_scaling(args: dict) -> str:
     return " ".join(parts)
 
 
+def _render_aws_resume_auto_scaling_processes(args: dict) -> str:
+    parts = ["aws", "autoscaling", "resume-processes"]
+    _append_arg(parts, "--auto-scaling-group-name", args.get("asg_name", ""))
+    processes_csv = str(args.get("processes_csv", "") or "").strip()
+    if processes_csv:
+        parts.extend(["--scaling-processes", _quote(processes_csv)])
+    return " ".join(parts)
+
+
 def _render_aws_describe_instances(args: dict) -> str:
     params: dict[str, object] = {}
     filters = _parse_json_arg(args.get("filters_json"))
@@ -359,6 +368,44 @@ def _render_k8s_exec(args: dict) -> str:
     return " ".join(parts)
 
 
+def _render_k8s_restart_workload_safely(args: dict) -> str:
+    namespace = _default_namespace(str(args.get("namespace", "") or ""))
+    timeout_seconds = int(args.get("timeout_seconds", 300) or 300)
+    resource = f"{str(args.get('kind', '') or '').strip()}/{str(args.get('name', '') or '').strip()}"
+    return (
+        f"kubectl rollout restart {resource} -n {namespace} && "
+        f"kubectl rollout status {resource} -n {namespace} --timeout={timeout_seconds}s"
+    )
+
+
+def _render_k8s_cleanup_terminated_pods(args: dict) -> str:
+    phases_csv = str(args.get("phases_csv", "Failed,Unknown,Succeeded") or "Failed,Unknown,Succeeded").strip()
+    phases = [phase.strip() for phase in phases_csv.split(",") if phase.strip()]
+    namespace = str(args.get("namespace", "") or "").strip()
+    all_namespaces = bool(args.get("all_namespaces"))
+    if all_namespaces:
+        scope = "-A"
+    else:
+        scope = f"-n {_default_namespace(namespace)}"
+    commands = [
+        f"kubectl delete pods {scope} --field-selector=status.phase={phase} --ignore-not-found"
+        for phase in phases
+    ]
+    return " ; ".join(commands)
+
+
+def _render_infra_correlate_k8s_resource(args: dict) -> str:
+    kind = str(args.get("kind", "") or "").strip()
+    name = str(args.get("name", "") or "").strip()
+    namespace = str(args.get("namespace", "") or "").strip()
+    if kind == "node":
+        return f"kubectl get node {_quote(name)} -o json  # plus EC2/ASG correlation"
+    return (
+        f"kubectl get {kind} {_quote(name)} -n {_default_namespace(namespace)} -o json "
+        "# plus pod/node/EC2/ASG/storage correlation"
+    )
+
+
 def _fallback_preview(tool_name: str, args: dict) -> str:
     try:
         rendered_args = json.dumps(args or {}, sort_keys=True, default=str)
@@ -387,6 +434,7 @@ def _preview_for_tool(tool_name: str, args: dict) -> str:
             str(args.get("region", "") or ""),
         ),
         "aws_update_auto_scaling": lambda: _render_aws_update_auto_scaling(args),
+        "aws_resume_auto_scaling_processes": lambda: _render_aws_resume_auto_scaling_processes(args),
         "k8s_get_resources": lambda: _render_kubectl_get_resources(args),
         "k8s_describe_resource": lambda: _render_kubectl_describe(args),
         "k8s_get_pod_logs": lambda: _render_kubectl_logs(args),
@@ -405,6 +453,9 @@ def _preview_for_tool(tool_name: str, args: dict) -> str:
         "k8s_cordon_node": lambda: _render_k8s_cordon(args),
         "k8s_drain_node": lambda: _render_k8s_drain(args),
         "k8s_exec_in_pod": lambda: _render_k8s_exec(args),
+        "k8s_restart_workload_safely": lambda: _render_k8s_restart_workload_safely(args),
+        "k8s_cleanup_terminated_pods": lambda: _render_k8s_cleanup_terminated_pods(args),
+        "infra_correlate_k8s_resource": lambda: _render_infra_correlate_k8s_resource(args),
     }
     renderer = mapping.get(str(tool_name or "").strip())
     if renderer is None:

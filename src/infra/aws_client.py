@@ -750,6 +750,68 @@ class AWSClient:
         result.pop("ResponseMetadata", None)
         return json.dumps(result, indent=2)
 
+    def get_instance_details(
+        self,
+        *,
+        instance_id: str = "",
+        private_dns_name: str = "",
+        region: str | None = None,
+    ) -> dict[str, Any] | None | str:
+        ec2 = self._client("ec2", region=region)
+        kwargs: dict[str, Any] = {}
+        if instance_id:
+            kwargs["InstanceIds"] = [instance_id]
+        elif private_dns_name:
+            kwargs["Filters"] = [{"Name": "private-dns-name", "Values": [private_dns_name]}]
+        else:
+            return None
+
+        result = self._safe(ec2.describe_instances, **kwargs)
+        if isinstance(result, str):
+            return result
+        for reservation in result.get("Reservations", []):
+            for inst in reservation.get("Instances", []):
+                tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+                return {
+                    "instance_id": inst.get("InstanceId", ""),
+                    "state": str(inst.get("State", {}).get("Name", "") or ""),
+                    "instance_type": str(inst.get("InstanceType", "") or ""),
+                    "private_dns_name": str(inst.get("PrivateDnsName", "") or ""),
+                    "private_ip": str(inst.get("PrivateIpAddress", "") or ""),
+                    "availability_zone": str(inst.get("Placement", {}).get("AvailabilityZone", "") or ""),
+                    "launch_time": _format_timestamp(inst.get("LaunchTime")),
+                    "autoscaling_group_name": str(tags.get("aws:autoscaling:groupName", "") or ""),
+                    "tags": tags,
+                }
+        return None
+
+    def get_auto_scaling_group_details(self, asg_name: str) -> dict[str, Any] | None | str:
+        asg = self._client("autoscaling")
+        result = self._safe(asg.describe_auto_scaling_groups, AutoScalingGroupNames=[asg_name])
+        if isinstance(result, str):
+            return result
+        groups = result.get("AutoScalingGroups", [])
+        if not groups:
+            return None
+        group = groups[0]
+        return {
+            "name": str(group.get("AutoScalingGroupName", "") or ""),
+            "desired_capacity": group.get("DesiredCapacity"),
+            "min_size": group.get("MinSize"),
+            "max_size": group.get("MaxSize"),
+            "availability_zones": list(group.get("AvailabilityZones", []) or []),
+            "suspended_processes": [
+                str(item.get("ProcessName", "") or "")
+                for item in group.get("SuspendedProcesses", []) or []
+                if str(item.get("ProcessName", "") or "").strip()
+            ],
+            "instance_ids": [
+                str(item.get("InstanceId", "") or "")
+                for item in group.get("Instances", []) or []
+                if str(item.get("InstanceId", "") or "").strip()
+            ],
+        }
+
     def _lambda_recent_runs_from_logs(
         self,
         function_name: str,
@@ -1223,3 +1285,40 @@ class AWSClient:
         if isinstance(result, str):
             return result
         return f"Auto Scaling group '{asg_name}' updated successfully."
+
+    def resume_auto_scaling_processes(
+        self,
+        asg_name: str,
+        *,
+        processes: list[str] | None = None,
+    ) -> str:
+        before = self.get_auto_scaling_group_details(asg_name)
+        if isinstance(before, str):
+            return before
+        if before is None:
+            return f"ERROR: Auto Scaling group '{asg_name}' not found"
+
+        asg = self._client("autoscaling")
+        kwargs: dict[str, Any] = {"AutoScalingGroupName": asg_name}
+        if processes:
+            kwargs["ScalingProcesses"] = processes
+        result = self._safe(asg.resume_processes, **kwargs)
+        if isinstance(result, str):
+            return result
+
+        after = self.get_auto_scaling_group_details(asg_name)
+        if isinstance(after, str):
+            return after
+
+        before_set = set(before.get("suspended_processes", []))
+        requested = processes or sorted(before_set)
+        after_set = set((after or {}).get("suspended_processes", []))
+        resumed = [process for process in requested if process in before_set and process not in after_set]
+
+        payload = {
+            "asg_name": asg_name,
+            "requested_processes": requested,
+            "resumed_processes": resumed,
+            "remaining_suspended_processes": sorted(after_set),
+        }
+        return json.dumps(payload, indent=2)
