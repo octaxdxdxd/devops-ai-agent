@@ -53,10 +53,20 @@ def _safe_decimal(raw: object) -> Decimal | None:
         return None
 
 
-def _parse_cpu_to_mcpu(raw: object) -> int | None:
+def _parse_cpu_to_mcpu(raw: object) -> int | float | None:
     text = str(raw or "").strip()
     if not text:
         return None
+    if text.endswith("n"):
+        value = _safe_decimal(text[:-1])
+        if value is None:
+            return None
+        return round(float(value / Decimal(1_000_000)), 2)
+    if text.endswith("u"):
+        value = _safe_decimal(text[:-1])
+        if value is None:
+            return None
+        return round(float(value / Decimal(1000)), 2)
     if text.endswith("m"):
         value = _safe_decimal(text[:-1])
         return int(value) if value is not None else None
@@ -179,10 +189,24 @@ def _quantity_summary(values: dict) -> dict:
     return summary
 
 
-def _percent(numerator: int | None, denominator: int | None) -> float | None:
+def _percent(numerator: int | float | None, denominator: int | float | None) -> float | None:
     if numerator is None or denominator in (None, 0):
         return None
     return round((numerator / denominator) * 100, 2)
+
+
+def _format_cpu(value: int | float | None) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float) and not value.is_integer():
+        return f"{value:.2f}m"
+    return f"{int(value)}m"
+
+
+def _format_memory_mib(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.2f}Mi"
 
 
 class K8sClient:
@@ -375,6 +399,7 @@ class K8sClient:
         label_selector: str | None = None,
         all_namespaces: bool = False,
         include_usage: bool = True,
+        output_format: str = "auto",
     ) -> str:
         normalized_kind = _normalize_kind(kind)
         if normalized_kind not in _POD_KINDS | _WORKLOAD_KINDS:
@@ -430,7 +455,8 @@ class K8sClient:
             metrics_note=metrics_note,
             include_usage=include_usage,
         )
-        return json.dumps(summary, indent=2, sort_keys=False)
+        rendered = self._render_resource_usage_output(summary, output_format=output_format)
+        return rendered
 
     def _resolve_target_pods(
         self,
@@ -739,6 +765,105 @@ class K8sClient:
         }
         result["pods"] = pod_entries
         return result
+
+    def _render_resource_usage_output(self, summary: dict, *, output_format: str = "auto") -> str:
+        fmt = str(output_format or "auto").strip().lower()
+        pods = list(summary.get("pods") or [])
+        if fmt == "auto":
+            if len(pods) > 8 or bool(summary.get("query", {}).get("all_namespaces")):
+                fmt = "pod_table"
+            else:
+                fmt = "json"
+        if fmt == "json":
+            return json.dumps(summary, indent=2, sort_keys=False)
+        if fmt == "container_table":
+            return self._render_resource_usage_container_table(summary)
+        if fmt == "pod_table":
+            return self._render_resource_usage_pod_table(summary)
+        return json.dumps(summary, indent=2, sort_keys=False)
+
+    def _render_resource_usage_pod_table(self, summary: dict) -> str:
+        query = summary.get("query", {}) if isinstance(summary.get("query"), dict) else {}
+        totals = summary.get("summary", {}) if isinstance(summary.get("summary"), dict) else {}
+        total_requests = totals.get("total_requests", {}) if isinstance(totals.get("total_requests"), dict) else {}
+        total_limits = totals.get("total_limits", {}) if isinstance(totals.get("total_limits"), dict) else {}
+        total_usage = totals.get("total_usage", {}) if isinstance(totals.get("total_usage"), dict) else {}
+
+        lines = [
+            "Summary:",
+            f"- Pods analyzed: {totals.get('pods_analyzed', 0)}",
+            f"- Containers analyzed: {totals.get('containers_analyzed', 0)}",
+            f"- Total requests: CPU {_format_cpu(total_requests.get('cpu_mcpu'))}, Memory {_format_memory_mib(total_requests.get('memory_mib'))}",
+            f"- Total limits: CPU {_format_cpu(total_limits.get('cpu_mcpu'))}, Memory {_format_memory_mib(total_limits.get('memory_mib'))}",
+            f"- Total live usage: CPU {_format_cpu(total_usage.get('cpu_mcpu'))}, Memory {_format_memory_mib(total_usage.get('memory_mib'))}",
+        ]
+        metrics_note = str(summary.get("metrics_note") or "").strip()
+        if metrics_note:
+            lines.append(f"- Metrics note: {metrics_note}")
+        lines.extend(
+            [
+                "",
+                f"Query scope: kind={query.get('kind', '') or 'pod'}, namespace={query.get('namespace', '') or '(all/default)'}, all_namespaces={bool(query.get('all_namespaces'))}",
+                "",
+                "| Namespace | Pod | Containers | CPU Requests | Memory Requests | CPU Limits | Memory Limits | Live CPU | Live Memory |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for pod in summary.get("pods", []):
+            if not isinstance(pod, dict):
+                continue
+            pod_totals = pod.get("pod_totals", {}) if isinstance(pod.get("pod_totals"), dict) else {}
+            requests = pod_totals.get("requests", {}) if isinstance(pod_totals.get("requests"), dict) else {}
+            limits = pod_totals.get("limits", {}) if isinstance(pod_totals.get("limits"), dict) else {}
+            usage = pod_totals.get("usage", {}) if isinstance(pod_totals.get("usage"), dict) else {}
+            lines.append(
+                "| {namespace} | {name} | {containers} | {cpu_req} | {mem_req} | {cpu_lim} | {mem_lim} | {cpu_use} | {mem_use} |".format(
+                    namespace=str(pod.get("namespace", "") or ""),
+                    name=str(pod.get("name", "") or ""),
+                    containers=len(pod.get("containers", []) or []),
+                    cpu_req=_format_cpu(requests.get("cpu_mcpu")),
+                    mem_req=_format_memory_mib(requests.get("memory_mib")),
+                    cpu_lim=_format_cpu(limits.get("cpu_mcpu")),
+                    mem_lim=_format_memory_mib(limits.get("memory_mib")),
+                    cpu_use=_format_cpu(usage.get("cpu_mcpu")),
+                    mem_use=_format_memory_mib(usage.get("memory_mib")),
+                )
+            )
+        return "\n".join(lines).strip()
+
+    def _render_resource_usage_container_table(self, summary: dict) -> str:
+        totals = summary.get("summary", {}) if isinstance(summary.get("summary"), dict) else {}
+        lines = [
+            "Summary:",
+            f"- Pods analyzed: {totals.get('pods_analyzed', 0)}",
+            f"- Containers analyzed: {totals.get('containers_analyzed', 0)}",
+            "",
+            "| Namespace | Pod | Container | CPU Requests | Memory Requests | CPU Limits | Memory Limits | Live CPU | Live Memory |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for pod in summary.get("pods", []):
+            if not isinstance(pod, dict):
+                continue
+            for container in pod.get("containers", []):
+                if not isinstance(container, dict):
+                    continue
+                requests = container.get("requests", {}) if isinstance(container.get("requests"), dict) else {}
+                limits = container.get("limits", {}) if isinstance(container.get("limits"), dict) else {}
+                usage = container.get("usage", {}) if isinstance(container.get("usage"), dict) else {}
+                lines.append(
+                    "| {namespace} | {pod} | {container} | {cpu_req} | {mem_req} | {cpu_lim} | {mem_lim} | {cpu_use} | {mem_use} |".format(
+                        namespace=str(pod.get("namespace", "") or ""),
+                        pod=str(pod.get("name", "") or ""),
+                        container=str(container.get("name", "") or ""),
+                        cpu_req=_format_cpu(requests.get("cpu_mcpu")),
+                        mem_req=_format_memory_mib(requests.get("memory_mib")),
+                        cpu_lim=_format_cpu(limits.get("cpu_mcpu")),
+                        mem_lim=_format_memory_mib(limits.get("memory_mib")),
+                        cpu_use=_format_cpu(usage.get("cpu_mcpu")),
+                        mem_use=_format_memory_mib(usage.get("memory_mib")),
+                    )
+                )
+        return "\n".join(lines).strip()
 
     # ── write operations ─────────────────────────────────────────────────
 

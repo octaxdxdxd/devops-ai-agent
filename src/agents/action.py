@@ -40,6 +40,7 @@ Proposal format:
   - `{{"command":"kubectl ...","display":"kubectl ..."}}`
   - `{{"tool":"actual_write_tool_name","args":{{...}},"display":"operator-facing summary"}}`
 - Read tools are for investigation only. Do not put read tools like `aws_describe_service` or `k8s_get_resources` into `commands_json`.
+- `aws_run_api_command` is mutation-only in approval steps. Never use it for `describe_*`, `get_*`, `list_*`, `lookup_*`, or other discovery calls; resolve identifiers with read tools first.
 - Prefer typed write tools over raw `kubectl` commands whenever a matching tool exists.
 - Use real names you discovered. Never use placeholders like `<name>`, `REPLACE_ME`, or "replace this".
 - If Kubernetes cannot do the change, use the right AWS/K8s write tool instead of inventing a kubectl resource.
@@ -62,6 +63,7 @@ _PLACEHOLDER_RE = re.compile(
     r"\b(?:placeholder|replace[-_ ]?me|fill[-_ ]?me|example[-_ ]?(?:name|id))\b",
     re.IGNORECASE,
 )
+_READ_ONLY_AWS_OPERATION_RE = re.compile(r"^(describe|get|list|lookup|head|batch_get)_", re.IGNORECASE)
 _SHELL_OPERATOR_TOKENS = ("&&", "||", "|", ">", "<", ";", "&", "$(", "`", "\n", "\r")
 
 
@@ -262,6 +264,52 @@ def _build_write_tool_help(write_tool_map: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+_REQUIRED_NON_EMPTY_TOOL_ARGS: dict[str, tuple[str, ...]] = {
+    "aws_run_api_command": ("service", "operation"),
+    "aws_update_auto_scaling": ("asg_name",),
+    "aws_resume_auto_scaling_processes": ("asg_name",),
+    "k8s_exec_in_pod": ("pod", "command"),
+    "k8s_scale_resource": ("kind", "name"),
+    "k8s_rollout_restart": ("kind", "name"),
+    "k8s_rollout_undo": ("kind", "name"),
+    "k8s_delete_resource": ("kind", "name"),
+}
+
+
+def _validate_required_tool_args(tool_name: str, args: object, step_index: int) -> str | None:
+    if not isinstance(args, dict):
+        return f"step {step_index} tool '{tool_name}' must include an args object."
+
+    required_fields = _REQUIRED_NON_EMPTY_TOOL_ARGS.get(tool_name, ())
+    for field in required_fields:
+        value = args.get(field)
+        if value is None:
+            return f"step {step_index} tool '{tool_name}' is missing required arg '{field}'."
+        if isinstance(value, str) and not value.strip():
+            return f"step {step_index} tool '{tool_name}' has empty required arg '{field}'."
+
+    return None
+
+
+def _is_read_only_aws_operation(operation: str) -> bool:
+    return bool(_READ_ONLY_AWS_OPERATION_RE.match(str(operation or "").strip()))
+
+
+def _validate_tool_step_semantics(tool_name: str, args: object, step_index: int) -> str | None:
+    if not isinstance(args, dict):
+        return None
+
+    if tool_name == "aws_run_api_command":
+        operation = str(args.get("operation", "") or "").strip()
+        if operation and _is_read_only_aws_operation(operation):
+            return (
+                f"step {step_index} tool 'aws_run_api_command' cannot be used for read-only AWS operation "
+                f"'{operation}'. Resolve identifiers with read tools before proposing the action."
+            )
+
+    return None
+
+
 def _validate_proposed_steps(steps: list[dict], allowed_write_tool_names: set[str]) -> str | None:
     if not steps:
         return "commands_json must contain at least one action step."
@@ -291,6 +339,12 @@ def _validate_proposed_steps(steps: list[dict], allowed_write_tool_names: set[st
             if tool_name not in allowed_write_tool_names:
                 allowed = ", ".join(sorted(allowed_write_tool_names)) or "no write tools available"
                 return f"step {index} tool '{tool_name}' is not an allowed write tool. Allowed tools: {allowed}."
+            tool_arg_error = _validate_required_tool_args(tool_name, step.get("args", {}), index)
+            if tool_arg_error:
+                return tool_arg_error
+            tool_semantic_error = _validate_tool_step_semantics(tool_name, step.get("args", {}), index)
+            if tool_semantic_error:
+                return tool_semantic_error
             policy_error = guard_tool_invocation(tool_name, step.get("args", {}), write=True)
             if policy_error:
                 return f"step {index}: {policy_error}"

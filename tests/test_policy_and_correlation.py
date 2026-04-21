@@ -4,7 +4,7 @@ import json
 
 from src.agents.action import _validate_proposed_steps
 from src.config import Config
-from src.infra.k8s_client import K8sClient
+from src.infra.k8s_client import K8sClient, _parse_cpu_to_mcpu
 from src.tools.aws_write import create_aws_write_tools
 from src.tools.command_preview import render_tool_call_preview
 from src.tools.correlation_read import create_correlation_read_tools
@@ -226,6 +226,74 @@ class _FakeK8sUsageClient(K8sClient):
         }
 
 
+class _FakeK8sAllPodsUsageClient(K8sClient):
+    def __init__(self) -> None:
+        pass
+
+    def list_resources_json(
+        self,
+        kind: str,
+        namespace: str | None = None,
+        label_selector: str | None = None,
+        all_namespaces: bool = False,
+    ):
+        assert kind == "pod"
+        assert all_namespaces is True
+        return {
+            "items": [
+                {
+                    "metadata": {"name": "api-a", "namespace": "apps"},
+                    "spec": {
+                        "nodeName": "node-a",
+                        "containers": [
+                            {
+                                "name": "api",
+                                "image": "example/api:1",
+                                "resources": {
+                                    "requests": {"cpu": "250m", "memory": "512Mi"},
+                                    "limits": {"cpu": "500m", "memory": "1024Mi"},
+                                },
+                            }
+                        ],
+                    },
+                    "status": {"phase": "Running"},
+                },
+                {
+                    "metadata": {"name": "api-b", "namespace": "apps"},
+                    "spec": {
+                        "nodeName": "node-b",
+                        "containers": [
+                            {
+                                "name": "api",
+                                "image": "example/api:1",
+                                "resources": {
+                                    "requests": {"cpu": "100m", "memory": "256Mi"},
+                                    "limits": {},
+                                },
+                            }
+                        ],
+                    },
+                    "status": {"phase": "Running"},
+                },
+            ]
+        }
+
+    def get_pod_metrics_json(self, namespace: str | None = None, *, all_namespaces: bool = False):
+        assert all_namespaces is True
+        return {
+            "items": [
+                {
+                    "metadata": {"name": "api-a", "namespace": "apps"},
+                    "containers": [{"name": "api", "usage": {"cpu": "4745627n", "memory": "145Mi"}}],
+                },
+                {
+                    "metadata": {"name": "api-b", "namespace": "apps"},
+                    "containers": [{"name": "api", "usage": {"cpu": "10619313n", "memory": "24Mi"}}],
+                },
+            ]
+        }
+
+
 def test_policy_blocks_raw_kubectl_write_commands_when_allow_all_write_disabled() -> None:
     previous_allow = Config.K8S_CLI_ALLOW_ALL_WRITE
     previous_posture = Config.COMMAND_SAFETY_POSTURE
@@ -403,3 +471,25 @@ def test_k8s_read_tool_exposes_structured_resource_usage_analysis() -> None:
 
     assert data["query"]["name"] == "gitlab-webservice-default"
     assert data["pods"][0]["containers"][0]["requests"]["cpu_mcpu"] == 500
+
+
+def test_parse_cpu_to_mcpu_supports_nanocores_and_microcores() -> None:
+    assert _parse_cpu_to_mcpu("4745627n") == 4.75
+    assert _parse_cpu_to_mcpu("10619313n") == 10.62
+    assert _parse_cpu_to_mcpu("250u") == 0.25
+
+
+def test_k8s_analyze_resource_usage_auto_renders_compact_pod_table_for_large_all_pods_queries() -> None:
+    client = _FakeK8sAllPodsUsageClient()
+
+    result = client.analyze_resource_usage(
+        kind="pod",
+        all_namespaces=True,
+        include_usage=True,
+        output_format="auto",
+    )
+
+    assert "| Namespace | Pod | Containers | CPU Requests | Memory Requests | CPU Limits | Memory Limits | Live CPU | Live Memory |" in result
+    assert "| apps | api-a | 1 | 250m | 512.00Mi | 500m | 1024.00Mi | 4.75m | 145.00Mi |" in result
+    assert "| apps | api-b | 1 | 100m | 256.00Mi | — | — | 10.62m | 24.00Mi |" in result
+    assert "- Total live usage: CPU 15.37m, Memory 169.00Mi" in result

@@ -286,6 +286,7 @@ def _render_k8s_analyze_resource_usage(args: dict) -> str:
     label_selector = str(args.get("label_selector", "") or "").strip()
     all_namespaces = bool(args.get("all_namespaces"))
     include_usage = bool(args.get("include_usage", True))
+    output_format = str(args.get("output_format", "auto") or "auto").strip()
 
     parts = ["kubectl", "get", kind]
     if name:
@@ -298,8 +299,8 @@ def _render_k8s_analyze_resource_usage(args: dict) -> str:
         _append_arg(parts, "-n", _default_namespace(str(args.get("namespace", "") or "")))
     parts.extend(["-o", "json"])
     if include_usage:
-        return f"{' '.join(parts)}  # plus metrics.k8s.io pod usage / kubectl top --containers"
-    return " ".join(parts)
+        return f"{' '.join(parts)}  # plus metrics.k8s.io pod usage / kubectl top --containers (format={output_format})"
+    return f"{' '.join(parts)}  # format={output_format}"
 
 
 def _render_kubectl_rollout_history(args: dict) -> str:

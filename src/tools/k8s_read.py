@@ -241,6 +241,7 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
         label_selector: str = "",
         all_namespaces: bool = False,
         include_usage: bool = True,
+        output_format: str = "auto",
     ) -> str:
         """Analyze exact pod/workload requests, limits, and live usage without relying on truncated YAML.
 
@@ -254,6 +255,7 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             label_selector: Label filter for list-style analysis
             all_namespaces: Set True to analyze across all namespaces
             include_usage: Include live CPU/memory usage via metrics API when available
+            output_format: 'auto', 'pod_table', 'container_table', or 'json'
         """
         policy_error = guard_k8s_read_tool(
             "k8s_analyze_resource_usage",
@@ -270,6 +272,7 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
                 label_selector=label_selector or None,
                 all_namespaces=all_namespaces,
                 include_usage=include_usage,
+                output_format=output_format or "auto",
             ),
             max_lines=220,
             max_chars=16000,
