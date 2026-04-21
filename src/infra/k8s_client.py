@@ -38,6 +38,7 @@ class K8sClient:
         args: list[str],
         namespace: str | None = None,
         timeout: int = 30,
+        include_stderr_on_success: bool = False,
     ) -> str:
         cmd = self._base_cmd()
         if namespace:
@@ -53,7 +54,11 @@ class K8sClient:
             )
             if result.returncode != 0:
                 return f"ERROR: {result.stderr.strip()}"
-            return result.stdout.strip()
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            if include_stderr_on_success and stderr:
+                return "\n".join(part for part in (stdout, stderr) if part)
+            return stdout
         except subprocess.TimeoutExpired:
             return f"ERROR: Command timed out after {timeout}s"
         except FileNotFoundError:
@@ -227,6 +232,60 @@ class K8sClient:
             timeout=grace_period + 30,
         )
 
+    def _validate_exec_target(
+        self,
+        pod: str,
+        namespace: str | None = None,
+        container: str | None = None,
+    ) -> str | None:
+        pod_data = self.get_resource_json("pod", pod, namespace or self.namespace)
+        if isinstance(pod_data, str):
+            return pod_data
+
+        containers = [
+            str(item.get("name", "") or "").strip()
+            for item in pod_data.get("spec", {}).get("containers", [])
+            if str(item.get("name", "") or "").strip()
+        ]
+        if container:
+            if container not in containers:
+                valid = ", ".join(containers) or "<none>"
+                return (
+                    f"ERROR: container '{container}' is not valid for pod '{pod}'. "
+                    f"Valid containers: {valid}"
+                )
+        elif len(containers) > 1:
+            return (
+                f"ERROR: pod '{pod}' has multiple containers. "
+                f"Specify one of: {', '.join(containers)}"
+            )
+        return None
+
+    def exec_args(
+        self,
+        pod: str,
+        command_args: list[str],
+        namespace: str | None = None,
+        container: str | None = None,
+        *,
+        timeout: int = 30,
+        include_stderr_on_success: bool = False,
+    ) -> str:
+        target_error = self._validate_exec_target(pod, namespace, container)
+        if target_error:
+            return target_error
+        args = ["exec", pod]
+        if container:
+            args.extend(["-c", container])
+        args.append("--")
+        args.extend(command_args)
+        return self.run(
+            args,
+            namespace=namespace or self.namespace,
+            timeout=timeout,
+            include_stderr_on_success=include_stderr_on_success,
+        )
+
     def exec_command(
         self,
         pod: str,
@@ -234,12 +293,14 @@ class K8sClient:
         namespace: str | None = None,
         container: str | None = None,
     ) -> str:
-        args = ["exec", pod]
-        if container:
-            args.extend(["-c", container])
-        args.append("--")
-        args.extend(shlex.split(command))
-        return self.run(args, namespace=namespace or self.namespace, timeout=30)
+        return self.exec_args(
+            pod,
+            shlex.split(command),
+            namespace=namespace,
+            container=container,
+            timeout=30,
+            include_stderr_on_success=True,
+        )
 
     def rollout_status(self, kind: str, name: str, namespace: str | None = None, timeout_seconds: int = 300) -> str:
         return self.run(

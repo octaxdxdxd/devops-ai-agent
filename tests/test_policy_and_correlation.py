@@ -4,9 +4,11 @@ import json
 
 from src.agents.action import _validate_proposed_steps
 from src.config import Config
+from src.infra.k8s_client import K8sClient
 from src.tools.aws_write import create_aws_write_tools
 from src.tools.command_preview import render_tool_call_preview
 from src.tools.correlation_read import create_correlation_read_tools
+from src.tools.k8s_read import create_k8s_read_tools
 
 
 class _FakeAWSWrite:
@@ -100,6 +102,49 @@ class _FakeAWSCorrelation:
         }
 
 
+class _FakeK8sReadOnly:
+    def run(self, args):  # pragma: no cover - should not be called for blocked writes
+        raise AssertionError("read-only kubectl wrapper should not execute blocked write commands")
+
+
+class _FakeK8sExecClient(K8sClient):
+    def __init__(self) -> None:
+        pass
+
+    def get_resource_json(self, kind: str, name: str, namespace: str | None = None):
+        assert kind == "pod"
+        return {
+            "spec": {
+                "containers": [
+                    {"name": "ingress-controller"},
+                    {"name": "proxy"},
+                ]
+            }
+        }
+
+    def run(self, args, namespace: str | None = None, timeout: int = 30) -> str:  # pragma: no cover - should not be called on invalid container
+        raise AssertionError("kubectl exec should not run when the container name is invalid")
+
+
+class _FakeK8sExecStdErrClient(K8sClient):
+    def __init__(self) -> None:
+        pass
+
+    def get_resource_json(self, kind: str, name: str, namespace: str | None = None):
+        assert kind == "pod"
+        return {"spec": {"containers": [{"name": "nexus-repository-manager"}]}}
+
+    def run(
+        self,
+        args,
+        namespace: str | None = None,
+        timeout: int = 30,
+        include_stderr_on_success: bool = False,
+    ) -> str:
+        assert include_stderr_on_success is True
+        return "sh: line 1: wget: command not found"
+
+
 def test_policy_blocks_raw_kubectl_write_commands_when_allow_all_write_disabled() -> None:
     previous_allow = Config.K8S_CLI_ALLOW_ALL_WRITE
     previous_posture = Config.COMMAND_SAFETY_POSTURE
@@ -162,3 +207,72 @@ def test_command_preview_renders_typed_restart_workflow() -> None:
     assert "kubectl rollout restart deployment/api -n prod" in preview
     assert "kubectl rollout status deployment/api -n prod --timeout=180s" in preview
     assert language == "bash"
+
+
+def test_k8s_run_kubectl_reports_exec_subcommand_and_typed_tool_guidance() -> None:
+    previous_allow = Config.K8S_CLI_ALLOW_ALL_READ
+    try:
+        Config.K8S_CLI_ALLOW_ALL_READ = True
+        tools = {tool.name: tool for tool in create_k8s_read_tools(_FakeK8sReadOnly())}
+        result = tools["k8s_run_kubectl"].invoke(
+            {
+                "command": "-n kong exec kong-kong-abc123 -c proxy -- curl -fsS http://127.0.0.1:8100/status/ready",
+            }
+        )
+    finally:
+        Config.K8S_CLI_ALLOW_ALL_READ = previous_allow
+
+    assert "'kubectl exec' is a mutating operation" in result
+    assert "typed write tool `k8s_exec_in_pod`" in result
+    assert '"namespace": "kong"' in result
+    assert '"pod": "kong-kong-abc123"' in result
+    assert '"container": "proxy"' in result
+    assert '"command": "curl -fsS http://127.0.0.1:8100/status/ready"' in result
+
+
+def test_k8s_run_kubectl_exec_with_shell_operators_still_returns_typed_exec_guidance() -> None:
+    previous_allow = Config.K8S_CLI_ALLOW_ALL_READ
+    try:
+        Config.K8S_CLI_ALLOW_ALL_READ = True
+        tools = {tool.name: tool for tool in create_k8s_read_tools(_FakeK8sReadOnly())}
+        result = tools["k8s_run_kubectl"].invoke(
+            {
+                "command": "exec -n nexus nexus-nexus-repository-manager-5fc4cdf4c7-krks4 -- sh -lc 'wget -qO- http://127.0.0.1:8081/ >/dev/null && echo OK || (echo FAIL; exit 1)'",
+            }
+        )
+    finally:
+        Config.K8S_CLI_ALLOW_ALL_READ = previous_allow
+
+    assert "'kubectl exec' is a mutating operation" in result
+    assert "typed write tool `k8s_exec_in_pod`" in result
+    assert '"namespace": "nexus"' in result
+    assert '"pod": "nexus-nexus-repository-manager-5fc4cdf4c7-krks4"' in result
+    assert '"command": "sh -lc' in result
+    assert "wget -qO- http://127.0.0.1:8081/" in result
+
+
+def test_k8s_exec_preflights_container_name_before_running() -> None:
+    client = _FakeK8sExecClient()
+
+    result = client.exec_command(
+        "kong-kong-abc123",
+        "curl -fsS http://127.0.0.1:8100/status/ready",
+        namespace="kong",
+        container="kong",
+    )
+
+    assert "container 'kong' is not valid for pod 'kong-kong-abc123'" in result
+    assert "ingress-controller, proxy" in result
+
+
+def test_k8s_exec_command_preserves_stderr_on_success_path() -> None:
+    client = _FakeK8sExecStdErrClient()
+
+    result = client.exec_command(
+        "nexus-nexus-repository-manager-5fc4cdf4c7-krks4",
+        "sh -lc 'wget -qO- http://127.0.0.1:8081/service/rest/v1/status || curl -fsS http://127.0.0.1:8081/service/rest/v1/status'",
+        namespace="nexus",
+        container="nexus-repository-manager",
+    )
+
+    assert "wget: command not found" in result

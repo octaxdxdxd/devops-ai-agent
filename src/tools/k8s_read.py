@@ -2,11 +2,118 @@
 
 from __future__ import annotations
 
+import json
+import shlex
+
 from langchain_core.tools import tool
 
 from ..infra.k8s_client import K8sClient
-from ..policy import guard_k8s_read_tool
+from ..policy import guard_k8s_read_tool, parse_kubectl_command
 from .output import compress_output
+
+
+_GLOBAL_FLAG_NAMES = frozenset({
+    "-n",
+    "--namespace",
+    "-A",
+    "--all-namespaces",
+    "--context",
+    "--cluster",
+    "--user",
+    "--server",
+    "--kubeconfig",
+    "--as",
+    "--as-group",
+    "--token",
+    "--request-timeout",
+})
+
+
+def _extract_exec_args(command: str) -> dict[str, str]:
+    metadata = parse_kubectl_command(command)
+    args = list(metadata.get("subcommand_args", []))
+    namespace = str(metadata.get("namespace", "") or "")
+    pod = ""
+    container = ""
+    command_parts: list[str] = []
+
+    index = 0
+    while index < len(args):
+        part = args[index]
+        if part == "--":
+            command_parts = args[index + 1 :]
+            break
+        if part in {"-n", "--namespace"} and index + 1 < len(args):
+            namespace = args[index + 1]
+            index += 2
+            continue
+        if part.startswith("--namespace="):
+            namespace = part.split("=", 1)[1]
+            index += 1
+            continue
+        if part in _GLOBAL_FLAG_NAMES:
+            index += 2 if part in {"-n", "--namespace", "--context", "--cluster", "--user", "--server", "--kubeconfig", "--as", "--as-group", "--token", "--request-timeout"} else 1
+            continue
+        if part in {"-c", "--container"} and index + 1 < len(args):
+            container = args[index + 1]
+            index += 2
+            continue
+        if part.startswith("--container="):
+            container = part.split("=", 1)[1]
+            index += 1
+            continue
+        if part.startswith("-"):
+            index += 1
+            continue
+        if not pod:
+            pod = part
+        index += 1
+
+    result = {
+        "pod": pod,
+        "command": shlex.join(command_parts) if command_parts else "",
+    }
+    if namespace:
+        result["namespace"] = namespace
+    if container:
+        result["container"] = container
+    return result
+
+
+def _typed_write_guidance_for_kubectl(command: str) -> str:
+    metadata = parse_kubectl_command(command)
+    subcommand = str(metadata.get("subcommand", "") or "").strip().lower()
+    if not subcommand:
+        return ""
+    if subcommand == "exec":
+        args = _extract_exec_args(command)
+        if not args.get("pod") or not args.get("command"):
+            return (
+                "Use the approval-gated typed write tool `k8s_exec_in_pod` instead of raw kubectl exec. "
+                "Provide the pod name, namespace, optional container name, and the exact command."
+            )
+        return (
+            "This command maps to typed write tool `k8s_exec_in_pod`. "
+            f"Use `propose_action` with args {json.dumps(args, sort_keys=True)} instead of raw kubectl."
+        )
+    if subcommand == "scale":
+        return "This command maps to typed write tool `k8s_scale`."
+    if subcommand == "delete":
+        return "This command maps to typed write tool `k8s_delete_resource`."
+    if subcommand == "apply":
+        return "This command maps to typed write tool `k8s_apply_manifest`."
+    if subcommand in {"cordon", "uncordon"}:
+        return "This command maps to typed write tool `k8s_cordon_node`."
+    if subcommand == "drain":
+        return "This command maps to typed write tool `k8s_drain_node`."
+    if subcommand == "rollout":
+        sub_args = list(metadata.get("subcommand_args", []))
+        rollout_op = str(sub_args[0] if sub_args else "").strip().lower()
+        if rollout_op == "restart":
+            return "This command maps to typed write tool `k8s_restart_workload_safely` or `k8s_rollout_restart`."
+        if rollout_op == "undo":
+            return "This command maps to typed write tool `k8s_rollout_undo`."
+    return "Use an approval-gated typed write tool instead of raw kubectl."
 
 
 def create_k8s_read_tools(k8s: K8sClient) -> list:
@@ -191,25 +298,28 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
         policy_error = guard_k8s_read_tool("k8s_run_kubectl", command=command)
         if policy_error:
             return f"ERROR: {policy_error}"
-        import shlex as _shlex
         try:
-            parts = _shlex.split(command.strip())
+            parts = shlex.split(command.strip())
         except ValueError as exc:
             return f"ERROR: Invalid command syntax: {exc}"
         if not parts:
             return "ERROR: Empty command"
+        metadata = parse_kubectl_command(command)
+        subcommand = str(metadata.get("subcommand", "") or "").strip().lower()
+        if not subcommand:
+            return "ERROR: Could not determine kubectl subcommand from command input."
         # Safety: reject shell operators
         dangerous = ["|", ">", "<", ";", "&", "$(", "`"]
-        if any(d in command for d in dangerous):
-            return "ERROR: Command contains potentially dangerous shell operators"
+        has_dangerous_shell_operators = any(d in command for d in dangerous)
         # Safety: block mutating commands — only read-only subcommands allowed
-        subcommand = parts[0].lower()
         if subcommand not in _KUBECTL_READ_SUBCOMMANDS:
+            guidance = _typed_write_guidance_for_kubectl(command)
             return (
                 f"ERROR: 'kubectl {subcommand}' is a mutating operation and is blocked in read-only mode. "
-                "To modify infrastructure, describe what change is needed and the user "
-                "can request it as an action (which goes through the approval flow)."
+                f"{guidance} Do not provide raw kubectl commands for approval when a typed write tool exists."
             )
+        if has_dangerous_shell_operators:
+            return "ERROR: Command contains potentially dangerous shell operators"
         return compress_output(k8s.run(parts))
 
     return [

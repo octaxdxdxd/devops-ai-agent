@@ -5,11 +5,12 @@ from types import SimpleNamespace
 from langchain_core.messages import HumanMessage
 
 import src.agents.orchestrator as orchestrator_module
-from src.agents.action import PendingAction, _create_propose_action_tool, format_action_step_preview
+from src.agents.action import PendingAction, _create_propose_action_tool, format_action_step_preview, handle_action
 from src.agents.base import run_tool_loop
 from src.agents.diagnose import handle_diagnose
 from src.agents.explain import handle_explain
 from src.agents.orchestrator import AIOpsAgent
+from src.tools.registry import ToolRegistry
 from src.tools.aws_read import create_aws_read_tools
 from src.tracing.tracer import Tracer
 
@@ -492,3 +493,46 @@ def test_maybe_plan_fix_from_diagnosis_creates_pending_action() -> None:
     assert "Proposed Fix" in note
     assert agent.pending_actions[0].description == "Restart deployment safely"
     assert captured_statuses == ["Planning remediation from RCA..."]
+
+
+def test_handle_action_does_not_auto_extract_manual_kubectl_code_blocks() -> None:
+    llm = _FakeLLM(
+        [
+            _FakeResponse(
+                content=(
+                    "I cannot run that from here.\n\n"
+                    "```bash\n"
+                    "kubectl -n kong exec kong-pod -- curl -fsS http://127.0.0.1:8100/status/ready\n"
+                    "```"
+                )
+            )
+        ]
+    )
+
+    response_text, actions = handle_action(
+        "exec into kong and run a healthcheck",
+        [],
+        llm,
+        {},
+        {},
+        "test-model",
+        Tracer(),
+    )
+
+    assert "cannot run that from here" in response_text.lower()
+    assert actions == []
+
+
+def test_tool_registry_blocks_write_tool_execution_without_approval() -> None:
+    registry = object.__new__(ToolRegistry)
+    write_tool = _CountingTool("ok")
+    write_tool.name = "k8s_exec_in_pod"
+    registry.write_tools = [write_tool]
+    registry.tool_map = {write_tool.name: write_tool}
+
+    blocked = registry.execute("k8s_exec_in_pod", {"pod": "api-123", "command": "whoami"})
+    allowed = registry.execute("k8s_exec_in_pod", {"pod": "api-123", "command": "whoami"}, approved=True)
+
+    assert blocked == "ERROR: Tool 'k8s_exec_in_pod' requires explicit approval before execution."
+    assert allowed == "ok"
+    assert write_tool.calls == [{"pod": "api-123", "command": "whoami"}]

@@ -296,7 +296,7 @@ class AIOpsAgent:
                     result = self._run_approved_command(legacy_cmd)
                     trace_tool_name = "kubectl"
                 elif tool_name:
-                    result = self.tools.execute(tool_name, cmd.get("args", {}))
+                    result = self.tools.execute(tool_name, cmd.get("args", {}), approved=True)
                     trace_tool_name = tool_name
                 else:
                     result = f"ERROR: No command or tool specified in: {cmd}"
@@ -329,7 +329,7 @@ class AIOpsAgent:
                 # Legacy format: {"tool": "...", "args": {...}}
                 v_tool = action.verification.get("tool", "")
                 v_args = action.verification.get("args", {})
-                v_result = self.tools.execute(v_tool, v_args) if v_tool else "No verification command"
+                v_result = self.tools.execute(v_tool, v_args, approved=True) if v_tool else "No verification command"
                 trace_tool_name = v_tool or "unknown"
 
             self.tracer.step(

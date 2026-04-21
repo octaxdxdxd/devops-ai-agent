@@ -32,6 +32,7 @@ Workflow:
 - If a lookup fails, try other namespaces, labels, parents, or AWS regions.
 - Call `propose_action` once you have the minimal safe plan.
 - Never execute changes directly.
+- If a read tool says a kubectl command is blocked because it is mutating, do not suggest manual kubectl commands. Convert it into a typed write-tool proposal with `propose_action`.
 
 Proposal format:
 - `commands_json` must be valid JSON.
@@ -50,6 +51,8 @@ Allowed write tools for proposal steps:
 Rules:
 - Propose the minimum effective change.
 - Prefer `kubectl rollout restart` on a parent workload over deleting a pod directly.
+- For `k8s_exec_in_pod`, prefer a single direct command when possible. Only use `sh -lc` when multiple shell operations are genuinely required.
+- If the target pod has multiple containers, inspect the pod spec first and pass the exact container name.
 - Do not repeat the same read tool call with identical arguments. If a path stays empty or errors, switch discovery paths or state the uncertainty.
 - Risk must be LOW, MEDIUM, HIGH, or CRITICAL.
 - After proposing, summarize briefly without placeholders or fill-in-the-blank notes."""
@@ -106,17 +109,25 @@ def _normalize_action_step(raw_step: object) -> dict:
         return {"display": text} if text else {}
 
     step: dict[str, object] = {}
+    parse_error = str(raw_step.get("_parse_error", "") or "").strip()
     command = str(raw_step.get("command", "") or "").strip()
     display = str(raw_step.get("display", "") or "").strip()
     tool_name = str(raw_step.get("tool", "") or "").strip()
+    args = raw_step.get("args", {})
+    if tool_name and not display and isinstance(args, dict):
+        nested_display = str(args.get("display", "") or "").strip()
+        if nested_display:
+            display = nested_display
+            args = {key: value for key, value in args.items() if key != "display"}
 
+    if parse_error:
+        step["_parse_error"] = parse_error
     if command:
         step["command"] = command
     if display:
         step["display"] = display
     if tool_name:
         step["tool"] = tool_name
-        args = raw_step.get("args", {})
         step["args"] = args if isinstance(args, dict) else {}
     return step
 
@@ -142,14 +153,88 @@ def format_action_step_preview(step: dict) -> tuple[str, str, str]:
     return render_action_step_preview(step)
 
 
-def _parse_proposed_steps(commands_json: str) -> list[dict]:
+def _looks_like_serialized_steps(value: object) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("[") or text.startswith("{")
+
+
+def _parse_jsonish_step_objects(raw_text: str) -> list[object]:
+    text = str(raw_text or "").strip()
+    if not text.startswith("["):
+        return []
+
+    in_string = False
+    escape = False
+    brace_depth = 0
+    object_start: int | None = None
+    chunks: list[str] = []
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if brace_depth == 0:
+                object_start = index
+            brace_depth += 1
+            continue
+        if char == "}":
+            if brace_depth > 0:
+                brace_depth -= 1
+                if brace_depth == 0 and object_start is not None:
+                    chunks.append(text[object_start : index + 1])
+                    object_start = None
+
+    if object_start is not None:
+        partial = text[object_start:].rstrip()
+        if partial.endswith("]"):
+            partial = partial[:-1].rstrip()
+        if partial.endswith(","):
+            partial = partial[:-1].rstrip()
+        if brace_depth > 0:
+            partial += "}" * brace_depth
+        chunks.append(partial)
+
+    parsed_steps: list[object] = []
+    for chunk in chunks:
+        candidate = chunk.strip()
+        if not candidate:
+            continue
+        try:
+            parsed_steps.append(json.loads(candidate))
+            continue
+        except (json.JSONDecodeError, TypeError):
+            pass
+        try:
+            parsed_steps.append(ast.literal_eval(candidate))
+        except (SyntaxError, ValueError):
+            continue
+    return parsed_steps
+
+
+def _parse_proposed_steps(commands_json: object) -> list[dict]:
     try:
         raw_steps = json.loads(commands_json)
     except (json.JSONDecodeError, TypeError):
         try:
             raw_steps = ast.literal_eval(commands_json)
         except (SyntaxError, ValueError):
-            raw_steps = commands_json
+            salvaged_steps = _parse_jsonish_step_objects(str(commands_json or ""))
+            if salvaged_steps:
+                raw_steps = salvaged_steps
+            elif _looks_like_serialized_steps(commands_json):
+                raw_steps = [{"_parse_error": "commands_json must be valid JSON or a recoverable JSON-like array of action steps."}]
+            else:
+                raw_steps = commands_json
     return _normalize_action_steps(raw_steps)
 
 
@@ -182,11 +267,14 @@ def _validate_proposed_steps(steps: list[dict], allowed_write_tool_names: set[st
         return "commands_json must contain at least one action step."
 
     for index, step in enumerate(steps, start=1):
+        parse_error = str(step.get("_parse_error", "") or "").strip()
         command = str(step.get("command", "") or "").strip()
         tool_name = str(step.get("tool", "") or "").strip()
         display = str(step.get("display", "") or "").strip()
         combined_text = " ".join(part for part in (command, tool_name, display) if part)
 
+        if parse_error:
+            return parse_error
         if _contains_placeholder(combined_text):
             return f"step {index} contains a placeholder. Discover the real identifier first."
         if command and tool_name:
@@ -378,6 +466,9 @@ def handle_action(
                 )
 
             messages.append(ToolMessage(content=result, tool_call_id=tool_id))
+            planner_feedback = _planner_feedback_for_tool_result(tool_name, tool_args, result)
+            if planner_feedback:
+                messages.append(SystemMessage(content=planner_feedback))
 
     # Build pending actions from captured proposals
     pending_actions: list[PendingAction] = []
@@ -398,12 +489,6 @@ def handle_action(
         )
 
     response_text = (response.content or "").strip() if response else ""
-
-    # If the LLM didn't use propose_action, try to extract from the text
-    if not pending_actions and response_text:
-        extracted = _extract_actions_from_text(response_text)
-        pending_actions.extend(extracted)
-
     return response_text, pending_actions
 
 
@@ -417,26 +502,19 @@ def _get_base_llm(llm_with_tools):
     return None
 
 
-def _extract_actions_from_text(text: str) -> list[PendingAction]:
-    """Fallback: extract code blocks as proposed commands from response text."""
-    actions = []
-    code_blocks = re.findall(r"```(?:bash|sh|shell)?\n(.*?)```", text, re.DOTALL)
-    if not code_blocks:
-        return actions
+def _planner_feedback_for_tool_result(tool_name: str, tool_args: dict, result: str) -> str:
+    text = str(result or "").strip()
+    if tool_name != "k8s_run_kubectl":
+        return ""
+    if "blocked in read-only mode" not in text or "typed write tool" not in text:
+        return ""
 
-    commands = []
-    for block in code_blocks:
-        for line in block.strip().splitlines():
-            line = line.strip()
-            if line and line.startswith("kubectl"):
-                commands.append({"command": line, "display": line})
-
-    if commands:
-        actions.append(PendingAction(
-            id=uuid4().hex[:10],
-            description="Extracted from response",
-            commands=commands,
-            risk="MEDIUM",
-            expected_outcome="See response text for details",
-        ))
-    return actions
+    blocked_command = str(tool_args.get("command", "") or "").strip()
+    lines = [
+        "Planner note: the previous raw kubectl command was blocked because it is a mutating operation.",
+        "Do not retry the same read-only tool and do not provide manual kubectl examples.",
+        "Use `propose_action` with the typed write tool and args named in the tool result.",
+    ]
+    if blocked_command:
+        lines.append(f"Blocked command: {blocked_command}")
+    return "\n".join(lines)

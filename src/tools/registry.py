@@ -56,10 +56,14 @@ class ToolRegistry:
         # Name → tool for direct execution
         self.tool_map: dict[str, object] = {t.name: t for t in self.all_tools}
 
-    def execute(self, tool_name: str, args: dict) -> str:
+    def execute(self, tool_name: str, args: dict, *, approved: bool = False) -> str:
         tool = self.tool_map.get(tool_name)
         if not tool:
             return f"ERROR: Unknown tool '{tool_name}'"
+        if self.is_write_tool(tool_name) and not approved:
+            return (
+                f"ERROR: Tool '{tool_name}' requires explicit approval before execution."
+            )
         try:
             return str(tool.invoke(args))
         except Exception as exc:

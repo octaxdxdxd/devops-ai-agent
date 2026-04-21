@@ -6,6 +6,29 @@ import shlex
 
 from .config import Config
 
+_KUBECTL_FLAGS_WITH_VALUES = frozenset({
+    "-n",
+    "--namespace",
+    "--context",
+    "--cluster",
+    "--user",
+    "--server",
+    "--kubeconfig",
+    "--as",
+    "--as-group",
+    "--token",
+    "--request-timeout",
+    "--selector",
+    "-l",
+    "-o",
+    "--output",
+    "-f",
+    "--filename",
+    "--field-selector",
+    "--container",
+    "-c",
+})
+
 
 def _csv_values(raw: str) -> set[str]:
     return {
@@ -77,22 +100,64 @@ def write_actions_allowed() -> str | None:
 
 
 def parse_kubectl_scope(command: str) -> tuple[str, bool]:
+    metadata = parse_kubectl_command(command)
+    return metadata["namespace"], metadata["all_namespaces"]
+
+
+def parse_kubectl_command(command: str) -> dict[str, object]:
     namespace = ""
     all_namespaces = False
+    subcommand = ""
+    subcommand_index = -1
     try:
         parts = shlex.split(str(command or "").strip())
     except ValueError:
-        return namespace, all_namespaces
+        return {
+            "namespace": namespace,
+            "all_namespaces": all_namespaces,
+            "subcommand": subcommand,
+            "subcommand_args": [],
+            "parts": [],
+        }
 
-    for index, part in enumerate(parts):
+    if parts and parts[0] == "kubectl":
+        parts = parts[1:]
+
+    index = 0
+    while index < len(parts):
+        part = parts[index]
         if part in {"-A", "--all-namespaces"}:
             all_namespaces = True
-        elif part in {"-n", "--namespace"} and index + 1 < len(parts):
+            index += 1
+            continue
+        if part in {"-n", "--namespace"} and index + 1 < len(parts):
             namespace = parts[index + 1]
-        elif part.startswith("--namespace="):
+            index += 2
+            continue
+        if part.startswith("--namespace="):
             namespace = part.split("=", 1)[1]
+            index += 1
+            continue
+        if part.startswith("--context=") or part.startswith("--cluster=") or part.startswith("--user="):
+            index += 1
+            continue
+        if part in _KUBECTL_FLAGS_WITH_VALUES:
+            index += 2
+            continue
+        if part.startswith("-"):
+            index += 1
+            continue
+        subcommand = part.lower()
+        subcommand_index = index
+        break
 
-    return namespace, all_namespaces
+    return {
+        "namespace": namespace,
+        "all_namespaces": all_namespaces,
+        "subcommand": subcommand,
+        "subcommand_args": parts[subcommand_index + 1:] if subcommand_index >= 0 else [],
+        "parts": parts,
+    }
 
 
 def guard_k8s_read_tool(
