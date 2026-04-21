@@ -390,7 +390,7 @@ class AIOpsAgent:
                 HumanMessage(content=(
                     f"Action: {action.description}\n"
                     f"Expected outcome: {action.expected_outcome}\n"
-                    f"Execution output:\n{compress_output(execution_output, max_chars=2000)}\n\n"
+                    f"Execution output:\n{compress_output(execution_output, max_chars=3000, format_hint='sectioned_text')}\n\n"
                     "Did the change succeed? Is the expected outcome achieved? "
                     "Any concerns? Answer in 2-3 sentences."
                 )),

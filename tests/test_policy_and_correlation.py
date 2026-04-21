@@ -145,6 +145,87 @@ class _FakeK8sExecStdErrClient(K8sClient):
         return "sh: line 1: wget: command not found"
 
 
+class _FakeK8sUsageClient(K8sClient):
+    def __init__(self) -> None:
+        pass
+
+    def get_resource_json(self, kind: str, name: str, namespace: str | None = None):
+        if kind == "deployment":
+            return {
+                "kind": "Deployment",
+                "metadata": {"name": "gitlab-webservice-default", "namespace": "gitlab"},
+                "spec": {
+                    "selector": {
+                        "matchLabels": {
+                            "app": "webservice",
+                            "component": "webservice",
+                        }
+                    }
+                },
+            }
+        return f"ERROR: unexpected get_resource_json call: {kind}/{name}"
+
+    def list_resources_json(
+        self,
+        kind: str,
+        namespace: str | None = None,
+        label_selector: str | None = None,
+        all_namespaces: bool = False,
+    ):
+        if kind == "pod":
+            assert namespace == "gitlab"
+            assert label_selector == "app=webservice,component=webservice"
+            return {
+                "items": [
+                    {
+                        "metadata": {
+                            "name": "gitlab-webservice-default-abc",
+                            "namespace": "gitlab",
+                            "ownerReferences": [{"kind": "ReplicaSet", "name": "gitlab-webservice-default-rs"}],
+                        },
+                        "spec": {
+                            "nodeName": "node-a",
+                            "containers": [
+                                {
+                                    "name": "webservice",
+                                    "image": "gitlab/webservice:latest",
+                                    "resources": {
+                                        "requests": {"cpu": "500m", "memory": "2048Mi"},
+                                        "limits": {"cpu": "1", "memory": "3072Mi"},
+                                    },
+                                },
+                                {
+                                    "name": "workhorse",
+                                    "image": "gitlab/workhorse:latest",
+                                    "resources": {
+                                        "requests": {"cpu": "100m", "memory": "256Mi"},
+                                        "limits": {"cpu": "300m", "memory": "512Mi"},
+                                    },
+                                },
+                            ],
+                        },
+                        "status": {"phase": "Running"},
+                    }
+                ]
+            }
+        return {"items": []}
+
+    def get_pod_metrics_json(self, namespace: str | None = None, *, all_namespaces: bool = False):
+        assert namespace == "gitlab"
+        assert all_namespaces is False
+        return {
+            "items": [
+                {
+                    "metadata": {"name": "gitlab-webservice-default-abc", "namespace": "gitlab"},
+                    "containers": [
+                        {"name": "webservice", "usage": {"cpu": "17m", "memory": "2206Mi"}},
+                        {"name": "workhorse", "usage": {"cpu": "4m", "memory": "82Mi"}},
+                    ],
+                }
+            ]
+        }
+
+
 def test_policy_blocks_raw_kubectl_write_commands_when_allow_all_write_disabled() -> None:
     previous_allow = Config.K8S_CLI_ALLOW_ALL_WRITE
     previous_posture = Config.COMMAND_SAFETY_POSTURE
@@ -276,3 +357,49 @@ def test_k8s_exec_command_preserves_stderr_on_success_path() -> None:
     )
 
     assert "wget: command not found" in result
+
+
+def test_k8s_analyze_resource_usage_returns_exact_per_container_requests_limits_and_usage() -> None:
+    client = _FakeK8sUsageClient()
+
+    result = client.analyze_resource_usage(
+        kind="deployment",
+        namespace="gitlab",
+        name="gitlab-webservice-default",
+    )
+    data = json.loads(result)
+
+    assert data["query"]["kind"] == "deployment"
+    assert data["metrics_available"] is True
+    assert data["summary"]["pods_analyzed"] == 1
+    assert data["summary"]["containers_analyzed"] == 2
+    assert data["summary"]["total_requests"]["cpu_mcpu"] == 600
+    assert data["summary"]["total_limits"]["cpu_mcpu"] == 1300
+    assert data["summary"]["total_usage"]["cpu_mcpu"] == 21
+
+    pod = data["pods"][0]
+    assert pod["name"] == "gitlab-webservice-default-abc"
+    container = {item["name"]: item for item in pod["containers"]}
+    assert container["webservice"]["requests"]["cpu"] == "500m"
+    assert container["webservice"]["limits"]["memory"] == "3072Mi"
+    assert container["webservice"]["usage"]["cpu"] == "17m"
+    assert container["webservice"]["usage_vs_request"]["memory_pct"] == 107.71
+    assert container["workhorse"]["requests"]["memory"] == "256Mi"
+    assert container["workhorse"]["usage"]["memory"] == "82Mi"
+
+
+def test_k8s_read_tool_exposes_structured_resource_usage_analysis() -> None:
+    tools = {tool.name: tool for tool in create_k8s_read_tools(_FakeK8sUsageClient())}
+
+    result = tools["k8s_analyze_resource_usage"].invoke(
+        {
+            "kind": "deployment",
+            "namespace": "gitlab",
+            "name": "gitlab-webservice-default",
+            "include_usage": True,
+        }
+    )
+    data = json.loads(result)
+
+    assert data["query"]["name"] == "gitlab-webservice-default"
+    assert data["pods"][0]["containers"][0]["requests"]["cpu_mcpu"] == 500

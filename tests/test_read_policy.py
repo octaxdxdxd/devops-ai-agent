@@ -30,6 +30,7 @@ def _sample_k8s_tools() -> list:
         _tool("k8s_get_resources"),
         _tool("k8s_get_resource_yaml"),
         _tool("k8s_get_resource_usage"),
+        _tool("k8s_analyze_resource_usage"),
     ]
 
 
@@ -53,7 +54,7 @@ def test_trace_regression_8f1fca82_remains_k8s_scoped() -> None:
 
     names = [tool.name for tool in selection.tools]
     assert selection.backend == "k8s"
-    assert names == ["k8s_get_resources", "k8s_get_resource_yaml", "k8s_get_resource_usage"]
+    assert names == ["k8s_get_resources", "k8s_get_resource_yaml", "k8s_get_resource_usage", "k8s_analyze_resource_usage"]
     assert "aws_get_caller_identity" not in names
 
 
@@ -108,6 +109,7 @@ def test_low_confidence_scope_binds_broad_safe_read_tools() -> None:
         "k8s_get_resources",
         "k8s_get_resource_yaml",
         "k8s_get_resource_usage",
+        "k8s_analyze_resource_usage",
         "aws_describe_service",
         "aws_audit_cloudtrail",
         "aws_inspect_lambda_schedules",

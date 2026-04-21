@@ -234,6 +234,48 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
         return compress_output(k8s.top(resource_type, namespace or None, name or None))
 
     @tool
+    def k8s_analyze_resource_usage(
+        kind: str = "pod",
+        namespace: str = "",
+        name: str = "",
+        label_selector: str = "",
+        all_namespaces: bool = False,
+        include_usage: bool = True,
+    ) -> str:
+        """Analyze exact pod/workload requests, limits, and live usage without relying on truncated YAML.
+
+        Supports direct pod analysis and workload-to-pod expansion for deployments,
+        statefulsets, daemonsets, replicasets, jobs, and cronjobs.
+
+        Args:
+            kind: Resource kind, e.g. 'pod', 'deployment', 'statefulset', 'daemonset'
+            namespace: K8s namespace (empty = default namespace)
+            name: Specific pod/workload name (empty = analyze all matching resources)
+            label_selector: Label filter for list-style analysis
+            all_namespaces: Set True to analyze across all namespaces
+            include_usage: Include live CPU/memory usage via metrics API when available
+        """
+        policy_error = guard_k8s_read_tool(
+            "k8s_analyze_resource_usage",
+            namespace=namespace,
+            all_namespaces=all_namespaces,
+        )
+        if policy_error:
+            return f"ERROR: {policy_error}"
+        return compress_output(
+            k8s.analyze_resource_usage(
+                kind=kind,
+                namespace=namespace or None,
+                name=name or None,
+                label_selector=label_selector or None,
+                all_namespaces=all_namespaces,
+                include_usage=include_usage,
+            ),
+            max_lines=220,
+            max_chars=16000,
+        )
+
+    @tool
     def k8s_get_rollout_history(kind: str, name: str, namespace: str = "") -> str:
         """Get rollout history for a deployment or statefulset. Shows recent revisions.
 
@@ -259,7 +301,7 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
 
     @tool
     def k8s_get_resource_yaml(kind: str, name: str, namespace: str = "") -> str:
-        """Get the full YAML definition of a Kubernetes resource.
+        """Get the YAML definition of a Kubernetes resource.
 
         Args:
             kind: Resource type
@@ -271,8 +313,9 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
             return f"ERROR: {policy_error}"
         return compress_output(
             k8s.get_resource_yaml(kind, name, namespace or None),
-            max_lines=100,
-            max_chars=6000,
+            max_lines=140,
+            max_chars=9000,
+            format_hint="k8s_manifest",
         )
 
     # Read-only kubectl subcommands (whitelist).  Anything not listed
@@ -328,6 +371,7 @@ def create_k8s_read_tools(k8s: K8sClient) -> list:
         k8s_get_pod_logs,
         k8s_get_events,
         k8s_get_resource_usage,
+        k8s_analyze_resource_usage,
         k8s_get_rollout_history,
         k8s_get_contexts,
         k8s_get_namespaces,

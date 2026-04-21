@@ -280,6 +280,28 @@ def _render_kubectl_top(args: dict) -> str:
     return " ".join(parts)
 
 
+def _render_k8s_analyze_resource_usage(args: dict) -> str:
+    kind = str(args.get("kind", "pod") or "pod").strip()
+    name = str(args.get("name", "") or "").strip()
+    label_selector = str(args.get("label_selector", "") or "").strip()
+    all_namespaces = bool(args.get("all_namespaces"))
+    include_usage = bool(args.get("include_usage", True))
+
+    parts = ["kubectl", "get", kind]
+    if name:
+        parts.append(_quote(name))
+    if label_selector:
+        parts.extend(["-l", _quote(label_selector)])
+    if all_namespaces:
+        parts.append("-A")
+    else:
+        _append_arg(parts, "-n", _default_namespace(str(args.get("namespace", "") or "")))
+    parts.extend(["-o", "json"])
+    if include_usage:
+        return f"{' '.join(parts)}  # plus metrics.k8s.io pod usage / kubectl top --containers"
+    return " ".join(parts)
+
+
 def _render_kubectl_rollout_history(args: dict) -> str:
     parts = [
         "kubectl",
@@ -440,6 +462,7 @@ def _preview_for_tool(tool_name: str, args: dict) -> str:
         "k8s_get_pod_logs": lambda: _render_kubectl_logs(args),
         "k8s_get_events": lambda: _render_kubectl_events(args),
         "k8s_get_resource_usage": lambda: _render_kubectl_top(args),
+        "k8s_analyze_resource_usage": lambda: _render_k8s_analyze_resource_usage(args),
         "k8s_get_rollout_history": lambda: _render_kubectl_rollout_history(args),
         "k8s_get_contexts": lambda: "kubectl config get-contexts",
         "k8s_get_namespaces": lambda: "kubectl get namespaces",
