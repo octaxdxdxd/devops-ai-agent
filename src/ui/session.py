@@ -77,6 +77,8 @@ def initialize_session_state() -> None:
         st.session_state.sync_model_drafts = False
     if "pending_model_name_draft" not in st.session_state:
         st.session_state.pending_model_name_draft = None
+    if "active_handoff_message_index" not in st.session_state:
+        st.session_state.active_handoff_message_index = None
 
 
 def reconcile_model_draft_state(provider_options: list[str]) -> None:

@@ -8,6 +8,7 @@ import streamlit as st
 
 from ..config import Config
 from .approval import render_pending_actions, render_action_status
+from .handoff import render_message_handoff_panel
 from .session import (
     convert_to_langchain_messages,
     get_message_content,
@@ -30,6 +31,10 @@ def display_chat_messages() -> None:
         st.markdown("---")
         return
 
+    agent = st.session_state.get("agent")
+    trace_store = getattr(agent, "trace_store", None)
+    active_handoff_index = st.session_state.get("active_handoff_message_index")
+
     for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             content = get_message_content(message)
@@ -45,8 +50,17 @@ def display_chat_messages() -> None:
             if trace_id and Config.TRACE_ENABLED:
                 st.caption(f"Trace ID: `{trace_id}`")
 
+            if message["role"] == "assistant":
+                handoff_open = active_handoff_index == idx
+                handoff_label = "Hide Handoff" if handoff_open else "Handoff"
+                if st.button(handoff_label, key=f"handoff_toggle_{idx}"):
+                    st.session_state.active_handoff_message_index = None if handoff_open else idx
+                    st.rerun()
+
+                if handoff_open:
+                    render_message_handoff_panel(st.session_state.messages, idx, trace_store=trace_store)
+
     # Render pending approval buttons for the latest assistant message
-    agent = st.session_state.get("agent")
     if agent and agent.pending_actions:
         pending = [a for a in agent.pending_actions if a.status == "pending"]
         if pending:
@@ -222,6 +236,7 @@ def process_chat_turn() -> None:
         return
 
     if prompt := st.chat_input("Ask about cluster health, pods, events, or remediation..."):
+        st.session_state.active_handoff_message_index = None
         user_message = {"role": "user", "content": prompt, "trace_id": None}
         st.session_state.messages.append(user_message)
 
