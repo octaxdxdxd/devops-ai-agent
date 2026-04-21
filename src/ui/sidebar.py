@@ -5,7 +5,11 @@ from __future__ import annotations
 import streamlit as st
 
 from ..config import Config
-from .session import apply_runtime_model_selection, get_message_trace_id
+from .session import (
+    apply_runtime_model_selection,
+    get_message_trace_id,
+    reconcile_model_draft_state,
+)
 
 
 def display_sidebar() -> None:
@@ -23,10 +27,7 @@ def display_sidebar() -> None:
         st.caption("Changes apply to new turns and health scans.")
 
         provider_options = list(Config.SUPPORTED_LLM_PROVIDERS)
-        if st.session_state.get("model_provider_draft") not in provider_options:
-            st.session_state.model_provider_draft = st.session_state.model_provider
-        if not str(st.session_state.get("model_name_draft") or "").strip():
-            st.session_state.model_name_draft = st.session_state.model_name
+        reconcile_model_draft_state(provider_options)
 
         with st.form("runtime_model_controls"):
             st.selectbox(
@@ -48,7 +49,7 @@ def display_sidebar() -> None:
             default_clicked = col_default.form_submit_button("Use Default", use_container_width=True)
 
         if default_clicked:
-            st.session_state.model_name_draft = Config.get_model_name_for_provider(
+            st.session_state.pending_model_name_draft = Config.get_model_name_for_provider(
                 st.session_state.model_provider_draft
             )
             st.rerun()

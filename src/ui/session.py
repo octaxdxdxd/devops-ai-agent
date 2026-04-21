@@ -73,6 +73,28 @@ def initialize_session_state() -> None:
         st.session_state.model_name_draft = st.session_state.model_name
     if "model_settings_notice" not in st.session_state:
         st.session_state.model_settings_notice = None
+    if "sync_model_drafts" not in st.session_state:
+        st.session_state.sync_model_drafts = False
+    if "pending_model_name_draft" not in st.session_state:
+        st.session_state.pending_model_name_draft = None
+
+
+def reconcile_model_draft_state(provider_options: list[str]) -> None:
+    """Sync draft widget state before bound widgets are instantiated."""
+    if st.session_state.get("sync_model_drafts"):
+        st.session_state.model_provider_draft = st.session_state.model_provider
+        st.session_state.model_name_draft = st.session_state.model_name
+        st.session_state.sync_model_drafts = False
+
+    pending_model_name = str(st.session_state.get("pending_model_name_draft") or "").strip()
+    if pending_model_name:
+        st.session_state.model_name_draft = pending_model_name
+        st.session_state.pending_model_name_draft = None
+
+    if st.session_state.get("model_provider_draft") not in provider_options:
+        st.session_state.model_provider_draft = st.session_state.model_provider
+    if not str(st.session_state.get("model_name_draft") or "").strip():
+        st.session_state.model_name_draft = st.session_state.model_name
 
 
 def apply_runtime_model_selection(provider: str, model_name: str | None = None) -> tuple[str, str]:
@@ -101,8 +123,7 @@ def apply_runtime_model_selection(provider: str, model_name: str | None = None) 
 
     st.session_state.model_provider = selected_provider
     st.session_state.model_name = applied_model
-    st.session_state.model_provider_draft = selected_provider
-    st.session_state.model_name_draft = applied_model
+    st.session_state.sync_model_drafts = True
     st.session_state.agent_status_text = None
     return selected_provider, applied_model
 
