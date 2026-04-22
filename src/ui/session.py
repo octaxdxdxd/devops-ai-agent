@@ -79,6 +79,8 @@ def initialize_session_state() -> None:
         st.session_state.pending_model_name_draft = None
     if "active_handoff_message_index" not in st.session_state:
         st.session_state.active_handoff_message_index = None
+    if "handoff_package_cache" not in st.session_state:
+        st.session_state.handoff_package_cache = {}
 
 
 def reconcile_model_draft_state(provider_options: list[str]) -> None:
@@ -127,6 +129,7 @@ def apply_runtime_model_selection(provider: str, model_name: str | None = None) 
     st.session_state.model_name = applied_model
     st.session_state.sync_model_drafts = True
     st.session_state.agent_status_text = None
+    st.session_state.handoff_package_cache = {}
     return selected_provider, applied_model
 
 

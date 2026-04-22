@@ -58,7 +58,12 @@ def display_chat_messages() -> None:
                     st.rerun()
 
                 if handoff_open:
-                    render_message_handoff_panel(st.session_state.messages, idx, trace_store=trace_store)
+                    render_message_handoff_panel(
+                        st.session_state.messages,
+                        idx,
+                        trace_store=trace_store,
+                        agent=agent,
+                    )
 
     # Render pending approval buttons for the latest assistant message
     if agent and agent.pending_actions:
