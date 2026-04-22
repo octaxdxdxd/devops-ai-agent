@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool as langchain_tool
+import yaml
 
 from ..config import Config
 from ..policy import guard_k8s_read_tool, guard_k8s_write_tool, guard_tool_invocation
@@ -53,6 +54,9 @@ Rules:
 - Propose the minimum effective change.
 - Prefer `kubectl rollout restart` on a parent workload over deleting a pod directly.
 - For `k8s_exec_in_pod`, prefer a single direct command when possible. Only use `sh -lc` when multiple shell operations are genuinely required.
+- For `k8s_apply_manifest`, include complete manifest documents. Do not propose partial YAML for existing resources.
+- For `batch/v1` `CronJob`, always include `spec.schedule` and `spec.jobTemplate.spec.template.spec.restartPolicy`.
+- For narrow changes like image updates, prefer a targeted write tool over a full apply manifest when possible.
 - If the target pod has multiple containers, inspect the pod spec first and pass the exact container name.
 - Do not repeat the same read tool call with identical arguments. If a path stays empty or errors, switch discovery paths or state the uncertainty.
 - Risk must be LOW, MEDIUM, HIGH, or CRITICAL.
@@ -153,6 +157,13 @@ def _format_tool_step(tool_name: str, args: dict) -> str:
 def format_action_step_preview(step: dict) -> tuple[str, str, str]:
     """Return a human label, code/text preview, and syntax hint for one action step."""
     return render_action_step_preview(step)
+
+
+def format_action_step_details(step: dict) -> tuple[str, str, str] | None:
+    """Return optional operator-visible details for one action step."""
+    from ..tools.command_preview import render_action_step_details
+
+    return render_action_step_details(step)
 
 
 def _looks_like_serialized_steps(value: object) -> bool:
@@ -268,6 +279,7 @@ _REQUIRED_NON_EMPTY_TOOL_ARGS: dict[str, tuple[str, ...]] = {
     "aws_run_api_command": ("service", "operation"),
     "aws_update_auto_scaling": ("asg_name",),
     "aws_resume_auto_scaling_processes": ("asg_name",),
+    "k8s_apply_manifest": ("manifest_yaml",),
     "k8s_exec_in_pod": ("pod", "command"),
     "k8s_scale_resource": ("kind", "name"),
     "k8s_rollout_restart": ("kind", "name"),
@@ -295,6 +307,93 @@ def _is_read_only_aws_operation(operation: str) -> bool:
     return bool(_READ_ONLY_AWS_OPERATION_RE.match(str(operation or "").strip()))
 
 
+def _parse_manifest_documents(manifest_yaml: object) -> tuple[list[dict], str | None]:
+    text = str(manifest_yaml or "").strip()
+    if not text:
+        return [], "manifest_yaml must not be empty."
+
+    try:
+        raw_documents = list(yaml.safe_load_all(text))
+    except yaml.YAMLError as exc:
+        return [], f"manifest_yaml is not valid YAML: {exc}"
+
+    documents = [doc for doc in raw_documents if doc is not None]
+    if not documents:
+        return [], "manifest_yaml must contain at least one YAML document."
+
+    for doc_index, document in enumerate(documents, start=1):
+        if not isinstance(document, dict):
+            return [], f"manifest_yaml document {doc_index} must be a YAML mapping."
+
+    return documents, None
+
+
+def _get_nested_mapping_value(document: object, *path: str) -> object | None:
+    current = document
+    for part in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _validate_manifest_identity(document: dict, *, step_index: int, doc_index: int) -> str | None:
+    api_version = str(document.get("apiVersion", "") or "").strip()
+    kind = str(document.get("kind", "") or "").strip()
+    metadata = document.get("metadata")
+    name = ""
+    if isinstance(metadata, dict):
+        name = str(metadata.get("name", "") or "").strip()
+
+    if not api_version:
+        return (
+            f"step {step_index} tool 'k8s_apply_manifest' manifest document {doc_index} is missing "
+            "required field 'apiVersion'."
+        )
+    if not kind:
+        return (
+            f"step {step_index} tool 'k8s_apply_manifest' manifest document {doc_index} is missing "
+            "required field 'kind'."
+        )
+    if not isinstance(metadata, dict):
+        return (
+            f"step {step_index} tool 'k8s_apply_manifest' manifest document {doc_index} is missing "
+            "required mapping 'metadata'."
+        )
+    if not name:
+        return (
+            f"step {step_index} tool 'k8s_apply_manifest' manifest document {doc_index} is missing "
+            "required field 'metadata.name'."
+        )
+    return None
+
+
+def _validate_cronjob_manifest(document: dict, *, step_index: int, doc_index: int) -> str | None:
+    schedule = _get_nested_mapping_value(document, "spec", "schedule")
+    if not isinstance(schedule, str) or not schedule.strip():
+        return (
+            f"step {step_index} tool 'k8s_apply_manifest' CronJob manifest document {doc_index} is missing "
+            "required field 'spec.schedule'."
+        )
+
+    restart_policy = _get_nested_mapping_value(
+        document,
+        "spec",
+        "jobTemplate",
+        "spec",
+        "template",
+        "spec",
+        "restartPolicy",
+    )
+    if not isinstance(restart_policy, str) or not restart_policy.strip():
+        return (
+            f"step {step_index} tool 'k8s_apply_manifest' CronJob manifest document {doc_index} is missing "
+            "required field 'spec.jobTemplate.spec.template.spec.restartPolicy'."
+        )
+
+    return None
+
+
 def _validate_tool_step_semantics(tool_name: str, args: object, step_index: int) -> str | None:
     if not isinstance(args, dict):
         return None
@@ -306,6 +405,23 @@ def _validate_tool_step_semantics(tool_name: str, args: object, step_index: int)
                 f"step {step_index} tool 'aws_run_api_command' cannot be used for read-only AWS operation "
                 f"'{operation}'. Resolve identifiers with read tools before proposing the action."
             )
+
+    if tool_name == "k8s_apply_manifest":
+        documents, manifest_error = _parse_manifest_documents(args.get("manifest_yaml"))
+        if manifest_error:
+            return f"step {step_index} tool 'k8s_apply_manifest' {manifest_error}"
+
+        for doc_index, document in enumerate(documents, start=1):
+            identity_error = _validate_manifest_identity(document, step_index=step_index, doc_index=doc_index)
+            if identity_error:
+                return identity_error
+
+            api_version = str(document.get("apiVersion", "") or "").strip()
+            kind = str(document.get("kind", "") or "").strip()
+            if api_version == "batch/v1" and kind == "CronJob":
+                cronjob_error = _validate_cronjob_manifest(document, step_index=step_index, doc_index=doc_index)
+                if cronjob_error:
+                    return cronjob_error
 
     return None
 

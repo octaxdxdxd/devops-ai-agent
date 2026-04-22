@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import shlex
 
+import yaml
+
 from ..config import Config
 
 
@@ -53,6 +55,110 @@ def _default_namespace(namespace: str = "", all_namespaces: bool = False) -> str
     if all_namespaces:
         return ""
     return str(namespace or Config.K8S_DEFAULT_NAMESPACE or "default").strip() or "default"
+
+
+def _truncate_block(text: str, *, max_lines: int = 80, max_chars: int = 4000) -> str:
+    content = str(text or "").strip()
+    if not content:
+        return ""
+
+    lines = content.splitlines()
+    if len(lines) > max_lines:
+        content = "\n".join(lines[:max_lines]) + f"\n... [{len(lines) - max_lines} more lines omitted]"
+
+    if len(content) > max_chars:
+        content = content[:max_chars].rstrip() + "\n... [truncated]"
+    return content
+
+
+def _parse_manifest_documents(manifest_yaml: object) -> list[dict]:
+    text = str(manifest_yaml or "").strip()
+    if not text:
+        return []
+    try:
+        documents = list(yaml.safe_load_all(text))
+    except yaml.YAMLError:
+        return []
+    return [doc for doc in documents if isinstance(doc, dict)]
+
+
+def _get_nested_mapping_value(document: object, *path: str) -> object | None:
+    current = document
+    for part in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _summarize_manifest_metadata(metadata: object) -> dict[str, object]:
+    if not isinstance(metadata, dict):
+        return {}
+    summary: dict[str, object] = {}
+    for key in ("name", "namespace", "generateName"):
+        value = metadata.get(key)
+        if value:
+            summary[key] = value
+    return summary
+
+
+def _summarize_manifest_document(document: dict) -> dict[str, object]:
+    summary: dict[str, object] = {}
+    api_version = document.get("apiVersion")
+    kind = document.get("kind")
+    if api_version:
+        summary["apiVersion"] = api_version
+    if kind:
+        summary["kind"] = kind
+
+    metadata = _summarize_manifest_metadata(document.get("metadata"))
+    if metadata:
+        summary["metadata"] = metadata
+
+    if str(kind or "") == "CronJob" and str(api_version or "") == "batch/v1":
+        cronjob_spec: dict[str, object] = {}
+        schedule = _get_nested_mapping_value(document, "spec", "schedule")
+        restart_policy = _get_nested_mapping_value(
+            document,
+            "spec",
+            "jobTemplate",
+            "spec",
+            "template",
+            "spec",
+            "restartPolicy",
+        )
+        if schedule:
+            cronjob_spec["schedule"] = schedule
+        if restart_policy:
+            cronjob_spec["jobTemplate"] = {
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "restartPolicy": restart_policy,
+                        }
+                    }
+                }
+            }
+        if cronjob_spec:
+            summary["spec"] = cronjob_spec
+
+    return summary or document
+
+
+def _render_manifest_preview(manifest_yaml: object) -> str:
+    documents = _parse_manifest_documents(manifest_yaml)
+    if not documents:
+        return ""
+
+    summarized_documents = [_summarize_manifest_document(doc) for doc in documents[:3]]
+    rendered_parts = [
+        yaml.safe_dump(doc, sort_keys=False, default_flow_style=False).strip()
+        for doc in summarized_documents
+    ]
+    preview = "\n---\n".join(part for part in rendered_parts if part)
+    if len(documents) > 3:
+        preview += f"\n---\n# ... {len(documents) - 3} more manifest document(s) omitted"
+    return _truncate_block(preview, max_lines=60, max_chars=1600)
 
 
 def _render_aws_cli(service: str, operation: str, params: object | None = None, region: str = "") -> str:
@@ -391,6 +497,13 @@ def _render_k8s_exec(args: dict) -> str:
     return " ".join(parts)
 
 
+def _render_k8s_apply_manifest(args: dict) -> str:
+    manifest_preview = _render_manifest_preview(args.get("manifest_yaml"))
+    if not manifest_preview:
+        return "kubectl apply -f -"
+    return f"kubectl apply -f - <<'EOF'\n{manifest_preview}\nEOF"
+
+
 def _render_k8s_restart_workload_safely(args: dict) -> str:
     namespace = _default_namespace(str(args.get("namespace", "") or ""))
     timeout_seconds = int(args.get("timeout_seconds", 300) or 300)
@@ -473,7 +586,7 @@ def _preview_for_tool(tool_name: str, args: dict) -> str:
         "k8s_rollout_restart": lambda: _render_k8s_rollout(args, "restart"),
         "k8s_rollout_undo": lambda: _render_k8s_rollout(args, "undo"),
         "k8s_delete_resource": lambda: _render_k8s_delete(args),
-        "k8s_apply_manifest": lambda: "kubectl apply -f -",
+        "k8s_apply_manifest": lambda: _render_k8s_apply_manifest(args),
         "k8s_cordon_node": lambda: _render_k8s_cordon(args),
         "k8s_drain_node": lambda: _render_k8s_drain(args),
         "k8s_exec_in_pod": lambda: _render_k8s_exec(args),
@@ -503,6 +616,18 @@ def render_tool_call_preview(
     return label, preview, language
 
 
+def render_tool_call_details(tool_name: str, tool_args: dict | None = None) -> tuple[str, str, str] | None:
+    """Return optional operator-visible details for a tool invocation."""
+    args = tool_args if isinstance(tool_args, dict) else {}
+    if str(tool_name or "").strip() != "k8s_apply_manifest":
+        return None
+
+    manifest_yaml = _truncate_block(str(args.get("manifest_yaml", "") or ""), max_lines=120, max_chars=6000)
+    if not manifest_yaml:
+        return None
+    return "Manifest payload", manifest_yaml, "yaml"
+
+
 def render_action_step_preview(step: dict) -> tuple[str, str, str]:
     """Return a human label, code/text preview, and syntax hint for one action step."""
     display = str(step.get("display", "") or "").strip()
@@ -518,3 +643,11 @@ def render_action_step_preview(step: dict) -> tuple[str, str, str]:
     preview = display or str(step)
     language = "bash" if preview.startswith(("aws ", "kubectl ")) else "text"
     return "", preview, language
+
+
+def render_action_step_details(step: dict) -> tuple[str, str, str] | None:
+    """Return optional operator-visible details for one action step."""
+    tool_name = str(step.get("tool", "") or "").strip()
+    if not tool_name:
+        return None
+    return render_tool_call_details(tool_name, step.get("args", {}))

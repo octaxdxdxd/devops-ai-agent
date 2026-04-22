@@ -6,7 +6,7 @@ from src.agents.action import _validate_proposed_steps
 from src.config import Config
 from src.infra.k8s_client import K8sClient, _parse_cpu_to_mcpu
 from src.tools.aws_write import create_aws_write_tools
-from src.tools.command_preview import render_tool_call_preview
+from src.tools.command_preview import render_tool_call_details, render_tool_call_preview
 from src.tools.correlation_read import create_correlation_read_tools
 from src.tools.k8s_read import create_k8s_read_tools
 
@@ -356,6 +356,64 @@ def test_command_preview_renders_typed_restart_workflow() -> None:
     assert "kubectl rollout restart deployment/api -n prod" in preview
     assert "kubectl rollout status deployment/api -n prod --timeout=180s" in preview
     assert language == "bash"
+
+
+def test_command_preview_renders_apply_manifest_with_manifest_context() -> None:
+    label, preview, language = render_tool_call_preview(
+        "k8s_apply_manifest",
+        {
+            "manifest_yaml": "\n".join(
+                [
+                    "apiVersion: batch/v1",
+                    "kind: CronJob",
+                    "metadata:",
+                    "  name: terminated-pod-gc",
+                    "  namespace: kube-system",
+                    "spec:",
+                    '  schedule: "*/5 * * * *"',
+                    "  jobTemplate:",
+                    "    spec:",
+                    "      template:",
+                    "        spec:",
+                    "          restartPolicy: OnFailure",
+                ]
+            )
+        },
+        display="Apply the updated CronJob manifest",
+    )
+
+    assert label == "Apply the updated CronJob manifest"
+    assert "kubectl apply -f - <<'EOF'" in preview
+    assert "kind: CronJob" in preview
+    assert "name: terminated-pod-gc" in preview
+    assert "schedule: '*/5 * * * *'" in preview or 'schedule: \"*/5 * * * *\"' in preview
+    assert "restartPolicy: OnFailure" in preview
+    assert preview.rstrip().endswith("EOF")
+    assert language == "bash"
+
+
+def test_command_preview_exposes_manifest_payload_details() -> None:
+    details = render_tool_call_details(
+        "k8s_apply_manifest",
+        {
+            "manifest_yaml": "\n".join(
+                [
+                    "apiVersion: batch/v1",
+                    "kind: CronJob",
+                    "metadata:",
+                    "  name: terminated-pod-gc",
+                    "  namespace: kube-system",
+                ]
+            )
+        },
+    )
+
+    assert details is not None
+    title, body, language = details
+    assert title == "Manifest payload"
+    assert "kind: CronJob" in body
+    assert "namespace: kube-system" in body
+    assert language == "yaml"
 
 
 def test_k8s_run_kubectl_reports_exec_subcommand_and_typed_tool_guidance() -> None:

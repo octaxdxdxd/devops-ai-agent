@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import streamlit as st
 
-from ..agents.action import format_action_step_preview
+from ..agents.action import format_action_step_details, format_action_step_preview
 
 if TYPE_CHECKING:
     from ..agents.action import PendingAction
@@ -46,6 +46,11 @@ def _render_single_action(action: PendingAction) -> None:
                 if label:
                     st.caption(label)
                 st.code(preview, language=language)
+                details = format_action_step_details(cmd)
+                if details:
+                    details_title, details_body, details_language = details
+                    with st.expander(details_title):
+                        st.code(details_body, language=details_language)
 
         if action.verification:
             verification_label, verification_preview, verification_language = format_action_step_preview(action.verification)

@@ -1,6 +1,12 @@
 import json
+import textwrap
 
-from src.agents.action import _create_propose_action_tool, _parse_proposed_steps, format_action_step_preview
+from src.agents.action import (
+    _create_propose_action_tool,
+    _parse_proposed_steps,
+    format_action_step_details,
+    format_action_step_preview,
+)
 
 
 def test_format_action_step_preview_uses_real_command() -> None:
@@ -273,3 +279,146 @@ def test_propose_action_rejects_exec_step_with_empty_command() -> None:
         "Proposal rejected: step 1 tool 'k8s_exec_in_pod' has empty required arg 'command'."
     )
     assert captured == []
+
+
+def test_propose_action_rejects_partial_cronjob_apply_manifest() -> None:
+        captured: list[dict] = []
+        propose_action = _create_propose_action_tool(captured, {"k8s_apply_manifest"})
+        manifest_yaml = textwrap.dedent(
+                """
+                apiVersion: batch/v1
+                kind: CronJob
+                metadata:
+                    name: terminated-pod-gc
+                    namespace: kube-system
+                spec:
+                    jobTemplate:
+                        spec:
+                            template:
+                                spec:
+                                    containers:
+                                        - name: kubectl
+                                          image: bitnami/kubectl:1.34.0
+                """
+        ).strip()
+
+        result = propose_action.invoke(
+                {
+                        "description": "Update the terminated pod cleanup CronJob image",
+                        "commands_json": json.dumps(
+                                [
+                                        {
+                                                "tool": "k8s_apply_manifest",
+                                                "args": {"manifest_yaml": manifest_yaml},
+                                                "display": "Apply the updated CronJob manifest",
+                                        }
+                                ]
+                        ),
+                        "risk": "MEDIUM",
+                        "expected_outcome": "The CronJob uses a pullable kubectl image",
+                        "verification_command": "kubectl get cronjob terminated-pod-gc -n kube-system -o yaml",
+                }
+        )
+
+        assert result == (
+                "Proposal rejected: step 1 tool 'k8s_apply_manifest' CronJob manifest document 1 is missing "
+                "required field 'spec.schedule'."
+        )
+        assert captured == []
+
+
+def test_propose_action_accepts_complete_cronjob_apply_manifest() -> None:
+        captured: list[dict] = []
+        propose_action = _create_propose_action_tool(captured, {"k8s_apply_manifest"})
+        manifest_yaml = textwrap.dedent(
+                """
+                apiVersion: batch/v1
+                kind: CronJob
+                metadata:
+                    name: terminated-pod-gc
+                    namespace: kube-system
+                spec:
+                    schedule: "*/5 * * * *"
+                    jobTemplate:
+                        spec:
+                            template:
+                                spec:
+                                    restartPolicy: OnFailure
+                                    containers:
+                                        - name: kubectl
+                                          image: bitnami/kubectl:1.34.0
+                                          command:
+                                            - /bin/sh
+                                            - -c
+                                            - kubectl delete pods -A --field-selector=status.phase==Succeeded
+                """
+        ).strip()
+
+        result = propose_action.invoke(
+                {
+                        "description": "Update the terminated pod cleanup CronJob image",
+                        "commands_json": json.dumps(
+                                [
+                                        {
+                                                "tool": "k8s_apply_manifest",
+                                                "args": {"manifest_yaml": manifest_yaml},
+                                                "display": "Apply the updated CronJob manifest",
+                                        }
+                                ]
+                        ),
+                        "risk": "MEDIUM",
+                        "expected_outcome": "The CronJob uses a pullable kubectl image",
+                        "verification_command": "kubectl get cronjob terminated-pod-gc -n kube-system -o yaml",
+                }
+        )
+
+        assert result.startswith("Action proposal captured.")
+        assert captured == [
+                {
+                        "description": "Update the terminated pod cleanup CronJob image",
+                        "commands": [
+                                {
+                                        "tool": "k8s_apply_manifest",
+                                        "args": {"manifest_yaml": manifest_yaml},
+                                        "display": "Apply the updated CronJob manifest",
+                                }
+                        ],
+                        "risk": "MEDIUM",
+                        "expected_outcome": "The CronJob uses a pullable kubectl image",
+                        "verification": {"command": "kubectl get cronjob terminated-pod-gc -n kube-system -o yaml"},
+                }
+        ]
+
+
+def test_format_action_step_details_exposes_manifest_yaml() -> None:
+        manifest_yaml = textwrap.dedent(
+                """
+                apiVersion: batch/v1
+                kind: CronJob
+                metadata:
+                    name: terminated-pod-gc
+                    namespace: kube-system
+                spec:
+                    schedule: "*/5 * * * *"
+                    jobTemplate:
+                        spec:
+                            template:
+                                spec:
+                                    restartPolicy: OnFailure
+                """
+        ).strip()
+
+        details = format_action_step_details(
+                {
+                        "tool": "k8s_apply_manifest",
+                        "args": {"manifest_yaml": manifest_yaml},
+                        "display": "Apply the updated CronJob manifest",
+                }
+        )
+
+        assert details is not None
+        title, body, language = details
+        assert title == "Manifest payload"
+        assert "kind: CronJob" in body
+        assert "schedule: \"*/5 * * * *\"" in body
+        assert language == "yaml"
